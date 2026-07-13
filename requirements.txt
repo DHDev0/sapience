@@ -1,0 +1,25 @@
+# The Living Brain — Python dependencies (pip install -r requirements.txt)
+# Python 3.10+.  A CUDA/ROCm build of torch is recommended for GPU; CPU works out of the box.
+
+# --- core (required) ---
+torch>=2.1              # the tensor engine (spiking substrate, BPTT, autograd)
+numpy>=1.24             # sensory encoders, math
+tensorboard>=2.14       # the ~40 metric time-series (also shown live on the board)
+requests>=2.28          # web reading (partner.py) — Claude teaching + browsing text
+pillow>=9.5             # image observations (retina encode/decode + ASCII vision)
+
+# --- birth teacher + real text (recommended) ---
+datasets>=2.14          # wikitext-2 at birth
+transformers>=4.40      # the frozen Qwen3.5-0.8B birth teacher (llm_teacher.py)
+
+# --- memory compression (recommended; falls back to lzma if absent) ---
+zstandard>=0.21         # zstd-19 compression of the whole-life episodic memory
+
+# --- terminal UI (optional; only for `python tui.py`) ---
+textual>=0.50
+rich>=13.0
+
+# --- visual web browsing (optional; only for --visual / browsing) ---
+# playwright>=1.40       # then run:  playwright install chromium
+#
+# Also uses the `claude` CLI (Claude Code) on PATH for the live Sonnet teaching loop.
