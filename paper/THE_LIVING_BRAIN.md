@@ -565,3 +565,52 @@ that change learning (group A) from the realism that does not (group C), and (2)
 fidelity-vs-capability curve as each is added*. That curve — "here is exactly how much each
 biological constraint costs" — is the contribution; the full survey lives in
 `runs/cortical_algorithm_research.md`.
+
+# §16 · The deeper brain: one neuro-endocrine-oscillatory control loop (R&D)
+
+§15 gives five spiking modules + a self-adapting cortex, but every cycle fires all five and sleep replays
+a **raw byte buffer** — two things the brain almost certainly does not do. Three literature-grounded R&D
+threads (full surveys + citations in `runs/{memory_architecture,drive_stress,dynamics_oscillations}_research.md`;
+integrated design in `runs/deeper_brain_integrated_design.md`) converge on a single missing controller that
+sits *above* the existing tones, the self-adapting `attention`, the sleep-debt, and the dopamine critic —
+coupling only to fields that already exist:
+
+> **endocrine drive/cortisol** (sets the arousal/entropy operating point + **sleep pressure**) → the
+> **ultradian sleep-cycle** (NREM/REM schedule) → **ripple-gated generative consolidation** of the
+> **generalized-in-the-net** memory → gated by **oscillatory dynamic states** (which regions fire, at what
+> frequency, set by attention) → feeding back into the self-adapting attention.
+
+**Memory is generalized-in-the-net, not a buffer (verified).** The raw replay buffer is biologically
+wrong: hippocampal replay is *reconstructive/generative* — it builds never-experienced shortcuts (Gupta
+2010), pre-plays untraversed paths (Ólafsdóttir 2015), and sweeps to *future* goals (Pfeiffer-Foster 2013);
+under Complementary Learning Systems (McClelland 1995; Kumaran 2016) the cortex accumulates *generalized*
+structure in its weights, nothing stores raw episodes. The buffer-free mechanism is **generative self-replay**
+(Robins 1995; Shin 2017; van de Ven 2020): the cortex *dreams* from its own dynamics and hard-learns the
+dreams. **This is built and measured** — `SpikingBrain.generative_replay()` (diverse high-temperature dreams
+from sparse byte-cues, with two anti-"overfitted-brain" safeguards: a small veridical anchor fraction and a
+held-out acceptance monitor). On a forgetting-resistance test (learn topic A, then live through B–E), topic-A
+retention was **none 0.232 < raw-buffer 0.255 < generative 0.274** — dreaming from the net consolidates
+*better* than replaying stored text, with **no buffer** (`runs/generative_replay_test.py`).
+
+**The drive/stress layer.** A `SpikingEndocrine` of slow scalars — a **drive deficit** (leaky integrator,
+met by a satiation event → a homeostatic-RL reward, Keramati-Gutkin, fed into the existing dopamine critic),
+**cortisol** (rises with unmet drive + prediction-error; an inverted-U on plasticity — acute sharpens, chronic
+impairs; and it *is* the sleep-pressure term), and **mood** (a dopamine EMA that damps cortisol — resilience).
+"Satiation → focus" is principled: a satisfied drive lowers tonic NE → the phasic, focused mode (Aston-Jones-
+Cohen). (Energy is modelled as an opportunity-cost bias, not a fuel gate — the glucose/ego-depletion account
+is discredited, Hagger 2016.)
+
+**The dynamics layer.** Not-all-regions-active is an **ignition gate** (global workspace, Dehaene) — each
+system ignites only if its salience beats a threshold set by a single **entropy knob β** (the normal↔psychedelic
+axis, REBUS/Carhart-Harris). Attention shifts the **processing frequency** (gamma-fast window when focused,
+alpha-slow when disengaged, theta sampling) — a variable effective eligibility-window over the fixed tick. Sleep
+becomes a fixed **ultradian FSM** (SWS-heavy early → REM-heavy late) with SO-spindle-ripple coupling gating
+*when* consolidation commits.
+
+**Honest status + phased plan.** An adversarial pass (in the design doc) confirmed the *control* couplings are
+one real loop but flagged that the current histogram-based hippocampus cannot seed a semantic "gist" — hence P0
+uses sparse *byte-cues*, not vector reinstatement. Build order by value-per-effort: **P0 generative self-replay
+(done + verified)**; **P1** `SpikingEndocrine` over the existing knobs (drive→reward→focus, cortisol inverted-U,
+sleep-pressure); **P2** the oscillatory ignition/frequency layer; **P3** the full SO-spindle-ripple sleep FSM +
+a richer hippocampal trace so reinstatement can carry sequence, not just letter statistics. Each ships behind a
+toggle with an acceptance test, and lands one piece at a time — the lesson of the faithfulness build.

@@ -596,6 +596,30 @@ class SpikingBrain(nn.Module):
         self.train()
         return prompt + bytes(out).decode("utf-8", "replace")
 
+    @torch.no_grad()
+    def generative_replay(self, n=8, dream_len=160, temperature=1.1, cues=None,
+                          probe=None, anchor=None, anchor_frac=0.2):
+        """§16 GENERATIVE SELF-REPLAY (pseudo-rehearsal) — the buffer-free consolidation. The cortex DREAMS
+        sequences from its OWN dynamics and hard-learns them, so its generalized memory is rehearsed with NO
+        raw replay buffer (CLS; Robins 1995, Shin 2017, van de Ven 2020). Diverse high-temperature dreams
+        sample the whole learned distribution → it rehearses everything it knows (forgetting-resistance).
+        Safeguards vs the self-reinforcing 'overfitted brain': a small VERIDICAL anchor fraction keeps replay
+        on the data manifold, and an ACCEPTANCE monitor on a held-out probe reports drift so the caller can
+        raise the anchor if replay degrades. `cues` = sparse byte-cues (the hippocampal index, not the episode)."""
+        cues = cues or [""]
+        before = self.bits_per_byte(probe) if probe is not None else None
+        dreamed = 0
+        for i in range(n):
+            if anchor is not None and (i / max(1, n)) < anchor_frac:      # veridical anchor (small fraction)
+                text = anchor if isinstance(anchor, str) else anchor[i % len(anchor)]
+            else:
+                cue = cues[i % len(cues)]                                 # sparse cue → DREAM the continuation
+                text = self.generate(cue, n=dream_len, temperature=temperature)
+            if len(text) >= 32:
+                self.learn_text(text, epochs=1, max_steps=2); dreamed += 1
+        drift = (self.bits_per_byte(probe) - before) if probe is not None else 0.0   # >0 = replay hurt the probe
+        return dict(dreamed=dreamed, probe_drift=round(float(drift), 4))
+
     # ---- eval -------------------------------------------------------- #
     @torch.no_grad()
     def next_byte_acc(self, text):

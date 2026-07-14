@@ -184,6 +184,14 @@ freeze_growth, freeze_sleep, freeze_learning, max_model_gb (=checkpoint cap), ha
 cap), max_log_mb, max_tb_mb, visual, teacher`. Only initial `hidden` (neuron population), `syn_density`,
 `layers`, `device`, `core` need `/api/start` (which resumes the checkpoint, so nothing is lost).
 
+**Deeper-brain R&D (§16, paper).** Three literature-grounded research threads + an integrated design live in
+`runs/{memory_architecture,drive_stress,dynamics_oscillations}_research.md` + `runs/deeper_brain_integrated_design.md`:
+memory should be *generative-in-the-net* not a raw buffer, plus a subcortical drive/cortisol layer and dynamic
+oscillatory states. **P0 is built + verified**: `sleep_mode` = `generative` runs buffer-free **generative
+self-replay** (the cortex dreams from its own dynamics and hard-learns it; forgetting-resistance verified >
+raw-buffer in `runs/generative_replay_test.py`), live-tunable via `/api/set {sleep_mode, gr_dreams, gr_dream_len,
+gr_temperature, gr_anchor_frac}` with metrics `sleep_mode / gr_probe_drift / gr_dream_entropy` in `/api/state`.
+
 **Faithfulness stack via `/api/net`** `{target:'cortex', …}` (no restart, each independent): `learn_rule,
 feedback_mode, two_compartment, diff_neuromod, dale, dendritic, bounded_synapses, homeostasis, btsp,
 stochastic, metabolic` + their hyperparameters (`eprop_lr_scale, fb_decay, burst_thr, w_max, target_rate,

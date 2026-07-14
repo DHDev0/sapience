@@ -205,6 +205,12 @@ class Controller:
                     setattr(L.brain, k, int(v)); applied[k] = int(v)
                 elif k in ("freeze_growth", "freeze_sleep", "freeze_learning"):
                     setattr(L, k, bool(v)); applied[k] = bool(v)
+                elif k == "sleep_mode":                          # §16: buffer vs GENERATIVE self-replay
+                    L.sleep_mode = v if v in ("buffer", "generative") else L.sleep_mode; applied[k] = L.sleep_mode
+                elif k in ("gr_dreams", "gr_dream_len"):
+                    setattr(L, k, max(1, int(v))); applied[k] = getattr(L, k)
+                elif k in ("gr_temperature", "gr_anchor_frac"):
+                    setattr(L, k, max(0.0, float(v))); applied[k] = getattr(L, k)
                 elif k == "hard_disk_gb":
                     L.memory.hard = int(float(v) * 1e9); applied[k] = float(v)
                 elif k in ("visual", "teacher"):

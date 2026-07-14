@@ -189,6 +189,12 @@ class BrainLife:
         self.min_awake, self.max_awake = float(min_awake), float(max_awake)
         self.debt_threshold = float(debt_threshold)
         self.max_sleep = 900.0                 # cap on a single consolidation (s), live-tunable
+        # §16 consolidation mode (live-tunable): "buffer" = replay raw episodic buffer (default, safe);
+        # "generative" = GENERATIVE self-replay — dream from the net, buffer-free (verified forgetting-
+        # resistant in isolation). gr_* tune the dream count/length/temperature/veridical-anchor fraction.
+        self.sleep_mode = "buffer"
+        self.gr_dreams, self.gr_dream_len, self.gr_temperature, self.gr_anchor_frac = 8, 200, 1.1, 0.15
+        self._gr_drift, self._gr_entropy = 0.0, 0.0             # metrics: replay probe-drift + dream diversity
         self.wake_start = time.time()
         self.debt = 0.0
         self.sleep_remaining = 0
@@ -923,11 +929,29 @@ class BrainLife:
             else min(getattr(self, "sleep_chunks", 10), 5)
         steps = int(getattr(self, "sleep_steps", 14))
         sseq = int(getattr(self, "sleep_seq", 96)) if self.core == "spiking" else None
-        for _ in range(base):
-            chunk = self.memory.sample(1400)
-            if chunk and len(chunk) > 32 and not self.freeze_learning:
-                self.brain.learn_text(chunk, epochs=1, max_steps=steps, **({"seq": sseq} if sseq else {}))
-                self._replay_count = getattr(self, "_replay_count", 0) + 1   # replay-consolidation counter
+        mode = getattr(self, "sleep_mode", "buffer")
+        if mode == "generative" and self.core == "spiking" and not self.freeze_learning \
+                and hasattr(self.brain, "generative_replay"):
+            # §16 GENERATIVE self-replay: DREAM from the net (buffer-free); the raw buffer is demoted to
+            # sparse CUES + a small veridical ANCHOR (the safeguard), never the training data itself.
+            cues = [self.memory.sample(6) or "" for _ in range(max(1, base))]
+            probe = self.memory.sample(400)                              # held-out acceptance monitor (metric)
+            anchor = self.memory.sample(600) if getattr(self, "gr_anchor_frac", 0.15) > 0 else None
+            r = self.brain.generative_replay(n=int(getattr(self, "gr_dreams", base * 2)),
+                                             dream_len=int(getattr(self, "gr_dream_len", 200)),
+                                             temperature=float(getattr(self, "gr_temperature", 1.1)),
+                                             cues=cues, probe=probe, anchor=anchor,
+                                             anchor_frac=float(getattr(self, "gr_anchor_frac", 0.15)))
+            self._replay_count = getattr(self, "_replay_count", 0) + r["dreamed"]
+            self._gr_drift = r["probe_drift"]                            # metric: >0 = replay hurt the held-out probe
+            try: self._gr_entropy = float(self.brain.generate_diag(n=120).get("entropy_bits", 0.0))
+            except Exception: self._gr_entropy = 0.0                     # metric: dream diversity (low = degenerate)
+        else:
+            for _ in range(base):
+                chunk = self.memory.sample(1400)
+                if chunk and len(chunk) > 32 and not self.freeze_learning:
+                    self.brain.learn_text(chunk, epochs=1, max_steps=steps, **({"seq": sseq} if sseq else {}))
+                    self._replay_count = getattr(self, "_replay_count", 0) + 1   # replay-consolidation counter
         if not self.freeze_learning:
             with torch.no_grad():
                 for p in self.brain.parameters():
@@ -1512,6 +1536,9 @@ class BrainLife:
                   hippo_spike_rate=nd.get("hippo_spike_rate"), hippo_fidelity=nd.get("hippo_fidelity"),
                   bg_policy_entropy=nd.get("bg_policy_entropy"),
                   replay_total=getattr(self, "_replay_count", 0),
+                  sleep_mode=getattr(self, "sleep_mode", "buffer"),          # §16 consolidation mode
+                  gr_probe_drift=round(float(getattr(self, "_gr_drift", 0.0)), 4),   # generative-replay metrics
+                  gr_dream_entropy=round(float(getattr(self, "_gr_entropy", 0.0)), 3),
                   replay_mb=mem.get("disk_mb", 0), hot_mb=mem.get("hot_mb", 0),
                   lived_chars=mem.get("lived_chars", 0), segments=mem.get("segments", 0),
                   compression=mem.get("compression", 0), teach_queue=self._teach_q.qsize(),
