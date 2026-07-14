@@ -135,8 +135,15 @@ the dashboard's *faithfulness stack* panel), so each one's capability cost is *m
 | `stochastic` | probabilistic (noisy) spiking |
 | `metabolic` | spike-rate energy penalty in the objective |
 
-Each surfaces a metric (`fb_align_cos`, `ei_frac_excit`, `burst_frac`, `apical_mag`, `homeo_thr_mean`,
-`synapse_sat_frac`) in `GET /api/state` → `net.weights`. The measured **capability-vs-fidelity curve**
+The effective learning rate is **self-adapting**, not a dial: it is `eprop_lr_scale · attention`, where
+`attention` tracks the brain's own learning health (loss vs. a running baseline) — a loss spike drops it
+so the update shrinks and the representation self-heals; a healthy loss raises it to engage (Yerkes–Dodson).
+This is **scale-invariant by construction** (fan-in-normalized base + relative-loss attention), so the same
+settings move from 16k to a million neurons without retuning. Sleep cycles NREM↔REM with replay depth set
+by the day's novelty/debt. Each constraint surfaces a metric, and a suite of leading-indicator diagnostics
+(`attention`, `eff_lr_scale`, `loss_ema`, `mem_mag` = representation magnitude / the true runaway signal,
+`update_mag`, `grad_mag`, `surprise`, plus `fb_align_cos`, `ei_frac_excit`, `burst_frac`, `apical_mag`,
+`homeo_thr_mean`, `synapse_sat_frac`) is exposed in `GET /api/state` → `net.weights`. The measured **capability-vs-fidelity curve**
 — how many bits/byte each constraint costs — is `runs/fidelity_capability_curve.{py,md}`; the honest
 cortical-algorithm survey + roadmap (real interneuron populations, STDP, prospective-configuration, ripple-gated
 consolidation, DG neurogenesis, embodiment) is `runs/cortical_algorithm_research.md` and paper §15.17.

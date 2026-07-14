@@ -84,8 +84,17 @@ class SpikingBrain(nn.Module):
         # across network size (identical descent 8k↔64k↔256k). 2000 is the sustainably-stable default:
         # higher (e.g. 10000) descends faster short-term but can run away over long training once
         # synaptogenesis inflates the representation magnitude (measured). Tune up cautiously ≤4000.
-        self.eprop_lr_scale = 2000.0
+        self.eprop_lr_scale = 2000.0           # the BASE rate; the EFFECTIVE rate self-adapts via `attention`
         self._fanin_pow = 1.0                  # divide the update by N_j^p (p=1 → width-invariant descent)
+        # SELF-ADAPTING plasticity (§15.17): the learning rate is NOT a fixed dial to hand-tune — it is
+        # gated by `attention`, which tracks the brain's OWN learning health (loss vs. its running
+        # baseline). A loss spike above baseline (a shock / struggling) DROPS attention → the update
+        # shrinks → the representation is protected and re-learns gently (self-healing); at/below baseline
+        # attention rises to engage. This is the Yerkes–Dodson arousal→plasticity curve; it removes the
+        # need to manually chase eprop_lr_scale and would have auto-damped the Dale/lr excursions.
+        self.attention = 1.0
+        self.loss_ema = None
+        self.attn_sensitivity = 0.8            # how sharply attention drops with above-baseline loss
         # e-prop's top-down error path (§15.16). "learned" (DEFAULT) = Kolen-Pollack: the feedback
         # matrix B gets the SAME local gradient as the readout head (+ tiny decay), so it LEARNS to
         # align with the forward weights — no weight transport, strictly more faithful than fixed random.
@@ -459,7 +468,15 @@ class SpikingBrain(nn.Module):
         # change O(1) and the stable rate width-invariant (input scaling; each neuron knows only N_j).
         p = float(getattr(self, "_fanin_pow", 1.0))
         denom = float(B * T); dmax = 0.02
-        scale = float(gate) * lr * ((0.5 + da) if diffnm else 1.0)   # ACh gates (gate); DA reward-modulates the magnitude
+        # self-adapting attention: this step's loss vs. the brain's running baseline sets plasticity.
+        L = tot_loss / T
+        if getattr(self, "loss_ema", None) is None: self.loss_ema = L
+        surprise = (L - self.loss_ema) / max(self.loss_ema, 1.0)     # >0 = worse than usual (struggling)
+        sens = float(getattr(self, "attn_sensitivity", 0.8))
+        attn_t = min(1.3, max(0.2, 1.0 - sens * surprise))          # Yerkes–Dodson: high error → less plasticity
+        self.attention = 0.9 * float(getattr(self, "attention", 1.0)) + 0.1 * attn_t
+        self.loss_ema = 0.98 * self.loss_ema + 0.02 * L             # slow learning-health baseline
+        scale = float(gate) * lr * self.attention * ((0.5 + da) if diffnm else 1.0)   # ACh gates; ATTENTION self-adapts; DA reward-modulates
         def _upd(w, g, fin):
             w.add_((scale * (g / (denom * float(fin) ** p))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
         for l, c in enumerate(cells):
@@ -494,6 +511,19 @@ class SpikingBrain(nn.Module):
             self._project_dale()                               # re-impose E/I sign law after the update
         self._burst_frac = burst_frac
         if twocomp: self._apical_mag = float(ap[-1].abs().mean())   # apical-dendrite drive magnitude
+        # DIAGNOSTIC METRICS — the leading indicators the root-cause read needed (bpb alone lagged):
+        #  mem_mag = top-layer membrane |v| = the REPRESENTATION magnitude; a runaway here (the actual
+        #  collapse mechanism) climbs BEFORE bpb blows up. update_mag = per-step head Δw; grad_mag = raw
+        #  readout gradient. Together they show whether an excursion is drive-runaway, over-plasticity, or data.
+        _ct = cells[-1]
+        _grt = g_rec[-1]; _rf = (_ct.rec_fanin if sp(_ct) else _ct.hid)      # RECURRENT update = runaway-relevant
+        self._diag = dict(
+            mem_mag=float(v[-1].abs().mean()),                               # representation magnitude (runaway indicator)
+            grad_mag=float(gHead.abs().mean()),
+            update_mag=float((scale * (_grt / (denom * float(_rf) ** p))).clamp(-dmax, dmax).abs().mean()),
+            surprise=float(surprise),
+            rec_w_mag=float(_ct.rec_val.abs().mean() if sp(_ct) else _ct.Wrec.weight.abs().mean()),
+        )
         self._apply_prune_mask()
         return tot_loss / T
 
@@ -645,6 +675,12 @@ class SpikingBrain(nn.Module):
             out[f"L{i}_w_absmean"] = float(w.abs().mean())
             out[f"L{i}_w_std"] = float(w.std())
         out["head_w_std"] = float(self.head.weight.detach().std())
+        out["attention"] = float(getattr(self, "attention", 1.0))              # self-adapting plasticity gate
+        out["eff_lr_scale"] = float(getattr(self, "eprop_lr_scale", 2000.0) * getattr(self, "attention", 1.0))
+        if getattr(self, "loss_ema", None) is not None:
+            out["loss_ema"] = float(self.loss_ema)                             # the brain's learning-health baseline
+        for k, v in (getattr(self, "_diag", None) or {}).items():             # leading-indicator diagnostics
+            out[k] = round(float(v), 5)                                        # mem_mag/grad_mag/update_mag/surprise/rec_w_mag
         if getattr(self, "_fb", None):                                         # feedback↔forward alignment
             fb = self._fb[-1].detach().flatten().float(); hw = self.head.weight.detach().flatten().float()
             out["fb_align_cos"] = float(torch.dot(fb, hw) / (fb.norm() * hw.norm() + 1e-9))
@@ -949,6 +985,8 @@ class SpikingBrain(nn.Module):
                         sparse_cfg=getattr(self, "sparse_cfg", None),
                         pmask=getattr(self, "_pmask", None),
                         faith=self.faith_config(),                         # every fidelity-axis setting
+                        attention=getattr(self, "attention", 1.0),
+                        loss_ema=getattr(self, "loss_ema", None),
                         fb=(getattr(self, "_fb", None) if self.feedback_mode == "learned" else None),
                         ei=getattr(self, "_ei_sign", None),                # Dale E/I typing (learned state)
                         thr_adapt=getattr(self, "_thr_adapt", None)), path)  # homeostatic thresholds
@@ -998,6 +1036,7 @@ class SpikingBrain(nn.Module):
         self.prune_frac = d.get("prune_frac", getattr(self, "prune_frac", 0.05))
         for k, v in (d.get("faith") or {}).items():                      # restore every fidelity-axis setting
             setattr(self, k, v)
+        self.attention = d.get("attention", 1.0); self.loss_ema = d.get("loss_ema", None)
         if d.get("fb") is not None:   self._fb = [t.to(self.device) for t in d["fb"]]        # aligned feedback
         if d.get("ei") is not None:   self._ei_sign = [t.to(self.device) for t in d["ei"]]   # Dale E/I typing
         if d.get("thr_adapt") is not None: self._thr_adapt = [t.to(self.device) for t in d["thr_adapt"]]

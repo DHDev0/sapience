@@ -454,6 +454,23 @@ rather than asserted:
 - **Stochastic spiking** — probabilistic firing (membrane noise before threshold; noisy vesicle release).
 - **Metabolic cost** — a spike-rate penalty in the learning signal (real coding is energy-constrained).
 
+**Self-adapting plasticity, and why the hyperparameters are scale-free.** The effective learning rate
+is *not* a dial to hand-tune — it is `eprop_lr_scale · attention`, where **attention** self-regulates on
+the brain's own learning health: each step's loss is compared to a running baseline, and a loss spike
+above baseline (a shock, or over-plasticity) *drops* attention → the update shrinks → the representation
+is protected and re-learns gently (the Yerkes–Dodson arousal→plasticity curve). This makes learning
+self-healing — an injected weight shock recovers autonomously, and the rate that once caused a runaway
+stays bounded — and it removes hand-tuning. Sleep, correspondingly, cycles NREM↔REM under the §5 tones
+with replay depth gated by the day's novelty/debt, so *when* and *how hard* it consolidates is set by the
+day, not a constant. The design is **scale-invariant by construction**, which is what lets the same
+hyperparameters move from a 16k to a 256k to a million-neuron cortex without retuning: the base rate is
+**fan-in-normalized** (÷N_j → the per-neuron drive change, and hence the representation magnitude, is
+width-invariant — verified: `mem_mag` 1.357 at 16k vs 1.367 at 64k under identical settings), attention
+runs on the *relative* loss (dimensionless → size-independent), and the Δmax bound is per-synapse. A suite
+of leading-indicator diagnostics (`mem_mag` = representation magnitude, the true runaway signal that
+climbs *before* bits/byte does; `update_mag`, `grad_mag`, `attention`, `eff_lr_scale`, `surprise`,
+`loss_ema`) is exposed in `GET /api/state`, because bits/byte alone lags the dynamics.
+
 **One circuit, not separate toggles (the unification).** The toggles above are *axes*, but three of
 them are really one biological circuit, and `two_compartment=True` fuses them: each neuron gets an
 **apical dendrite** (the §3.7 `TwoCompartmentLIF` compartment, now load-bearing) with its own membrane

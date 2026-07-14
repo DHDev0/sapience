@@ -904,10 +904,15 @@ class BrainLife:
                  f"{self.sleep_remaining:.0f}s")
 
     def _sleep_tick(self):
-        """§8-9 NREM: the deep-learning phase. Sleep replays many chunks of the WHOLE life
-        (tiered episodic memory) with heavy BPTT (waking thought stays fast; sleep does the
-        real consolidation, as in the brain), then §8.4 SHY multiplicative downscale so
-        sleep also renormalises (restores ⟨Δw⟩_wake + ⟨Δw⟩_sleep ≈ 0, not only potentiates)."""
+        """§8-9 sleep: the deep-learning phase. Sleep replays many chunks of the WHOLE life
+        (tiered episodic memory) under the default learning rule (faithful e-prop; waking thought
+        stays fast, sleep does the real consolidation), then §8.4 SHY multiplicative downscale so
+        sleep also renormalises (restores ⟨Δw⟩_wake + ⟨Δw⟩_sleep ≈ 0, not only potentiates).
+        The night CYCLES NREM↔REM: NREM (low ACh/NE) consolidates; a periodic REM sub-phase
+        (high ACh, zero NE) integrates — different phases of plasticity intensity, as in biology."""
+        if self.modules_on:                                    # NREM/REM cycle (phases of intensity)
+            self._sleep_phase_t = getattr(self, "_sleep_phase_t", 0) + 1
+            self.nm.set_phase("rem" if self._sleep_phase_t % 5 == 0 else "nrem")   # ~1-in-5 ticks = REM
         # §4 novelty-gated replay (CLS): a life full of NOVEL experience replays harder;
         # a familiar one consolidates lightly (the hippocampal salience signal sets the load).
         # replay load = novelty-gated chunk count × per-chunk BPTT steps. Both are live-tunable
