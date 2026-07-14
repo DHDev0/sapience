@@ -23,10 +23,10 @@ def test_entropy_tracks_arousal():
 
 def test_attention_sets_processing_frequency():
     d = SpikingDynamics(); d.on = True
-    focused = d.eligibility_beta(attention=1.3)                  # focused → gamma (short window, high decay)
-    disengaged = d.eligibility_beta(attention=0.3)               # disengaged → alpha (long window)
-    assert focused > disengaged                                  # focus shortens the eligibility window
-    assert d.f_alpha <= disengaged <= focused <= d.f_gamma + 1e-9
+    focused = d.eligibility_beta(attention=1.3)                  # focused → gamma → SHORT window → LOW eb
+    disengaged = d.eligibility_beta(attention=0.3)               # disengaged → alpha → LONG window → HIGH eb
+    assert focused < disengaged                                  # focus SHORTENS the eligibility window (lower eb)
+    assert d.f_gamma <= focused <= disengaged <= d.f_alpha + 1e-9
 
 
 def test_set_params_and_state():

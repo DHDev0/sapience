@@ -187,16 +187,23 @@ cap), max_log_mb, max_tb_mb, visual, teacher`. Only initial `hidden` (neuron pop
 **Deeper-brain R&D (§16, paper).** Three literature-grounded research threads + an integrated design live in
 `runs/{memory_architecture,drive_stress,dynamics_oscillations}_research.md` + `runs/deeper_brain_integrated_design.md`:
 memory should be *generative-in-the-net* not a raw buffer, plus a subcortical drive/cortisol layer and dynamic
-oscillatory states. **P0–P2 built + verified** (all opt-in, live-tunable, metric'd, device/dtype-safe, persisted; default OFF):
-- **P0 generative self-replay** — `sleep_mode=generative` dreams from the net, buffer-free (forgetting-resistance >
-  raw-buffer, `runs/generative_replay_test.py`). `/api/set {sleep_mode, gr_dreams, gr_dream_len, gr_temperature,
-  gr_anchor_frac}`; metrics `sleep_mode/gr_probe_drift/gr_dream_entropy`.
-- **P1 endocrine** (`brain/endocrine.py`) — drive-deficit + cortisol + mood: satiation→reward→focus, cortisol
-  inverted-U on plasticity, chronic-stress→allostatic-load→impaired→sleep-recovers (`runs/endocrine_test.py`).
-  `/api/net {target:'endocrine', on, alpha_D, tau_C, C_star, …}`; metrics in `/api/state → netparams.endocrine`.
+oscillatory states. **P0–P2 built, verified, and A/B-measured** (all opt-in, live-tunable, metric'd, device/dtype-safe,
+persisted; default OFF). Each was measured on the metric it claims to touch (`runs/deeper_brain_measure.py`), the
+§15.17 way — the honest verdict: **P0 helps memory; P1/P2 do no harm to learning but are neutral on bits/byte** —
+their value is behavioural/compute-realism, not lower loss, and the paper's ledger says so:
+- **P0 generative self-replay** — `sleep_mode=generative` dreams from the net, buffer-free. **HELPS memory:**
+  forgetting-resistance retention **none 0.232 < buffer 0.255 < generative 0.274** (`runs/generative_replay_test.py`).
+  `/api/set {sleep_mode, gr_dreams, gr_dream_len, gr_temperature, gr_anchor_frac}`; metrics `sleep_mode/gr_probe_drift/gr_dream_entropy`.
+- **P1 endocrine** (`brain/endocrine.py`) — drive-deficit + cortisol + mood: satiation→reward→focus, a **one-sided**
+  cortisol gate (calm→optimal = full plasticity, only chronic-high impairs → allostatic-load → sleep-recovers,
+  `runs/endocrine_test.py`). **NEUTRAL on bits/byte** (−0.001); value is behavioural (drive/focus/stress over a
+  lifetime). `/api/net {target:'endocrine', on, alpha_D, tau_C, C_star, …}`; metrics in `/api/state → netparams.endocrine`.
 - **P2 dynamics** (`brain/dynamics.py`) — entropy knob β (normal↔psychedelic), **selective ignition** (not all
-  systems active every cycle), attention→**processing frequency** (eligibility window). `/api/net {target:'dynamics',
-  on, beta0, ignite_thr, …}`; metrics `beta/n_active/eff_freq` in `netparams.dynamics`.
+  systems active every cycle), attention→**processing frequency** (eligibility window). **NEUTRAL on bits/byte**
+  (+0.004); value is not-all-on realism + selective compute. `/api/net {target:'dynamics', on, beta0, ignite_thr, …}`;
+  metrics `beta/n_active/eff_freq` in `netparams.dynamics`.
+- **P3 (roadmap, NOT built):** ripple-gated sleep FSM, sequence-carrying hippocampal trace, typed PV/SOM/VIP
+  interneuron *populations* (today scalars), STDP kernel, adult-DG neurogenesis, embodiment/closed sensorimotor loop.
 
 **Faithfulness stack via `/api/net`** `{target:'cortex', …}` (no restart, each independent): `learn_rule,
 feedback_mode, two_compartment, diff_neuromod, dale, dendritic, bounded_synapses, homeostasis, btsp,

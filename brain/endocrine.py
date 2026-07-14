@@ -65,8 +65,12 @@ class SpikingEndocrine:
         self.D_energy = max(0.0, self.D_energy - 0.02); self.D_novelty = max(0.0, self.D_novelty - 0.02)
 
     def plasticity_gain(self):
-        """Inverted-U cortisol modulation, capped by allostatic load. g(C) ∈ (0,1] (moderate C ⇒ ≈1)."""
-        g = math.exp(-((self.C - self.C_star) ** 2) / (2.0 * self.C_sigma ** 2 + 1e-9))
+        """Cortisol modulation of plasticity, capped by allostatic load. ONE-SIDED: plasticity is FULL up to the
+        optimal cortisol C_star (calm→acute-moderate learning is unthrottled), and only CHRONIC-HIGH cortisol
+        impairs it (Lupien 2009: sustained stress harms). g(C) ∈ (0,1]. (Measurement §16 exposed that a
+        bidirectional inverted-U wrongly throttled calm learning; the impairing arm is the load-bearing one.)"""
+        over = max(0.0, self.C - self.C_star)
+        g = math.exp(-(over ** 2) / (2.0 * self.C_sigma ** 2 + 1e-9))
         return g * (1.0 - 0.5 * self.AL)
 
     def ne_gain(self):
@@ -83,7 +87,10 @@ class SpikingEndocrine:
             if k not in self._KEYS:
                 continue
             cur = getattr(self, k, None)
-            v = bool(v) if isinstance(cur, bool) else (float(v) if cur is not None else v)
+            if isinstance(cur, bool):                          # string 'false'/'0'/'off' must disable, not enable
+                v = v if isinstance(v, bool) else str(v).strip().lower() not in ("false", "0", "off", "no", "")
+            elif cur is not None:
+                v = float(v)
             setattr(self, k, v); applied[k] = getattr(self, k)
         return applied
 

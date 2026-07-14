@@ -23,15 +23,14 @@ check("satiation emits a homeostatic reward (r_home>0)", r_meet > 0.0)
 check("satiation LOWERS NE-gain → focus (Aston-Jones-Cohen)", fed_ne < starved_ne)
 print(f"     starved: D={starved_D:.2f} NE={starved_ne:.2f}  ->  fed: D={fed_D:.2f} NE={fed_ne:.2f}  r_home={r_meet:.3f}")
 
-# (2) cortisol inverted-U on plasticity
-print("(2) cortisol inverted-U plasticity gain g(C):")
+# (2) cortisol one-sided gate on plasticity (calm→optimal full; only chronic-high impairs)
+print("(2) cortisol plasticity gain g(C) (one-sided: calm full, chronic-high impairs):")
 e2 = SpikingEndocrine()
 gains = []
 for C in (0.0, 0.15, 0.35, 0.6, 1.0):
     e2.C = C; e2.AL = 0.0; gains.append((C, e2.plasticity_gain()))
-peak = max(gains, key=lambda x: x[1])[0]
-check("g(C) peaks at moderate cortisol (~C_star), not at 0 or high", 0.2 <= peak <= 0.5)
-check("high cortisol impairs plasticity vs the peak", gains[-1][1] < gains[2][1])
+check("calm→optimal cortisol = FULL plasticity (unthrottled)", gains[0][1] >= 0.95 and gains[2][1] >= 0.95)
+check("chronic-high cortisol impairs plasticity", gains[-1][1] < gains[2][1])
 print("     " + "  ".join(f"C={c:.2f}:g={g:.2f}" for c, g in gains))
 
 # (3) chronic stress → allostatic load → impaired; sleep recovers

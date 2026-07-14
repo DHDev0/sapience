@@ -1631,6 +1631,10 @@ class BrainLife:
                                  feed_mode=self.feed_mode, focus_label=self.focus_label,
                                  topics=self.topics, browse=self.browse,
                                  novelty_gate=getattr(self, "novelty_gate", 0.15),
+                                 sleep_mode=getattr(self, "sleep_mode", "buffer"),        # §16 P0 consolidation mode
+                                 gr_dreams=getattr(self, "gr_dreams", 8), gr_dream_len=getattr(self, "gr_dream_len", 200),
+                                 gr_temperature=getattr(self, "gr_temperature", 1.1),
+                                 gr_anchor_frac=getattr(self, "gr_anchor_frac", 0.15),
                                  net=self._net_params()))
             if self.modules_on:                              # §2/§4 state (curiosity + episodes)
                 life["modules"] = dict(bg_wv=self.bg.w_v, bg_wpi=self.bg.W_pi, bg_M=self.bg.M,
@@ -1647,10 +1651,12 @@ class BrainLife:
                                        bg_density=getattr(self.bg, "syn_density", 1.0),
                                        hippo_smask=getattr(self.hippo, "_smask", None),
                                        hippo_density=getattr(self.hippo, "syn_density", 1.0))
-                if hasattr(self, "endocrine"):               # §16 endocrine hormone state + params
-                    life["modules"]["endocrine"] = {k: getattr(self.endocrine, k)
-                                                     for k in ("on", "D_energy", "D_novelty", "C", "M", "AL",
-                                                               "alpha_D", "tau_C", "C_star", "C_sigma")}
+                if hasattr(self, "endocrine"):               # §16 endocrine: full tunable params + hormone state
+                    life["modules"]["endocrine"] = {**{k: getattr(self.endocrine, k) for k in self.endocrine._KEYS},
+                                                    **{k: getattr(self.endocrine, k)
+                                                       for k in ("D_energy", "D_novelty", "C", "M", "AL")}}
+                if hasattr(self, "dynamics"):                # §16 P2 dynamics: all tunable params
+                    life["modules"]["dynamics"] = {k: getattr(self.dynamics, k) for k in self.dynamics._KEYS}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1678,7 +1684,8 @@ class BrainLife:
                       "think_chunk", "learn_steps", "sleep_chunks", "sleep_steps", "sleep_seq",
                       "resonate_k", "grow_add", "freeze_growth",
                       "freeze_sleep", "freeze_learning", "use_visual", "max_log_mb", "max_tb_mb",
-                      "think_temp", "feed_mode", "focus_label", "topics", "browse", "novelty_gate"):
+                      "think_temp", "feed_mode", "focus_label", "topics", "browse", "novelty_gate",
+                      "sleep_mode", "gr_dreams", "gr_dream_len", "gr_temperature", "gr_anchor_frac"):  # §16 P0
                 if k in c:
                     setattr(self, k, c[k])
             if "grow_until" in c: self.brain.grow_until = c["grow_until"]
@@ -1711,6 +1718,8 @@ class BrainLife:
                 self._last_topic = m.get("last_topic", 0); self._novelty = m.get("novelty", 1.0)
                 if hasattr(self, "endocrine") and m.get("endocrine"):   # §16 restore hormone state + params
                     for k, v in m["endocrine"].items(): setattr(self.endocrine, k, v)
+                if hasattr(self, "dynamics") and m.get("dynamics"):     # §16 P2 restore dynamics params
+                    for k, v in m["dynamics"].items(): setattr(self.dynamics, k, v)
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)

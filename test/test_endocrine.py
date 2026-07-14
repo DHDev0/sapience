@@ -12,12 +12,13 @@ def test_satiation_emits_reward_and_focuses():
     assert e.ne_gain() < ne_starved                                # satiation lowers NE-gain → focus
 
 
-def test_cortisol_inverted_u():
+def test_cortisol_gates_plasticity():
     e = SpikingEndocrine()
     g = {}
     for C in (0.0, 0.35, 1.0):
         e.C, e.AL = C, 0.0; g[C] = e.plasticity_gain()
-    assert g[0.35] > g[0.0] and g[0.35] > g[1.0]                    # moderate cortisol is best (Yerkes-Dodson)
+    assert g[0.0] >= 0.95 and g[0.35] >= 0.95                       # calm→optimal = FULL plasticity (unthrottled)
+    assert g[1.0] < g[0.35]                                         # only CHRONIC-high cortisol impairs (Lupien)
 
 
 def test_chronic_stress_impairs_then_sleep_recovers():

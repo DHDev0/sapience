@@ -21,7 +21,9 @@ class SpikingDynamics:
         self.beta0 = 2.0                       # base entropy/gain (the normal↔psychedelic dial: raise → all-on)
         self.kappa = 1.0                       # attention's contribution to β
         self.ignite_thr = 0.5                  # a subsystem runs if its ignition gate > this
-        self.f_alpha, self.f_gamma = 0.90, 0.975   # eligibility-decay endpoints: alpha=long window, gamma=short
+        # eligibility-decay eb endpoints (window τ≈1/(1-eb)): ALPHA = disengaged = LONG window = HIGH eb;
+        # GAMMA = focused = SHORT window = LOW eb. (Fixed: eb is a retention factor, so short window = low eb.)
+        self.f_alpha, self.f_gamma = 0.975, 0.90
         self._beta = self.beta0
         self._active = {}                      # last ignition mask (metric)
 
@@ -56,7 +58,10 @@ class SpikingDynamics:
             if k not in self._KEYS:
                 continue
             cur = getattr(self, k, None)
-            v = bool(v) if isinstance(cur, bool) else (float(v) if cur is not None else v)
+            if isinstance(cur, bool):                          # string 'false'/'0'/'off' must disable, not enable
+                v = v if isinstance(v, bool) else str(v).strip().lower() not in ("false", "0", "off", "no", "")
+            elif cur is not None:
+                v = float(v)
             setattr(self, k, v); applied[k] = getattr(self, k)
         return applied
 

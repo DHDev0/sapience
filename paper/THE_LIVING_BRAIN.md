@@ -616,17 +616,51 @@ acceptance test, landing one piece at a time (the lesson of the faithfulness bui
   beyond the raw buffer.
 - **P1 `SpikingEndocrine` — done + verified** (`brain/endocrine.py`). Three bounded hormone scalars — a drive
   deficit (met by learning-progress → a homeostatic-RL reward into the dopamine critic, and satiation → low NE →
-  focus), cortisol (an inverted-U gate on plasticity — moderate sharpens, chronic-high impairs; and the
-  sleep-pressure term), and mood (a dopamine EMA that damps cortisol). Verified: satiation emits reward + focuses;
-  g(C) peaks at moderate stress; chronic stress accrues allostatic load + impairs, and **sleep recovers it**
-  (`runs/endocrine_test.py`). Live via `/api/net endocrine`; metrics `cortisol/drive/mood/allostatic/plasticity_gain`.
+  focus), cortisol (a **one-sided** gate on plasticity — calm→optimal learning is full, only chronic-high cortisol
+  impairs, capped further by allostatic load; and it is the sleep-pressure term), and mood (a dopamine EMA that
+  damps cortisol). Verified: satiation emits reward + focuses; calm cortisol leaves plasticity full while
+  chronic-high impairs; chronic stress accrues allostatic load, and **sleep recovers it** (`runs/endocrine_test.py`).
+  Live via `/api/net endocrine`; metrics `cortisol/drive/mood/allostatic/plasticity_gain`.
 - **P2 dynamic states — done + verified** (`brain/dynamics.py`). A single entropy knob β (the normal↔psychedelic
   dial) drives **selective ignition** — auxiliary systems run only when salient, so the brain is not all-on every
   cycle (verified: 1-of-3 fire when one is salient) — and attention sets the **processing frequency** (a
   gamma-short eligibility window when focused, alpha-long when disengaged). Live via `/api/net dynamics`; metrics
   `beta/n_active/eff_freq`.
-- **P3 (roadmap)** the full SO-spindle-ripple sleep FSM + a richer hippocampal trace so reinstatement carries
-  sequence, not just letter statistics; typed PV/SOM/VIP interneuron populations; STDP.
 
-All three new layers default OFF (opt-in, verified in isolation), are device/dtype-agnostic scalars, and persist
-across checkpoints — so the deeper brain can be switched on and tuned live without disturbing the running cortex.
+**The obligation of breadth: measured, not asserted.** §15.17 taught that a mechanism earns its place only
+after an A/B on the metric it claims to touch. The same discipline applies here. `runs/deeper_brain_measure.py`
+turns each of P1/P2 on in isolation over an identical cortex (16k neurons, same seed/data, endocrine driven from
+the live learning signal with a periodic "night" of sleep-relief) and measures the bits/byte effect; P0's benefit
+is a separate forgetting-resistance test. The honest ledger:
+
+| §16 mechanism | measured effect | verdict on bits/byte | where its value actually lives |
+|---|---|---|---|
+| **P0** generative self-replay | retention **none 0.232 < buffer 0.255 < generative 0.274** | **HELPS memory** (forgetting-resistance) | catastrophic-forgetting resistance, buffer-free |
+| **P1** endocrine | bpb 3.999 → **3.998 (−0.001)** | **NEUTRAL** on learning | behavioural — drive-driven exploration/focus, chronic-stress regulation, sleep-pressure, over a *lifetime* (not a per-step bpb effect) |
+| **P2** dynamics | bpb 3.999 → **4.003 (+0.004)** | **NEUTRAL** on learning | selective compute (not-all-on realism) + the attention→frequency window |
+| P1+P2 | bpb 3.999 → **4.001 (+0.002)** | **NEUTRAL** | — |
+
+The measurement earned its keep: the first run showed the endocrine *hurting* (+0.066) because a textbook
+*bidirectional* inverted-U throttled **calm** learning (resting cortisol sits below the optimum). That was a
+genuine design flaw the A/B exposed — the impairing arm (chronic-high) is the load-bearing one, so the gate is
+now one-sided (calm→optimal full, only chronic-high impairs), and the endocrine is now correctly neutral on
+learning. **The verdict is honest both ways:** P0 measurably helps memory and can carry its weight; P1 and P2 are
+**do-no-harm on bits/byte** — they are not learning-rate wins, they are *behavioural- and compute-realism* layers,
+and the ledger says so plainly. That is exactly why all three default **OFF**: they are opt-in enrichments whose
+value is measured where it lives, not smuggled in as if they lowered loss.
+
+Two faithfulness constraints the same rule already covers, lest they read as "missing": **metabolic cost**
+(a spike-rate energy penalty) and **stochastic spiking** are built and measured as §15.17 toggles — metabolic
+costs ≈ +0.14 bpb (the expected price of an energy constraint; the brain learns to spike less), stochastic is
+≈ neutral — both honest, both default off.
+
+- **P3 (roadmap — explicitly NOT built).** Named so the ledger is not mistaken for completeness: the full
+  SO-spindle-ripple sleep FSM (ripple-*gated* consolidation commit); a richer hippocampal trace so reinstatement
+  carries *sequence*, not just letter statistics; typed PV/SOM/VIP interneuron **populations** (today they are
+  functional scalars, not spiking sub-nets); an STDP timing kernel; adult-DG **neurogenesis**; and an
+  **embodiment / closed sensorimotor loop**. Each will land the §15.17 way — one toggle, one A/B, one honest row —
+  or not at all.
+
+All three shipped layers default OFF (opt-in, each verified in isolation and A/B-measured above), are
+device/dtype-agnostic scalars, and persist across checkpoints — so the deeper brain can be switched on and tuned
+live without disturbing the running cortex.
