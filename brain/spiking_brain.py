@@ -392,6 +392,8 @@ class SpikingBrain(nn.Module):
                 psi_l = self._psi(vfire - thr); z[l] = (vfire >= thr).float()
                 if homeo: spk_sum[l] = spk_sum[l] + z[l].sum(0)
                 eb = ebeta if btsp else c.beta                 # BTSP: eligibility outlives the membrane
+                dyn_eb = getattr(self, "_dyn_elig_beta", None)  # §16 P2: attention→FREQUENCY sets the window
+                if dyn_eb is not None: eb = float(dyn_eb)       #   (gamma-short when focused, alpha-long when not)
                 if diffnm: eb = min(0.995, eb * ht_pat)        # 5-HT stretches the eligibility window (patience)
                 eps_rec[l] = eb * eps_rec[l] + z_prev          # ε^v forward eligibility (per pre-neuron)
                 eps_in[l] = eb * eps_in[l] + layer_in

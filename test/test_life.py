@@ -72,7 +72,8 @@ def test_set_net_per_module():
     assert L.set_net("hippocampus", {"beta": 12})["applied"]["beta"] == 12.0
     assert L.set_net("neuromod", {"da": 0.9})["applied"]["da"] == 0.9
     assert L.set_net("cerebellum", {"eta": 0.5})["applied"]["eta"] == 0.5
-    assert set(L._net_params().keys()) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum"}
+    assert L.set_net("endocrine", {"on": True, "C_star": 0.4})["applied"]["C_star"] == 0.4   # §16 P1
+    assert set(L._net_params().keys()) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum", "endocrine", "dynamics"}
 
 
 def test_freezes():

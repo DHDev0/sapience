@@ -609,8 +609,24 @@ becomes a fixed **ultradian FSM** (SWS-heavy early → REM-heavy late) with SO-s
 
 **Honest status + phased plan.** An adversarial pass (in the design doc) confirmed the *control* couplings are
 one real loop but flagged that the current histogram-based hippocampus cannot seed a semantic "gist" — hence P0
-uses sparse *byte-cues*, not vector reinstatement. Build order by value-per-effort: **P0 generative self-replay
-(done + verified)**; **P1** `SpikingEndocrine` over the existing knobs (drive→reward→focus, cortisol inverted-U,
-sleep-pressure); **P2** the oscillatory ignition/frequency layer; **P3** the full SO-spindle-ripple sleep FSM +
-a richer hippocampal trace so reinstatement can carry sequence, not just letter statistics. Each ships behind a
-toggle with an acceptance test, and lands one piece at a time — the lesson of the faithfulness build.
+uses sparse *byte-cues*, not vector reinstatement. Build order by value-per-effort, each behind a toggle with an
+acceptance test, landing one piece at a time (the lesson of the faithfulness build):
+
+- **P0 generative self-replay — done + verified.** `SpikingBrain.generative_replay` (above); forgetting-resistant
+  beyond the raw buffer.
+- **P1 `SpikingEndocrine` — done + verified** (`brain/endocrine.py`). Three bounded hormone scalars — a drive
+  deficit (met by learning-progress → a homeostatic-RL reward into the dopamine critic, and satiation → low NE →
+  focus), cortisol (an inverted-U gate on plasticity — moderate sharpens, chronic-high impairs; and the
+  sleep-pressure term), and mood (a dopamine EMA that damps cortisol). Verified: satiation emits reward + focuses;
+  g(C) peaks at moderate stress; chronic stress accrues allostatic load + impairs, and **sleep recovers it**
+  (`runs/endocrine_test.py`). Live via `/api/net endocrine`; metrics `cortisol/drive/mood/allostatic/plasticity_gain`.
+- **P2 dynamic states — done + verified** (`brain/dynamics.py`). A single entropy knob β (the normal↔psychedelic
+  dial) drives **selective ignition** — auxiliary systems run only when salient, so the brain is not all-on every
+  cycle (verified: 1-of-3 fire when one is salient) — and attention sets the **processing frequency** (a
+  gamma-short eligibility window when focused, alpha-long when disengaged). Live via `/api/net dynamics`; metrics
+  `beta/n_active/eff_freq`.
+- **P3 (roadmap)** the full SO-spindle-ripple sleep FSM + a richer hippocampal trace so reinstatement carries
+  sequence, not just letter statistics; typed PV/SOM/VIP interneuron populations; STDP.
+
+All three new layers default OFF (opt-in, verified in isolation), are device/dtype-agnostic scalars, and persist
+across checkpoints — so the deeper brain can be switched on and tuned live without disturbing the running cortex.

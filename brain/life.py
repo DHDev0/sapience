@@ -27,6 +27,8 @@ import torch
 from .rnn_brain import ByteRNNBrain
 from .memory import EpisodicMemory
 from .spiking_modules import SpikingCerebellum, SpikingBasalGanglia, SpikingHippocampus, SpikingNeuromod
+from .endocrine import SpikingEndocrine
+from .dynamics import SpikingDynamics
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -164,6 +166,8 @@ class BrainLife:
             # CSR store because it is the only O(neurons²) system — the others are neurons×const).
             n_gran = max(1500, int(hidden))
             self.nm = SpikingNeuromod((1,), self.dev)                                  # §5 (tone only)
+            self.endocrine = SpikingEndocrine(self.dev)                                # §16 slow drive/stress layer (P1)
+            self.dynamics = SpikingDynamics(self.dev)                                  # §16 dynamic states + rhythm (P2)
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
                                           alpha_v=0.1, alpha_pi=0.3, seed=seed, syn_density=syn_density)  # §2
@@ -298,6 +302,15 @@ class BrainLife:
             # e-prop this M is the LITERAL three-factor gate on the eligibility update; under BPTT it
             # falls back to scaling the optimiser lr.
             gate = self.nm.tone["ach"] if self.modules_on else 1.0
+            endo = getattr(self, "endocrine", None)
+            if endo is not None and endo.on:                        # §16 endocrine gates plasticity + arousal
+                gate = gate * endo.plasticity_gain()                # cortisol inverted-U (acute sharpens, chronic impairs)
+                self.nm.tone["ne"] = endo.ne_gain()                 # satiation → focus (low NE); deficit → exploration
+            dyn = getattr(self, "dynamics", None)
+            if dyn is not None and dyn.on:                          # §16 P2 attention → processing frequency
+                self.brain._dyn_elig_beta = dyn.eligibility_beta(float(getattr(self.brain, "attention", 1.0)))
+            elif hasattr(self.brain, "_dyn_elig_beta"):
+                self.brain._dyn_elig_beta = None                    # off → the native eligibility timescale
             eprop = getattr(self.brain, "learn_rule", "bptt") == "eprop"
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr * gate
@@ -307,6 +320,12 @@ class BrainLife:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr
             if isinstance(r, tuple):                    # (first_loss, last_loss): free progress
                 progress = max(0.0, r[0] - r[1])
+            if endo is not None and endo.on:            # §16 wake tick → homeostatic-RL reward (satiation)
+                dg = getattr(self.brain, "_diag", {}) or {}
+                threat = max(0.0, 1.0 - float(getattr(self.brain, "attention", 1.0)))   # loss-shock = threat
+                self._r_home = endo.wake_tick(surprise=dg.get("surprise", 0.0), threat=threat, progress=progress,
+                                              novelty=getattr(self, "_novelty", 0.5),
+                                              da=self.nm.tone.get("da", 0.5) - 0.5)
             self.brain.observe_stream(text)             # the mind (hidden state) contexts on it
         self.learn_bps = self._ema(self.learn_bps, len(text) / max(time.time() - _t0, 1e-3))
         self.memory.write(text)                         # whole-life episodic memory
@@ -548,6 +567,8 @@ class BrainLife:
                        "beta": getattr(self.bg, "beta", None), "thr": getattr(self.bg, "thr", None),
                        "syn_density": getattr(self.bg, "syn_density", 1.0)}
             p["neuromod"] = dict(self.nm.tone)
+            if hasattr(self, "endocrine"): p["endocrine"] = self.endocrine.state()   # §16 drive/cortisol metrics
+            if hasattr(self, "dynamics"): p["dynamics"] = self.dynamics.state()      # §16 P2 entropy/ignition metrics
             p["cerebellum"] = {"eta": self.cereb_eta, "sparsity": self.cerebellum.sparsity,
                                "g_golgi": self.cerebellum.g_golgi, "thr0": self.cerebellum.thr0,
                                "syn_density": getattr(self.cerebellum, "syn_density", 1.0)}
@@ -607,6 +628,10 @@ class BrainLife:
             elif target == "neuromod" and self.modules_on:
                 for k in ("da", "ach", "ne", "ht"):
                     if k in p: self.nm.tone[k] = float(p[k]); applied[k] = self.nm.tone[k]
+            elif target == "endocrine" and self.modules_on and hasattr(self, "endocrine"):
+                applied.update(self.endocrine.set_params(**p))       # §16 drive/cortisol/mood live-tune + toggle `on`
+            elif target == "dynamics" and self.modules_on and hasattr(self, "dynamics"):
+                applied.update(self.dynamics.set_params(**p))        # §16 P2 entropy/ignition/frequency live-tune
             elif target == "cerebellum" and self.modules_on:
                 if "eta" in p: self.cereb_eta = float(p["eta"]); applied["eta"] = self.cereb_eta
                 if "sparsity" in p: self.cerebellum.sparsity = float(p["sparsity"]); applied["sparsity"] = self.cerebellum.sparsity
@@ -786,9 +811,9 @@ class BrainLife:
                 topic = self.topics[topic_idx % len(self.topics)] if self.modules_on else topic_idx
                 self.log(f"teacher({topic})> {lesson[:70]}")
                 progress = self._learn_text(lesson, steps=8)       # learn from Claude's teaching
-                self._reward_curiosity(topic_idx, progress)        # §2 dopamine on learning progress (free)
-                self._index_episode(lesson)                        # §4 hippocampal novelty
-                self._train_cerebellum(lesson)                     # §1 fast supervised forward model
+                if self._ignited("bg", progress): self._reward_curiosity(topic_idx, progress)  # §2 (ignition-gated)
+                if self._ignited("hippo", progress): self._index_episode(lesson)               # §4 (ignition-gated)
+                if self._ignited("cereb", progress): self._train_cerebellum(lesson)            # §1 (ignition-gated)
                 self.debt += 1.0
                 if on_update: on_update({"perceived": lesson[:1400], "status": f"learning about {topic}"})
             elif kind in ("browse", "cmd_browse"):
@@ -822,6 +847,22 @@ class BrainLife:
         except Exception:
             return step % len(TOPICS)
 
+    def _ignited(self, name, progress=0.0):
+        """§16 P2 selective activation — does auxiliary subsystem `name` ignite this cycle? Always True unless
+        the dynamics layer is engaged; then a system runs only if its salience beats the entropy-set threshold,
+        so the brain is not all-on every cycle (Dehaene global-workspace ignition)."""
+        dyn = getattr(self, "dynamics", None)
+        if dyn is None or not dyn.on:
+            return True
+        if getattr(self, "_ign_cyc", -1) != self.cycle:            # compute the ignition mask once per cycle
+            att = float(getattr(self.brain, "attention", 1.0))
+            ne = self.nm.tone.get("ne", 1.0) if self.modules_on else 1.0
+            self._ign_mask = dyn.ignition({"bg": abs(float(progress)),
+                                           "hippo": float(getattr(self, "_novelty", 0.5)),
+                                           "cereb": float(getattr(self, "cereb_mse", 0.0))}, ne=ne, attention=att)
+            self._ign_cyc = self.cycle
+        return self._ign_mask.get(name, True)
+
     def _reward_curiosity(self, topic_idx, progress):
         """§2 dopamine: reward the basal-ganglia topic policy by LEARNING PROGRESS — the drop
         in training loss on the lesson, already computed during learning (zero extra compute).
@@ -830,7 +871,9 @@ class BrainLife:
             return
         try:
             bd = self.bg.device                              # bg may live on its own device
-            reward = torch.tensor([float(progress)], device=bd)
+            endo = getattr(self, "endocrine", None)          # §16 homeostatic-RL reward = met-need deficit-drop
+            r_home = float(getattr(self, "_r_home", 0.0)) if (endo is not None and endo.on) else 0.0
+            reward = torch.tensor([float(progress) + r_home], device=bd)
             self.bg.train_step(self._topic_feat[self._last_topic:self._last_topic + 1].to(bd),
                                torch.tensor([topic_idx], device=bd), reward)
             self._last_topic = topic_idx
@@ -898,7 +941,9 @@ class BrainLife:
         dur = self._awake_seconds()
         if dur < self.min_awake: return False
         if dur >= self.max_awake: return True
-        return self.debt >= self.debt_threshold
+        endo = getattr(self, "endocrine", None)
+        pressure = endo.sleep_pressure() if (endo is not None and endo.on) else 1.0   # §16 cortisol → sleep pressure
+        return self.debt * pressure >= self.debt_threshold
 
     def _begin_sleep(self):
         self.awake = False
@@ -919,6 +964,8 @@ class BrainLife:
         if self.modules_on:                                    # NREM/REM cycle (phases of intensity)
             self._sleep_phase_t = getattr(self, "_sleep_phase_t", 0) + 1
             self.nm.set_phase("rem" if self._sleep_phase_t % 5 == 0 else "nrem")   # ~1-in-5 ticks = REM
+            endo = getattr(self, "endocrine", None)
+            if endo is not None and endo.on: endo.sleep_tick()  # §16 sleep RELIEVES cortisol + allostatic load
         # §4 novelty-gated replay (CLS): a life full of NOVEL experience replays harder;
         # a familiar one consolidates lightly (the hippocampal salience signal sets the load).
         # replay load = novelty-gated chunk count × per-chunk BPTT steps. Both are live-tunable
@@ -1600,6 +1647,10 @@ class BrainLife:
                                        bg_density=getattr(self.bg, "syn_density", 1.0),
                                        hippo_smask=getattr(self.hippo, "_smask", None),
                                        hippo_density=getattr(self.hippo, "syn_density", 1.0))
+                if hasattr(self, "endocrine"):               # §16 endocrine hormone state + params
+                    life["modules"]["endocrine"] = {k: getattr(self.endocrine, k)
+                                                     for k in ("on", "D_energy", "D_novelty", "C", "M", "AL",
+                                                               "alpha_D", "tau_C", "C_star", "C_sigma")}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1658,6 +1709,8 @@ class BrainLife:
                     self.cereb_mse = m.get("cereb_mse", 0.0)
                 self._restore_module_masks(m)                # §1/§2/§4 synapse masks + density
                 self._last_topic = m.get("last_topic", 0); self._novelty = m.get("novelty", 1.0)
+                if hasattr(self, "endocrine") and m.get("endocrine"):   # §16 restore hormone state + params
+                    for k, v in m["endocrine"].items(): setattr(self.endocrine, k, v)
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)
