@@ -148,3 +148,20 @@ def test_resolve_compute_auto():
     r = resolve_compute("auto")
     assert r["device"] in ("cpu", "cuda") and r["threads"] >= 1 and "note" in r
     assert resolve_compute("cuda")["device"] in ("cpu", "cuda")  # falls back to cpu if no GPU
+
+
+def test_neurogenesis_adds_dg_cells_in_adult_phase():
+    L = _life("neuro")
+    xi = torch.randn(1, L.hippo.N)                                # a stored memory pattern to preserve
+    L.hippo.store(xi)
+    m0 = L.hippo.M
+    # OFF → no DG cells added even in the adult phase
+    L.brain.age = L.brain.prune_until + 5                          # force the ADULT phase
+    L.slept_count = L.neurogenesis_every - 1                       # next night hits the neurogenesis cadence
+    L.neurogenesis = False; L._wake_up(); assert L.hippo.M == m0
+    # ON → DG granule cells added (adult neurogenesis), and the prior memory is still recallable
+    L.brain.age = L.brain.prune_until + 5
+    L.slept_count = L.neurogenesis_every - 1
+    L.neurogenesis = True; L._wake_up()
+    assert L.hippo.M == m0 + L.neurogenesis_add                    # DG grew
+    assert L.hippo.recall(xi) is not None                         # old memory survives grow() (identity-preserving)

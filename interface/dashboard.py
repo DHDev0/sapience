@@ -211,6 +211,11 @@ class Controller:
                     setattr(L, k, max(1, int(v))); applied[k] = getattr(L, k)
                 elif k in ("gr_temperature", "gr_anchor_frac"):
                     setattr(L, k, max(0.0, float(v))); applied[k] = getattr(L, k)
+                elif k == "neurogenesis":                        # §16 adult-DG neurogenesis toggle
+                    L.neurogenesis = (v if isinstance(v, bool) else str(v).strip().lower()
+                                      not in ("false", "0", "off", "no", "")); applied[k] = L.neurogenesis
+                elif k in ("neurogenesis_add", "neurogenesis_every"):
+                    setattr(L, k, max(1, int(float(v)))); applied[k] = getattr(L, k)
                 elif k == "hard_disk_gb":
                     L.memory.hard = int(float(v) * 1e9); applied[k] = float(v)
                 elif k in ("visual", "teacher"):
@@ -848,7 +853,8 @@ API_HELP = {
                      "resonate_k, threads, learn_steps, visual, teacher, "
                      "grow_add, grow_until, prune_until, freeze_growth, freeze_sleep, freeze_learning, "
                      "max_model_gb (= checkpoint cap), hard_disk_gb (replay cap), max_log_mb, max_tb_mb, "
-                     "sleep_mode (buffer|generative), gr_dreams, gr_dream_len, gr_temperature, gr_anchor_frac (§16 P0 replay). "
+                     "sleep_mode (buffer|generative), gr_dreams, gr_dream_len, gr_temperature, gr_anchor_frac (§16 P0 replay), "
+                     "neurogenesis, neurogenesis_add, neurogenesis_every (§16 adult-DG neurogenesis). "
                      "(initial neurons/layers/device/core need /api/start relaunch.)",
     "POST /api/net": "tune a PART (or 'all') of the net live: {target: cortex|cerebellum|hippocampus|bg|neuromod|endocrine|dynamics|all, ...params} — "
                      "cortex {lr,read_alpha,seq,think_temp,prune_frac,grow_syn_frac}, cerebellum {eta,sparsity,g_golgi,thr0,grow_syn_frac,prune_frac}, "

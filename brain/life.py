@@ -199,6 +199,11 @@ class BrainLife:
         self.sleep_mode = "buffer"
         self.gr_dreams, self.gr_dream_len, self.gr_temperature, self.gr_anchor_frac = 8, 200, 1.1, 0.15
         self._gr_drift, self._gr_entropy = 0.0, 0.0             # metrics: replay probe-drift + dream diversity
+        # adult-DG NEUROGENESIS (opt-in, default OFF; Aimone/Gage): in the ADULT phase the dentate gyrus keeps
+        # adding granule cells, which improves pattern-separation of NEW memories while grow() re-separates the
+        # old ones identity-preservingly (so nothing already stored is lost). neurogenesis_every = nights/add.
+        self.neurogenesis = False
+        self.neurogenesis_add, self.neurogenesis_every = 16, 4
         self.wake_start = time.time()
         self.debt = 0.0
         self.sleep_remaining = 0
@@ -1024,6 +1029,15 @@ class BrainLife:
                         if d.get("phase") == "child": mod.grow_synapses(getattr(mod, "grow_syn_frac", 0.15))
                         elif d.get("phase") == "adolescent": mod.prune_synapses(getattr(mod, "prune_frac", 0.05))
                     except Exception: pass
+            # §16 adult-DG neurogenesis (opt-in): once ADULT, add DG granule cells every Nth night — richer
+            # separation of memories stored from now on; grow() re-separates old ones so recall is preserved.
+            if (getattr(self, "neurogenesis", False) and not self.freeze_growth
+                    and d.get("phase") == "adult" and self.slept_count % max(1, int(self.neurogenesis_every)) == 0):
+                try:
+                    added = self.hippo.grow(int(self.neurogenesis_add))
+                    self.log(f"§16 neurogenesis: +{added} DG granule cells → {self.hippo.M} (separation of new memories)")
+                except Exception as e:
+                    self.log(f"neurogenesis skipped: {str(e)[:50]}")
         self.save_life()                                     # checkpoint on the night boundary
         self.log(f"woke (night {self.slept_count}) {d['phase']} age {d['age']} · "
                  f"{d.get('neurons', d['n_granule'])} neurons (fixed) · "
@@ -1641,6 +1655,9 @@ class BrainLife:
                                  gr_dreams=getattr(self, "gr_dreams", 8), gr_dream_len=getattr(self, "gr_dream_len", 200),
                                  gr_temperature=getattr(self, "gr_temperature", 1.1),
                                  gr_anchor_frac=getattr(self, "gr_anchor_frac", 0.15),
+                                 neurogenesis=getattr(self, "neurogenesis", False),       # §16 adult-DG neurogenesis
+                                 neurogenesis_add=getattr(self, "neurogenesis_add", 16),
+                                 neurogenesis_every=getattr(self, "neurogenesis_every", 4),
                                  net=self._net_params()))
             if self.modules_on:                              # §2/§4 state (curiosity + episodes)
                 life["modules"] = dict(bg_wv=self.bg.w_v, bg_wpi=self.bg.W_pi, bg_M=self.bg.M,
@@ -1691,7 +1708,8 @@ class BrainLife:
                       "resonate_k", "grow_add", "freeze_growth",
                       "freeze_sleep", "freeze_learning", "use_visual", "max_log_mb", "max_tb_mb",
                       "think_temp", "feed_mode", "focus_label", "topics", "browse", "novelty_gate",
-                      "sleep_mode", "gr_dreams", "gr_dream_len", "gr_temperature", "gr_anchor_frac"):  # §16 P0
+                      "sleep_mode", "gr_dreams", "gr_dream_len", "gr_temperature", "gr_anchor_frac",  # §16 P0
+                      "neurogenesis", "neurogenesis_add", "neurogenesis_every"):                     # §16 neurogenesis
                 if k in c:
                     setattr(self, k, c[k])
             if "grow_until" in c: self.brain.grow_until = c["grow_until"]
