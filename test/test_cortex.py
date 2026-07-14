@@ -11,6 +11,29 @@ def _brain(**kw):
     return SpikingBrain(DEV, emb=32, hidden=64, layers=2, seed=0, **kw)
 
 
+def test_eprop_learns_dense_and_sparse():
+    # e-prop (forward-in-time, local eligibility + random-feedback signal, no BPTT) must LEARN,
+    # both on the dense path and on the sparse (O(nnz), no H²) path.
+    for kw in (dict(), dict(sparse=True, rec_fanin=8, in_fanin=8, syn_density=0.6)):
+        b = SpikingBrain(DEV, emb=32, hidden=64, layers=2, cell="lif", seed=0, **kw)
+        b.learn_rule = "eprop"; b.eprop_lr_scale = 5000.0   # fan-in-normalized regime (width-invariant)
+        bpb0 = b.bits_per_byte(TXT)
+        for _ in range(120):
+            b.learn_eprop(TXT, epochs=1, bs=16, max_steps=1, seq=32)
+        assert b.bits_per_byte(TXT) < bpb0 - 0.3                  # genuinely learns forward-in-time
+
+
+def test_eprop_neuromod_gate_scales_update():
+    # the three-factor gate M must scale the update — gate=0 → NO weight change (§5 coupling is real).
+    b = SpikingBrain(DEV, emb=32, hidden=64, layers=2, cell="lif", seed=0)
+    b.learn_rule = "eprop"
+    w0 = b.head.weight.clone()
+    b.learn_eprop(TXT, epochs=1, bs=8, max_steps=2, seq=32, gate=0.0)
+    assert torch.equal(b.head.weight, w0)                        # M=0 → plasticity gated off
+    b.learn_eprop(TXT, epochs=1, bs=8, max_steps=2, seq=32, gate=1.0)
+    assert not torch.equal(b.head.weight, w0)                    # M=1 → it updates
+
+
 def test_membrane_readout_default_and_learns():
     b = _brain()
     assert b.readout == "mem" and b.cell_kind == "lif"           # the A/B-chosen default

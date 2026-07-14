@@ -206,6 +206,31 @@ def test_kill_flag_skips_checkpoint():
     assert getattr(c, "life", None) is None                     # dropped without a graceful save
 
 
+def test_kill_actually_stops_a_running_worker():
+    # REGRESSION: kill() used to null the thread WITHOUT waiting, so the worker (and the sense
+    # thread stuck in a teacher call) kept running while the board showed 'stopped'. kill() must
+    # now JOIN the worker and confirm it exited.
+    import threading, time
+    c = _controller_with_brain("killrun")
+    c.thread = threading.Thread(target=lambda: c.life.run(on_update=c._on_state), daemon=True)
+    c.thread.start()
+    time.sleep(2.0)                                             # let it enter the living loop
+    assert c.running()                                          # worker genuinely alive
+    worker = c.thread
+    r = c.kill()
+    assert r.get("stopped") is True                            # kill waited and confirmed exit
+    assert c.thread is None and c.life is None
+    assert not worker.is_alive()                               # the thread really stopped
+
+
+def test_teacher_call_is_interruptible():
+    # the Sonnet subprocess must be tracked so a stop/kill can terminate it (kill_active_calls);
+    # calling it with no active calls is a safe no-op.
+    from brain import partner
+    assert hasattr(partner, "kill_active_calls")
+    partner.kill_active_calls()                                 # no-op, no error
+
+
 def test_controller_boundary_methods():
     c = _controller_with_brain("bound")
     assert c.chat("hello brain")["ok"]                          # chat/inject

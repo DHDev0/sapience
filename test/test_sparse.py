@@ -11,11 +11,13 @@ TXT = "the quick brown fox jumps over the lazy dog. " * 60
 
 
 def _dense_wrec_from_sparse(c):
-    """Scatter a sparse cell's active CSR values into a dense (H,H) recurrent weight matrix."""
+    """Scatter a sparse cell's active CSR values into a dense (H,H) recurrent weight matrix.
+    accumulate=True sums parallel edges (a row may draw a column more than once), matching the
+    gather/scatter forward's index_add semantics."""
     H = c.hid
     Wd = torch.zeros(H, H)
     rows = torch.repeat_interleave(torch.arange(H), (c.rec_crow[1:] - c.rec_crow[:-1]).long())
-    Wd[rows, c.rec_col.long()] = (c.rec_val * c.rec_mask).detach()
+    Wd.index_put_((rows, c.rec_col.long()), (c.rec_val * c.rec_mask).detach(), accumulate=True)
     return Wd
 
 
@@ -54,7 +56,8 @@ def test_sparse_value_gradient_equals_dense_scatter():
     rows = torch.repeat_interleave(torch.arange(H), (c.rec_crow[1:] - c.rec_crow[:-1]).long())
     with torch.no_grad():
         dense.Win.weight.copy_(c.Win.weight); dense.Win.bias.copy_(c.Win.bias)
-        Wd = torch.zeros(H, H); Wd[rows, c.rec_col.long()] = (c.rec_val * c.rec_mask).detach()
+        Wd = torch.zeros(H, H)
+        Wd.index_put_((rows, c.rec_col.long()), (c.rec_val * c.rec_mask).detach(), accumulate=True)
         dense.Wrec.weight.copy_(Wd)
     x = torch.randn(4, 9, 8)
     c.run_seq(x, c.init_state(4, DEV))[1].pow(2).sum().backward()

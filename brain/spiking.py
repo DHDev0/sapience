@@ -40,29 +40,42 @@ class _SparseConnMM(torch.autograd.Function):
     """y = (W @ s.t()).t() for a CSR weight W(out,in) with values `val`, computed so the BACKWARD
     stays O(nnz·B) instead of densifying to O(out·in).
 
-    torch.sparse.mm's own autograd materialises a dense (out×in) gradient for the values (measured:
-    250 GB at 500k neurons → OOM). Here the value-gradient is a SAMPLED gather over the nnz edges
-    (grad_val[e] = Σ_b gy[b,row(e)]·s[b,col(e)]) and the input-gradient is a scatter — both O(nnz·B),
-    so a half-million-neuron connectome is trainable in RAM. Forward still uses the fast fused spmm."""
+    Both directions are pure gather/scatter (index_add), O(nnz·B) — NO torch.sparse.mm. This is
+    deliberate: (1) sparse.mm's own autograd densifies a full (out×in) value-gradient (~250 GB at
+    500k neurons → OOM), which the sampled `grad_val` here avoids; and (2) rocSPARSE (ROCm) is flaky
+    — its CSR spmm intermittently aborts the process with "Invalid device argument" and has no bf16
+    kernel — whereas index_add/gather are rock-stable at scale on both CUDA and ROCm. So a
+    half-million-neuron connectome is both trainable in RAM and stable on this GPU. Forced to fp32
+    (autocast off) because the connectome is where precision matters; dense ops still autocast to bf16."""
+
+    _CHUNK = 1 << 27                                            # cap the (rows, nnz) buffer at ~128M elems
 
     @staticmethod
     def forward(ctx, val, crow, col, row_idx, s, out_dim):
         s_dtype = s.dtype
-        s = s.to(val.dtype)                                     # keep sparse.mm in the values' dtype (bf16-safe)
-        with torch.no_grad():
-            W = torch.sparse_csr_tensor(crow, col, val, size=(out_dim, s.shape[1]))
-            y = torch.sparse.mm(W, s.t()).t().contiguous()
-        ctx.save_for_backward(val, col, row_idx, s)
+        vf, sf, cl = val.float(), s.float(), col.long()
+        B, nnz = sf.shape[0], cl.numel()
+        ch = max(1, min(B, _SparseConnMM._CHUNK // max(1, nnz)))  # bound the (chunk, nnz) intermediate
+        y = torch.empty(B, out_dim, device=sf.device, dtype=sf.dtype)
+        for i in range(0, B, ch):                              # chunk the batch (B·T for the input proj)
+            sc = sf[i:i + ch]                                  # y[b,row]+= val·s[b,col]: gather then scatter
+            contrib = vf.unsqueeze(0) * sc[:, cl]              # (chunk, nnz), transient
+            y[i:i + ch] = torch.zeros(sc.shape[0], out_dim, device=sf.device, dtype=sf.dtype).index_add_(1, row_idx, contrib)
+        ctx.save_for_backward(vf, col, row_idx, sf)
         ctx.s_dtype = s_dtype
-        return y
+        return y.to(s_dtype)
 
     @staticmethod
     def backward(ctx, gy):
-        val, col, row_idx, s = ctx.saved_tensors
-        gy = gy.contiguous().to(val.dtype); cl = col.long()
-        gy_e = gy[:, row_idx]                                   # (B, nnz) — grad_out at each edge's row
-        grad_val = (gy_e * s[:, cl]).sum(0)                     # SDDMM sample: O(nnz·B), no dense out×in
-        grad_s = torch.zeros_like(s).index_add_(1, cl, val.unsqueeze(0) * gy_e)   # scatter: O(nnz·B)
+        val, col, row_idx, s = ctx.saved_tensors               # already fp32
+        cl = col.long(); gyf = gy.contiguous().float()
+        B, nnz = s.shape[0], cl.numel()
+        ch = max(1, min(B, _SparseConnMM._CHUNK // max(1, nnz)))
+        grad_val = torch.zeros_like(val); grad_s = torch.empty_like(s)
+        for i in range(0, B, ch):
+            gy_e = gyf[i:i + ch][:, row_idx]                   # (chunk, nnz) — grad_out at each edge's row
+            grad_val += (gy_e * s[i:i + ch][:, cl]).sum(0)     # SDDMM sample: no dense out×in
+            grad_s[i:i + ch] = torch.zeros(gy_e.shape[0], s.shape[1], device=s.device).index_add_(1, cl, val.unsqueeze(0) * gy_e)
         return grad_val, None, None, None, grad_s.to(ctx.s_dtype), None
 
 
@@ -74,21 +87,14 @@ def _row_index(crow):
 
 @torch.no_grad()
 def _seed_csr(rows, cols, fanin, seed):
-    """Seed a CSR connectome: each of `rows` post-neurons draws `fanin` UNIQUE, per-row SORTED
-    pre-neuron columns from [0,cols) — the invariant torch.sparse_csr requires (duplicate or
-    unsorted columns silently coalesce and desync the gradient from the values Parameter). Chunked
-    top-k keeps the transient random matrix small even at H=250k. Returns (crow, col, fanin)."""
+    """Seed a fan-in connectome: `fanin` random pre-neuron columns per row from [0,cols). Columns
+    MAY repeat within a row (rare at fanin<<cols); the gather/scatter forward just SUMS parallel
+    edges, so uniqueness is not required — which makes this O(rows·fanin), instant even at H=1e6
+    (the old unique-per-row top-k over an H×H random matrix was the construction bottleneck at
+    scale). Returns (crow, col, fanin)."""
     fanin = int(min(fanin, cols))
     gen = torch.Generator().manual_seed(seed)
-    chunk = max(1, min(rows, 4_000_000 // max(1, cols)))
-    col_parts = []
-    for start in range(0, rows, chunk):
-        r = min(chunk, rows - start)
-        scores = torch.rand(r, cols, generator=gen)
-        idx = scores.topk(fanin, dim=1).indices          # unique columns per row
-        idx, _ = idx.sort(dim=1)                          # sorted per row (CSR requirement)
-        col_parts.append(idx.reshape(-1))
-    col = torch.cat(col_parts).to(torch.int32)
+    col = torch.randint(0, cols, (rows * fanin,), generator=gen, dtype=torch.int32)
     crow = torch.arange(0, rows * fanin + 1, fanin, dtype=torch.int32)
     return crow, col, fanin
 

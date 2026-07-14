@@ -276,18 +276,13 @@ class SpikingHippocampus(SynapseMaskMixin):
 
 
 class SpikingNeuromod:
-    """§5 three-factor gating: eligibility trace × a global neuromodulator M(t)."""
+    """§5 neuromodulatory tone M(t) — the third factor of the cortex's three-factor plasticity. The
+    eligibility trace itself lives in the cortex's e-prop update; here we hold only the diffuse tone
+    (ACh/NE/DA/5HT), and the ACh channel is what gates the cortex's local e-prop weight update per
+    phase (Δw = η·M(t)·L·e, see SpikingBrain._eprop_step). Wake = full plasticity, NREM = low."""
 
     def __init__(self, shape, device, tau_e=5.0):
-        self.e = torch.zeros(*shape, device=device); self.decay = 1 - 1 / tau_e
         self.tone = dict(da=0.5, ach=1.0, ne=1.0, ht=0.5)           # dopamine/ACh/NE/5HT
-
-    @torch.no_grad()
-    def accumulate(self, hebb):
-        self.e.mul_(self.decay).add_(hebb); return self.e
-
-    def gated(self, M):
-        return M * self.e
 
     def set_phase(self, phase):
         self.tone = {"wake": dict(da=0.5, ach=1.0, ne=1.0, ht=0.5),

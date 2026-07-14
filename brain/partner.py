@@ -13,6 +13,7 @@ the world by talking," and web pages add real-world text beyond the conversation
 """
 from __future__ import annotations
 import subprocess
+import threading
 import shutil
 import re
 import urllib.parse
@@ -28,8 +29,24 @@ _TEACH_SYSTEM = (
 )
 
 
+# in-flight teacher subprocesses, so a stop/kill can interrupt a blocking Sonnet call immediately
+# instead of waiting up to `timeout` seconds for it to return.
+_ACTIVE = set()
+_ACTIVE_LOCK = threading.Lock()
+
+
+def kill_active_calls():
+    """Terminate every in-flight teacher subprocess — makes stop/kill instant even mid-lesson."""
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE)
+    for p in procs:
+        try: p.kill()
+        except Exception: pass
+
+
 def claude_say(prompt, system=_TEACH_SYSTEM, model="sonnet", budget=0.30, timeout=120):
-    """One-shot Sonnet 5 reply as plain text. Returns '' on failure."""
+    """One-shot Sonnet 5 reply as plain text. Returns '' on failure. Runs as a tracked subprocess
+    so a stop/kill can terminate it immediately (see kill_active_calls)."""
     cmd = [
         _CLAUDE, "-p", prompt,
         "--model", model,
@@ -39,14 +56,24 @@ def claude_say(prompt, system=_TEACH_SYSTEM, model="sonnet", budget=0.30, timeou
     ]
     if system:
         cmd += ["--append-system-prompt", system]
+    p = None
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        out = (r.stdout or "").strip()
-        return out
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        with _ACTIVE_LOCK: _ACTIVE.add(p)
+        out, _ = p.communicate(timeout=timeout)
+        return (out or "").strip()
     except subprocess.TimeoutExpired:
+        try: p.kill(); p.communicate(timeout=5)
+        except Exception: pass
         return ""
-    except Exception as e:
+    except Exception:
+        try:
+            if p: p.kill()
+        except Exception: pass
         return ""
+    finally:
+        if p is not None:
+            with _ACTIVE_LOCK: _ACTIVE.discard(p)
 
 
 def _html_to_text(html, max_chars=20000):

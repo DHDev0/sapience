@@ -115,6 +115,7 @@ class BrainLife:
                  max_ram_mb=64.0, hard_disk_gb=10.0, threads=None, resonate_k=4,
                  max_log_mb=20.0, max_tb_mb=60.0, syn_density=0.5,
                  sparse=None, sparse_hidden_threshold=8192, rec_fanin=64, in_fanin=64,
+                 learn_rule="bptt", eprop_lr_scale=15.0,
                  think_chunk=20, perceive_gap=6.0, resume=False, use_tb=True, seed=0):
         os.makedirs(resdir, exist_ok=True)
         self.resdir = resdir
@@ -147,6 +148,8 @@ class BrainLife:
                                       syn_density=syn_density, sparse=sparse,
                                       sparse_hidden_threshold=sparse_hidden_threshold,
                                       rec_fanin=rec_fanin, in_fanin=in_fanin)
+            self.brain.learn_rule = learn_rule                 # "eprop" = biologically faithful
+            self.brain.eprop_lr_scale = float(eprop_lr_scale)
         self.core = core
         self.max_model_gb = max_model_gb
         # The four OTHER spiking systems (§1,§2,§4,§5), coupled to the cortex by ACTIVATION and
@@ -284,13 +287,16 @@ class BrainLife:
         if self.freeze_learning:                        # observe only — no weight updates
             self.brain.observe_stream(text)
         else:
-            # §5 three-factor gating: the ACh neuromodulator tone scales the effective
-            # plasticity (Δw = η·M(t)·e) — high in wake (encode), lower in NREM (consolidate).
+            # §5 three-factor gating: the ACh neuromodulator tone M(t) scales the effective
+            # plasticity (Δw = η·M(t)·e) — high in wake (encode), lower in NREM (consolidate). Under
+            # e-prop this M is the LITERAL three-factor gate on the eligibility update; under BPTT it
+            # falls back to scaling the optimiser lr.
             gate = self.nm.tone["ach"] if self.modules_on else 1.0
-            if gate != 1.0:
+            eprop = getattr(self.brain, "learn_rule", "bptt") == "eprop"
+            if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr * gate
-            r = self.brain.learn_text(text, epochs=1, max_steps=steps)
-            if gate != 1.0:
+            r = self.brain.learn_text(text, epochs=1, max_steps=steps, gate=gate)
+            if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr
             if isinstance(r, tuple):                    # (first_loss, last_loss): free progress
                 progress = max(0.0, r[0] - r[1])
@@ -521,7 +527,9 @@ class BrainLife:
                         "seq": self.brain.seq, "think_temp": getattr(self, "think_temp", 0.6),
                         "prune_frac": getattr(self.brain, "prune_frac", 0.05),
                         "grow_syn_frac": getattr(self.brain, "grow_syn_frac", 0.15),
-                        "syn_density": getattr(self.brain, "syn_density", 1.0)}}
+                        "syn_density": getattr(self.brain, "syn_density", 1.0),
+                        "learn_rule": getattr(self.brain, "learn_rule", "bptt"),
+                        "eprop_lr_scale": getattr(self.brain, "eprop_lr_scale", 15.0)}}
         if self.modules_on:
             p["hippocampus"] = {"beta": self.hippo.beta, "sparsity": self.hippo.a, "capacity": self.hippo.cap,
                                 "thr": getattr(self.hippo, "thr", None), "g_inh": getattr(self.hippo, "g_inh", None),
@@ -564,6 +572,10 @@ class BrainLife:
                     self.brain.prune_frac = max(0.0, min(0.5, float(p["prune_frac"]))); applied["prune_frac"] = self.brain.prune_frac
                 if "grow_syn_frac" in p:
                     self.brain.grow_syn_frac = max(0.0, min(1.0, float(p["grow_syn_frac"]))); applied["grow_syn_frac"] = self.brain.grow_syn_frac
+                if "eprop_lr_scale" in p:
+                    self.brain.eprop_lr_scale = max(0.1, float(p["eprop_lr_scale"])); applied["eprop_lr_scale"] = self.brain.eprop_lr_scale
+                if "learn_rule" in p and p["learn_rule"] in ("eprop", "bptt"):
+                    self.brain.learn_rule = p["learn_rule"]; applied["learn_rule"] = self.brain.learn_rule
             elif target == "hippocampus" and self.modules_on:
                 if "beta" in p: self.hippo.beta = float(p["beta"]); applied["beta"] = self.hippo.beta
                 if "sparsity" in p: self.hippo.a = float(p["sparsity"]); applied["sparsity"] = self.hippo.a
@@ -889,12 +901,18 @@ class BrainLife:
         sleep also renormalises (restores ⟨Δw⟩_wake + ⟨Δw⟩_sleep ≈ 0, not only potentiates)."""
         # §4 novelty-gated replay (CLS): a life full of NOVEL experience replays harder;
         # a familiar one consolidates lightly (the hippocampal salience signal sets the load).
-        n_chunks = 5 + int(5 * getattr(self, "_novelty", 0.5)) if self.modules_on else 5
-        for _ in range(n_chunks):
+        # replay load = novelty-gated chunk count × per-chunk BPTT steps. Both are live-tunable
+        # (`sleep_chunks`, `sleep_steps`, `sleep_seq`) because at large scale each step costs seconds
+        # — a small fast brain can afford the default heavy replay; a 100k+ GPU brain must run it
+        # lighter or a single night would take hours.
+        base = min(getattr(self, "sleep_chunks", 10), 5 + int(5 * getattr(self, "_novelty", 0.5))) if self.modules_on \
+            else min(getattr(self, "sleep_chunks", 10), 5)
+        steps = int(getattr(self, "sleep_steps", 14))
+        sseq = int(getattr(self, "sleep_seq", 96)) if self.core == "spiking" else None
+        for _ in range(base):
             chunk = self.memory.sample(1400)
             if chunk and len(chunk) > 32 and not self.freeze_learning:
-                seq = 96 if self.core == "spiking" else None    # sleep consolidates on long context
-                self.brain.learn_text(chunk, epochs=1, max_steps=14, **({"seq": seq} if seq else {}))
+                self.brain.learn_text(chunk, epochs=1, max_steps=steps, **({"seq": sseq} if sseq else {}))
                 self._replay_count = getattr(self, "_replay_count", 0) + 1   # replay-consolidation counter
         if not self.freeze_learning:
             with torch.no_grad():
@@ -923,9 +941,14 @@ class BrainLife:
 
     # ---- the continuous life loop ------------------------------------ #
     def request_stop(self):
-        """Ask the life to stop gracefully — from any thread, or from another process by
-        creating the STOP file (see the module-level request_stop / --stop CLI)."""
+        """Ask the life to stop — from any thread. Sets the run flag AND terminates any in-flight
+        teacher (Sonnet) subprocess, so the sense worker unblocks immediately instead of waiting out
+        the call. Both the main loop and the sense worker check `_running` each iteration."""
         self._running = False
+        try:
+            partner.kill_active_calls()          # unblock a sense worker stuck in a Sonnet call
+        except Exception:
+            pass
 
     def _stop_requested(self):
         """A STOP file in the run folder = a graceful stop request from another process."""
@@ -963,6 +986,12 @@ class BrainLife:
                     self._bound_logs(); self._last_bound = time.time()
         finally:
             self._running = False
+            try: partner.kill_active_calls()                     # stop any in-flight teacher call
+            except Exception: pass
+            pt = getattr(self, "_perc_thread", None)             # let the sense worker exit too
+            if pt is not None:
+                try: pt.join(timeout=8)
+                except Exception: pass
             if getattr(self, "_killed", False):
                 self.log("force-killed — NOT checkpointing")
             else:
@@ -1064,15 +1093,19 @@ class BrainLife:
             try:    # §4 hippocampus: DG/CA3 units; separator synapses + stored patterns
                 parts["hippocampus"] = _mod_arch(self.hippo, self.hippo.M, stored=int(self.hippo.keys.shape[0]))
             except Exception: pass
-            try:    # §5 neuromodulation: scalar tone channels (modulatory glue, ~no synapses)
-                parts["neuromod"] = dict(neurons=len(self.nm.tone), synapses=0, parameters=len(self.nm.tone),
-                                         density=1.0, device=str(getattr(self.nm, "device", self.dev)))
+            try:    # §5 neuromodulation: 4 DIFFUSE tone channels (da/ACh/NE/5HT) — modulatory glue, not
+                # neurons and not synapses. Report them as tone_channels so they don't masquerade as
+                # neural units or inflate the neuron/param totals; no connectome → 0 synapses at 0 density.
+                parts["neuromod"] = dict(neurons=0, synapses=0, synapse_capacity=0, parameters=0,
+                                         density=0.0, tone_channels=len(self.nm.tone),
+                                         device=str(getattr(self.nm, "device", self.dev)))
             except Exception: pass
         tot_n = sum(p.get("neurons", 0) for p in parts.values() if isinstance(p, dict))
         tot_s = sum(p.get("synapses", 0) for p in parts.values() if isinstance(p, dict))
+        tot_c = sum(p.get("synapse_capacity", 0) or 0 for p in parts.values() if isinstance(p, dict))
         tot_p = sum(p.get("parameters", 0) for p in parts.values() if isinstance(p, dict))
         return dict(parts=parts, total_neurons=int(tot_n), total_synapses=int(tot_s),
-                    total_parameters=int(tot_p))
+                    total_synapse_capacity=int(tot_c), total_parameters=int(tot_p))
 
     # ---- RESOURCE census: RAM / VRAM / storage, current + limits ------- #
     def _resources(self):
@@ -1498,6 +1531,9 @@ class BrainLife:
                                  debt_threshold=self.debt_threshold, max_sleep=self.max_sleep,
                                  perceive_gap=self.perceive_gap,
                                  think_chunk=self.think_chunk, learn_steps=self.learn_steps,
+                                 sleep_chunks=getattr(self, "sleep_chunks", 10),
+                                 sleep_steps=getattr(self, "sleep_steps", 14),
+                                 sleep_seq=getattr(self, "sleep_seq", 96),
                                  resonate_k=self.resonate_k, grow_add=self.grow_add,
                                  grow_until=self.brain.grow_until, prune_until=self.brain.prune_until,
                                  freeze_growth=self.freeze_growth, freeze_sleep=self.freeze_sleep,
@@ -1547,7 +1583,8 @@ class BrainLife:
             self._last_cyc, self._last_cyc_t = self.cycle, time.time()
             c = s.get("cfg") or {}                            # restore how you tuned it
             for k in ("budget", "min_awake", "max_awake", "debt_threshold", "max_sleep", "perceive_gap",
-                      "think_chunk", "learn_steps", "resonate_k", "grow_add", "freeze_growth",
+                      "think_chunk", "learn_steps", "sleep_chunks", "sleep_steps", "sleep_seq",
+                      "resonate_k", "grow_add", "freeze_growth",
                       "freeze_sleep", "freeze_learning", "use_visual", "max_log_mb", "max_tb_mb",
                       "think_temp", "feed_mode", "focus_label", "topics", "browse", "novelty_gate"):
                 if k in c:

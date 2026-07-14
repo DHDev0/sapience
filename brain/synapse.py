@@ -133,7 +133,10 @@ class SynapseMaskMixin:
         return capacity(self._syn_weights())
 
     def parameter_count(self):
-        """Number of trainable parameters (weight elements) in this region's connectome."""
+        """Total weight-element footprint of this region's connectome = capacity: EVERY slot, including
+        the silent (mask-zeroed) ones AND any FIXED random reservoir (e.g. the cerebellum mossy→granule
+        M and hippocampus DG projection are never trained). NOT a count of trainable weights — it is the
+        storage footprint, so parameter_count == synapse_capacity ≥ active_synapse_count by construction."""
         return capacity(self._syn_weights())
 
     @torch.no_grad()

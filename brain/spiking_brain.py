@@ -70,6 +70,15 @@ class SpikingBrain(nn.Module):
         self.max_model_gb = max_model_gb
         self.grow_until, self.prune_until = 8, 16
         self.grow_syn_frac, self.prune_frac = 0.15, 0.05
+        # learning rule: "eprop" = biologically faithful e-prop (forward-in-time, local eligibility
+        # traces + random-feedback learning signal, no weight transport, three-factor neuromod gate);
+        # "bptt" = surrogate backprop-through-time + Adam (the fast, non-plausible reference).
+        self.learn_rule = "bptt"
+        # e-prop learning rate. The update divides each synapse by its postsynaptic neuron's fan-in
+        # (N_j, see _eprop_step), which makes the effective rate width-invariant — so this raw scale is
+        # large and TRANSFERS across network size (verified identical descent 8k↔64k↔256k).
+        self.eprop_lr_scale = 10000.0
+        self._fanin_pow = 1.0                  # divide the update by N_j^p (p=1 → width-invariant descent)
         self._mind = None                      # persistent per-layer state = stream of thought
         self._last = None
         # §10: the NEURON count is fixed at birth; the SYNAPSE count is what develops. Seed a
@@ -122,7 +131,10 @@ class SpikingBrain(nn.Module):
 
     # ---- LEARN: surrogate-gradient BPTT (= PC at β→0, §3.5) ---------- #
     def learn_text(self, text, epochs=1, bs=16, max_steps=12, store=True,
-                   replay_interleave=0, consolidate_rounds=0, seq=None, on_step=None):
+                   replay_interleave=0, consolidate_rounds=0, seq=None, on_step=None, gate=1.0):
+        if getattr(self, "learn_rule", "bptt") == "eprop":     # faithful forward-in-time route
+            return self.learn_eprop(text, epochs=epochs, bs=bs, max_steps=max_steps, seq=seq,
+                                    on_step=on_step, gate=gate)
         data = text if isinstance(text, list) else self.to_bytes(text)
         seq = seq or self.seq                          # sleep can consolidate on a longer context
         if len(data) <= seq + 1:
@@ -149,6 +161,201 @@ class SpikingBrain(nn.Module):
         self.seen_bytes += n
         # (first_loss, last_loss): the drop across this text = free learning-progress signal
         return (first if first is not None else 0.0, last if last is not None else 0.0)
+
+    # ---- LEARN (faithful): e-prop, forward-in-time, local, no weight transport ---- #
+    # Bellec et al. 2020 (Nature Comms) — the online approximation to BPTT for spiking recurrent
+    # nets, purpose-built for LIF/ALIF. Instead of loss.backward() (a reverse pass unrolled through
+    # ALL of time, using the transpose of the forward weights — the exact things biology cannot do),
+    # each synapse keeps a forward eligibility TRACE and is updated by a per-neuron LEARNING SIGNAL:
+    #   ΔW_ji = -η · M · Σ_t  L_j^t · e_ji^t ,   e_ji^t = ψ_j^t · ε_i^t ,   ε_i^t = β·ε_i^{t-1} + z_i^{t-1}
+    # ε_i (per PRE-neuron) rides forward in time; ψ_j is the surrogate pseudo-derivative; L_j^t is
+    # the output error projected back through a FIXED RANDOM feedback matrix (random e-prop / DFA →
+    # no weight transport, and each layer gets its own signal → no cross-layer backprop); M is the
+    # neuromodulator tone (three-factor gate — the §5 coupling, now load-bearing). The readout head
+    # reads the current membrane, so its gradient is already local in time (err ⊗ v). Nothing is
+    # unrolled backward; the whole update is computed online during one forward pass.
+    @staticmethod
+    def _psi(x):
+        """Surrogate pseudo-derivative of the spike at (membrane − threshold) — fast-sigmoid."""
+        return 1.0 / (10.0 * x.abs() + 1.0) ** 2
+
+    def _ensure_feedback(self):
+        """Fixed random feedback B_l (V × hid_l) per layer — the plausible top-down error path that
+        replaces weight transport. Built once; grows with the layer (identity-neutral new columns)."""
+        if not hasattr(self, "_fb"):
+            self._fb = []
+        while len(self._fb) < len(self.cells):
+            l = len(self._fb); h = self.cells[l].hid
+            self._fb.append((torch.randn(self.V, h, device=self.device) / (self.V ** 0.5)))
+        for l, c in enumerate(self.cells):                 # keep width in sync after neuron growth
+            if self._fb[l].shape[1] != c.hid:
+                b = torch.randn(self.V, c.hid, device=self.device) / (self.V ** 0.5)
+                b[:, :self._fb[l].shape[1]] = self._fb[l]; self._fb[l] = b
+
+    @torch.no_grad()
+    def learn_eprop(self, text, epochs=1, bs=16, max_steps=12, seq=None, on_step=None, gate=1.0):
+        """Train the cortex by e-prop (see above). Returns (first_loss, last_loss) like learn_text."""
+        data = text if isinstance(text, list) else self.to_bytes(text)
+        seq = seq or self.seq
+        if len(data) <= seq + 1:
+            return None
+        self._ensure_feedback()
+        t = torch.tensor(data, device=self.device); n = t.numel()
+        first = last = None
+        for _ in range(epochs):
+            steps = max(1, min(max_steps, (n - seq) // (bs * seq) + 1))
+            for _s in range(steps):
+                i = torch.randint(0, n - seq - 1, (bs,), device=self.device)
+                x = torch.stack([t[k:k + seq] for k in i])
+                y = torch.stack([t[k + 1:k + seq + 1] for k in i])
+                loss = self._eprop_step(x, y, gate)
+                last = loss
+                if first is None: first = last
+                if on_step is not None:
+                    on_step(_s + 1, steps, last)
+        self.seen_bytes += n
+        return (first if first is not None else 0.0, last if last is not None else 0.0)
+
+    _EP_CHUNK = 1 << 26                                        # cap on any transient (chunk, nnz) buffer
+
+    @torch.no_grad()
+    def _eprop_step(self, x, y, gate=1.0):
+        """One e-prop gradient step over a (B,T) window — pure PyTorch, NO O(H²) anywhere. Eligibility
+        traces are per-neuron (O(H)); the recurrent grad is accumulated PER SYNAPSE by gather/scatter
+        (O(nnz) for a sparse cortex, so it scales to hundreds of thousands of neurons). Timestep-outer
+        (== the layer-outer forward), online, gated by the neuromodulator. No autograd, no BPTT."""
+        B, T = x.shape
+        cells = self.cells; dev = self.device
+        inp = self.E(x)                                        # (B,T,emb)
+        sp = lambda c: hasattr(c, "rec_val")                   # sparse cell?
+        al = [hasattr(c, "rho") for c in cells]                # ALIF (adaptive threshold) cell?
+        v = [torch.zeros(B, c.hid, device=dev) for c in cells]
+        z = [torch.zeros(B, c.hid, device=dev) for c in cells]
+        a = [torch.zeros(B, c.hid, device=dev) for c in cells]                 # ALIF adaptation state
+        eps_rec = [torch.zeros(B, c.hid, device=dev) for c in cells]           # per-PRE recurrent trace ε^v
+        eps_in = [torch.zeros(B, c.in_dim, device=dev) for c in cells]         # per-PRE input trace ε^v
+        # ALIF per-SYNAPSE adaptation eligibility ε^a (sparse: (B,nnz); dense: (B,out,in) — only for
+        # the small dense test nets). LIF cells keep ε^a=0 (their eligibility is exactly ε^v).
+        ea_rec = [torch.zeros(B, c.rec_val.numel(), device=dev) if (al[i] and sp(c))
+                  else (torch.zeros(B, c.hid, c.hid, device=dev) if al[i] else None)
+                  for i, c in enumerate(cells)]
+        ea_in = [None] * len(cells)
+        for i, c in enumerate(cells):
+            if not al[i]: continue
+            if sp(c) and c.sparse_in: ea_in[i] = torch.zeros(B, c.in_val.numel(), device=dev)
+            else: ea_in[i] = torch.zeros(B, c.hid, c.in_dim, device=dev)
+        g_rec = [torch.zeros_like(c.rec_val) if sp(c) else torch.zeros_like(c.Wrec.weight) for c in cells]
+        g_in, g_in_b = [], []
+        for c in cells:
+            if sp(c) and c.sparse_in: g_in.append(torch.zeros_like(c.in_val)); g_in_b.append(torch.zeros_like(c.in_bias))
+            else: g_in.append(torch.zeros_like(c.Win.weight)); g_in_b.append(torch.zeros_like(c.Win.bias))
+        gHead = torch.zeros_like(self.head.weight); gHead_b = torch.zeros_like(self.head.bias)
+        lr = self.lr * getattr(self, "eprop_lr_scale", 15.0)
+        CH = self._EP_CHUNK
+        def spmm(val, col, row, xin, out_dim):                 # y[b,row] += val · xin[b,col]  (O(nnz·B))
+            cl = col.long(); ch = max(1, min(B, CH // max(1, cl.numel())))
+            y = torch.zeros(B, out_dim, device=dev)
+            for i in range(0, B, ch):
+                xc = xin[i:i + ch].float()
+                y[i:i + ch] = torch.zeros(xc.shape[0], out_dim, device=dev).index_add_(1, row, val.float().unsqueeze(0) * xc[:, cl])
+            return y
+        def sddmm(gp, ep, row, col):                           # Σ_b gp[b,row]·ep[b,col] → (nnz)  (O(nnz·B))
+            cl = col.long(); nnz = cl.numel(); ch = max(1, min(B, CH // max(1, nnz)))
+            out = torch.zeros(nnz, device=dev)
+            for i in range(0, B, ch):
+                out += (gp[i:i + ch][:, row] * ep[i:i + ch][:, cl]).sum(0)
+            return out
+        def edge_reduce(gp, ea, row):                          # Σ_b gp[b,row]·ea[b]  → (nnz)  (ALIF term)
+            nnz = ea.shape[1]; ch = max(1, min(B, CH // max(1, nnz)))
+            out = torch.zeros(nnz, device=dev)
+            for i in range(0, B, ch):
+                out += (gp[i:i + ch][:, row] * ea[i:i + ch]).sum(0)
+            return out
+        tot_loss = 0.0
+        for tt in range(T):
+            layer_in = inp[:, tt]; psi = []
+            for l, c in enumerate(cells):
+                z_prev = z[l]
+                if sp(c):
+                    rec = spmm(c.rec_val * c.rec_mask, c.rec_col, c.rec_row, z_prev, c.hid)
+                    pre = (spmm(c.in_val * c.in_mask, c.in_col, c.in_row, layer_in, c.hid) + c.in_bias) \
+                        if c.sparse_in else c.Win(layer_in)
+                else:
+                    rec = c.Wrec(z_prev); pre = c.Win(layer_in)
+                v[l] = c.beta * v[l] * (1.0 - z_prev) + pre + rec
+                if al[l]:
+                    a[l] = c.rho * a[l] + z_prev               # adaptation from the previous spike
+                    thr = c.thr0 + c.beta_adapt * a[l]         # adaptive threshold
+                else:
+                    thr = c.thr
+                psi_l = self._psi(v[l] - thr); z[l] = (v[l] >= thr).float()
+                eps_rec[l] = c.beta * eps_rec[l] + z_prev      # ε^v forward eligibility (per pre-neuron)
+                eps_in[l] = c.beta * eps_in[l] + layer_in
+                if al[l]:                                      # ε^a = ψ_j·ε^v_i + (ρ − β_a·ψ_j)·ε^a (per synapse)
+                    ba, rho = c.beta_adapt, c.rho
+                    if sp(c):
+                        pr = psi_l[:, c.rec_row]                                    # (B,nnz) ψ at post-row
+                        ea_rec[l] = pr * eps_rec[l][:, c.rec_col.long()] + (rho - ba * pr) * ea_rec[l]
+                        if c.sparse_in:
+                            pi = psi_l[:, c.in_row]
+                            ea_in[l] = pi * eps_in[l][:, c.in_col.long()] + (rho - ba * pi) * ea_in[l]
+                        else:
+                            ea_in[l] = psi_l.unsqueeze(2) * eps_in[l].unsqueeze(1) + (rho - ba * psi_l).unsqueeze(2) * ea_in[l]
+                    else:
+                        ea_rec[l] = psi_l.unsqueeze(2) * eps_rec[l].unsqueeze(1) + (rho - ba * psi_l).unsqueeze(2) * ea_rec[l]
+                        ea_in[l] = psi_l.unsqueeze(2) * eps_in[l].unsqueeze(1) + (rho - ba * psi_l).unsqueeze(2) * ea_in[l]
+                psi.append(psi_l); layer_in = z[l]
+            top_v = v[-1]; logits = self.head(top_v)           # membrane readout → logits
+            p = torch.softmax(logits.float(), 1)
+            oh = torch.zeros_like(p); oh.scatter_(1, y[:, tt].long().unsqueeze(1), 1.0)
+            err = p - oh                                        # CE gradient wrt logits
+            tot_loss += float(-(oh * (p + 1e-9).log()).sum(1).mean())
+            gHead += err.t() @ top_v.float(); gHead_b += err.sum(0)   # head grad is LOCAL in time
+            for l, c in enumerate(cells):
+                Lsig = err @ self._fb[l].float()               # random-feedback learning signal
+                g = (Lsig * psi[l]).float()                    # g_j = L_j · ψ_j
+                ba = c.beta_adapt if al[l] else 0.0            # e_ji = ψ_j(ε^v_i − β_a·ε^a_ji); grad = Σ g_j·(ε^v_i − β_a·ε^a_ji)
+                if sp(c):
+                    g_rec[l] += sddmm(g, eps_rec[l], c.rec_row, c.rec_col)     # membrane part, O(nnz)
+                    if al[l]: g_rec[l] += -ba * edge_reduce(g, ea_rec[l], c.rec_row)   # adaptation part
+                    if c.sparse_in:
+                        g_in[l] += sddmm(g, eps_in[l], c.in_row, c.in_col)
+                        if al[l]: g_in[l] += -ba * edge_reduce(g, ea_in[l], c.in_row)
+                        g_in_b[l] += g.sum(0)
+                    else:
+                        g_in[l] += g.t() @ eps_in[l].float()                          # dense in (emb small)
+                        if al[l]: g_in[l] += -ba * (g.unsqueeze(2) * ea_in[l]).sum(0)
+                        g_in_b[l] += g.sum(0)
+                else:
+                    g_rec[l] += g.t() @ eps_rec[l].float()
+                    if al[l]: g_rec[l] += -ba * (g.unsqueeze(2) * ea_rec[l]).sum(0)    # (h,h) dense adaptation
+                    g_in[l] += g.t() @ eps_in[l].float()
+                    if al[l]: g_in[l] += -ba * (g.unsqueeze(2) * ea_in[l]).sum(0)
+                    g_in_b[l] += g.sum(0)
+        # FULLY LOCAL three-factor update: Δw_ji = -η·M · clamp(mean_t[L_j·e_ji]/N_j^p, ±Δmax). Each
+        # synapse sees only its own pre-trace, post learning-signal and the neuromodulator M — no global
+        # norm (the old global grad-norm clip was the one non-local operation). Two local homeostatic
+        # constraints keep it stable at any width: (1) a bounded per-synapse change rate Δmax; (2)
+        # per-postsynaptic-neuron fan-in normalization by N_j^p — a wide neuron's afferent gradient is
+        # fan-in-coherent (g_ji ∝ pre-activity), so dividing by its OWN afferent count makes the drive
+        # change O(1) and the stable rate width-invariant (input scaling; each neuron knows only N_j).
+        p = float(getattr(self, "_fanin_pow", 1.0))
+        denom = float(B * T); dmax = 0.02; scale = float(gate) * lr
+        def _upd(w, g, fin):
+            w.add_((scale * (g / (denom * float(fin) ** p))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
+        for l, c in enumerate(cells):
+            if sp(c):
+                _upd(c.rec_val, g_rec[l] * c.rec_mask, c.rec_fanin)   # silent synapses get no update
+                if c.sparse_in:
+                    _upd(c.in_val, g_in[l] * c.in_mask, c.in_fanin); _upd(c.in_bias, g_in_b[l], 1)
+                else:
+                    _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
+            else:
+                _upd(c.Wrec.weight, g_rec[l], c.Wrec.weight.shape[1])
+                _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
+        _upd(self.head.weight, gHead, self.head.weight.shape[1]); _upd(self.head.bias, gHead_b, 1)
+        self._apply_prune_mask()
+        return tot_loss / T
 
     # ---- THINK: continue the persistent spiking mind-state ----------- #
     @torch.no_grad()

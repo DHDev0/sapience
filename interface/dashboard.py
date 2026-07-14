@@ -107,6 +107,8 @@ class Controller:
                                  sparse_hidden_threshold=int(cfg.get("sparse_hidden_threshold", 8192)),
                                  rec_fanin=int(cfg.get("rec_fanin", 64)),
                                  in_fanin=int(cfg.get("in_fanin", 64)),
+                                 learn_rule=cfg.get("learn_rule", "bptt"),
+                                 eprop_lr_scale=float(cfg.get("eprop_lr_scale", 15.0)),
                                  max_model_gb=float(cfg.get("max_model_gb", 14.0)),
                                  max_log_mb=float(cfg.get("max_log_mb", 20.0)),
                                  max_tb_mb=float(cfg.get("max_tb_mb", 60.0)),
@@ -146,13 +148,23 @@ class Controller:
         return {"ok": True, "run_dir": self.run_dir}
 
     def kill(self):
-        """Force: drop the life immediately, WITHOUT a final checkpoint."""
-        if self.life is not None:
-            self.life._killed = True; self.life._running = False
+        """Force: stop the brain NOW (no checkpoint) and WAIT for the worker to actually exit — the
+        old version nulled the thread before waiting, so the loop + the sense thread (stuck in a
+        Sonnet call) kept running while the board already showed 'stopped'."""
+        self.status = "stopping"
+        L, t = self.life, self.thread
+        if L is not None:
+            L._killed = True
+            L.request_stop()                       # _running=False AND kill any in-flight teacher call
+        if t is not None:
+            t.join(timeout=25)                     # the worker's finally also joins the sense thread
+        stopped = (t is None) or (not t.is_alive())
         self.thread = None
         self.life = None
         self.status = "stopped"
-        return {"ok": True}
+        if not stopped:
+            self._on_log("[kill] worker did not exit within 25s (abandoned; no more learning occurs)")
+        return {"ok": True, "stopped": stopped}
 
     def chat(self, text):
         if self.life is not None and text.strip():
@@ -177,6 +189,8 @@ class Controller:
                     setattr(L, k, float(v)); applied[k] = float(v)
                 elif k == "think_chunk":
                     L.think_chunk = max(1, int(v)); applied[k] = L.think_chunk
+                elif k in ("sleep_chunks", "sleep_steps", "sleep_seq"):
+                    setattr(L, k, max(1, int(v))); applied[k] = getattr(L, k)   # scale-aware sleep replay load
                 elif k == "resonate_k":
                     L.resonate_k = max(1, int(v)); applied[k] = L.resonate_k
                 elif k == "threads":
@@ -657,10 +671,15 @@ function renderResources(r){const el=document.getElementById('resources');if(!el
  if(st.disk_total_gb!=null)h+=bar('disk',st.disk_total_gb-st.disk_free_gb,st.disk_total_gb,' GB');
  el.innerHTML=h;}
 function renderArch(a){const el=document.getElementById('archdiag');if(!el)return;if(!a||!a.parts){el.innerHTML='<small>—</small>';return;}
- let h='<div class=metric><span><b>TOTAL</b></span><b>'+fmt(a.total_neurons)+' neurons · '+fmt(a.total_synapses)+' syn · '+fmt(a.total_parameters)+' params</b></div>';
+ // synapses = ACTIVE (wired) connections; capacity = all wire-able SLOTS (active + silent). "% wired"
+ // is active/capacity of the allocated fan-in slots — NOT matrix density (a fan-in-32 cortex over H=128k
+ // is ~0.02% dense). params ≈ capacity because it counts every weight slot (incl. silent) + biases.
+ let tcap=(a.total_synapse_capacity!=null?' / '+fmt(a.total_synapse_capacity):'');
+ let h='<div class=metric><span><b>TOTAL</b></span><b>'+fmt(a.total_neurons)+' neurons · '+fmt(a.total_synapses)+tcap+' syn (active/slots) · '+fmt(a.total_parameters)+' params</b></div>';
  for(const[k,p]of Object.entries(a.parts)){if(p.err){h+='<div class=metric><span>'+k+'</span><small>'+esc(p.err)+'</small></div>';continue;}
-  let extra=(p.density!=null?' · '+Math.round(p.density*100)+'% dense':'')+(p.grow_syn_frac!=null?' · grow '+p.grow_syn_frac:'')+(p.device?' · '+p.device:'')+(p.layer_widths?' · L'+p.layer_widths.join('/'):'')+(p.stored!=null?' · '+p.stored+' stored':'');
-  h+='<div class=metric><span>'+k+'<small>'+esc(extra)+'</small></span><b>'+fmt(p.neurons)+' n · '+fmt(p.synapses)+' syn · '+fmt(p.parameters)+' p</b></div>';}
+  let extra=((p.density!=null&&p.synapse_capacity)?' · '+Math.round(p.density*100)+'% wired':'')+(p.grow_syn_frac!=null?' · grow '+p.grow_syn_frac:'')+(p.tone_channels!=null?' · '+p.tone_channels+' tone ch':'')+(p.device?' · '+p.device:'')+(p.layer_widths?' · L'+p.layer_widths.join('/'):'')+(p.stored!=null?' · '+p.stored+' stored':'');
+  let syn=fmt(p.synapses)+(p.synapse_capacity!=null?' / '+fmt(p.synapse_capacity):'')+' syn';
+  h+='<div class=metric><span>'+k+'<small>'+esc(extra)+'</small></span><b>'+fmt(p.neurons)+' n · '+syn+'</b></div>';}
  el.innerHTML=h;}
 function renderNet(nd,np){const el=document.getElementById('netdiag');if(el){const rows=[['train perplexity ↓',nd.perplexity_train],['gen perplexity',nd.perplexity_gen],['gen entropy (bits)',nd.gen_entropy],['cortex spike rate',nd.spike_rate],['cerebellum MSE ↓',nd.cerebellum_mse],['BG spike rate',nd.bg_spike_rate],['hippo spike rate',nd.hippo_spike_rate],['hippo recall fidelity',nd.hippo_fidelity],['BG policy entropy',nd.bg_policy_entropy]];Object.entries(nd.weights||{}).forEach(e=>rows.push([e[0],e[1]]));el.innerHTML=rows.filter(r=>r[1]!=null).map(r=>'<div class=metric><span>'+r[0]+'</span><b>'+esc(''+r[1])+'</b></div>').join('')||'<small>computing…</small>';}
  const pe=document.getElementById('netparams');if(pe){let h='';Object.entries(np||{}).forEach(m=>{h+='<div style=color:var(--acc);margin-top:3px>'+m[0]+'</div>'+Object.entries(m[1]).map(kv=>'<div class=metric><span>&nbsp;&nbsp;'+kv[0]+'</span><b>'+esc(''+kv[1])+'</b></div>').join('');});pe.innerHTML=h;}}
