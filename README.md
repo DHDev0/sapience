@@ -192,23 +192,28 @@ cap), max_log_mb, max_tb_mb, visual, teacher`. Only initial `hidden` (neuron pop
 **Deeper-brain R&D (§16, paper).** Three literature-grounded research threads + an integrated design live in
 `runs/{memory_architecture,drive_stress,dynamics_oscillations}_research.md` + `runs/deeper_brain_integrated_design.md`:
 memory should be *generative-in-the-net* not a raw buffer, plus a subcortical drive/cortisol layer and dynamic
-oscillatory states. **P0–P2 built, verified, and A/B-measured** (all opt-in, live-tunable, metric'd, device/dtype-safe,
-persisted; default OFF). Each was measured on the metric it claims to touch (`runs/deeper_brain_measure.py`), the
-§15.17 way — the honest verdict: **P0 helps memory; P1/P2 do no harm to learning but are neutral on bits/byte** —
-their value is behavioural/compute-realism, not lower loss, and the paper's ledger says so:
-- **P0 generative self-replay** — `sleep_mode=generative` dreams from the net, buffer-free. **HELPS memory:**
-  forgetting-resistance retention **none 0.232 < buffer 0.255 < generative 0.274** (`runs/generative_replay_test.py`).
-  `/api/set {sleep_mode, gr_dreams, gr_dream_len, gr_temperature, gr_anchor_frac}`; metrics `sleep_mode/gr_probe_drift/gr_dream_entropy`.
+oscillatory states. **P0–P2 built, A/B-measured** (all opt-in, live-tunable, metric'd, device/dtype-safe,
+persisted; default OFF). Each was measured on the metric it claims to touch (`runs/deeper_brain_measure.py` →
+committed `runs/deeper_brain_measure.json`), the §15.17 way. **The honest verdict: no §16 mechanism is a bits/byte
+win** — P1/P2 do no harm and have *measured non-loss* value; P0 and neurogenesis are measured nulls:
+- **P0 generative self-replay** — `sleep_mode=generative` dreams from the net, buffer-free. **Benefit did NOT
+  replicate:** a single-seed pilot beat the buffer, but over **3 seeds** retention was none **1.131** / buffer
+  **1.031** / generative **0.236** — anchor-free dreaming *corrupted* the net. Stays OFF by measurement.
+  `/api/set {sleep_mode, gr_dreams, gr_dream_len, gr_temperature, gr_anchor_frac}`.
 - **P1 endocrine** (`brain/endocrine.py`) — drive-deficit + cortisol + mood: satiation→reward→focus, a **one-sided**
   cortisol gate (calm→optimal = full plasticity, only chronic-high impairs → allostatic-load → sleep-recovers,
-  `runs/endocrine_test.py`). **NEUTRAL on bits/byte** (−0.001); value is behavioural (drive/focus/stress over a
-  lifetime). `/api/net {target:'endocrine', on, alpha_D, tau_C, C_star, …}`; metrics in `/api/state → netparams.endocrine`.
+  `runs/endocrine_test.py`). **NEUTRAL on bits/byte** (−0.001) but **measured behavioural value**: under an OOD
+  stress flood it protects prior knowledge (retention **0.751 vs 0.302** on/off), and drive→arousal raises
+  generation diversity. `/api/net {target:'endocrine', on, alpha_D, tau_C, C_star, …}`; metrics in `netparams.endocrine`.
 - **P2 dynamics** (`brain/dynamics.py`) — entropy knob β (normal↔psychedelic), **selective ignition** (not all
   systems active every cycle), attention→**processing frequency** (eligibility window). **NEUTRAL on bits/byte**
-  (+0.004); value is not-all-on realism + selective compute. `/api/net {target:'dynamics', on, beta0, ignite_thr, …}`;
+  (+0.004); **~50% compute saved** (≈50% of systems ignite per cycle). `/api/net {target:'dynamics', on, beta0, ignite_thr, …}`;
   metrics `beta/n_active/eff_freq` in `netparams.dynamics`.
+- **Adult-DG neurogenesis** (`/api/set neurogenesis`) — built: the adult wake-phase adds DG granule cells
+  (`SpikingHippocampus.grow()`, memory-preserving). A/B shows **no measured separation gain** (test saturated at
+  1.00→1.00), so default OFF pending a harder regime.
 - **P3 (roadmap, NOT built):** ripple-gated sleep FSM, sequence-carrying hippocampal trace, typed PV/SOM/VIP
-  interneuron *populations* (today scalars), STDP kernel, adult-DG neurogenesis, embodiment/closed sensorimotor loop.
+  interneuron *populations* (today scalars), STDP kernel, embodiment/closed sensorimotor loop.
 
 **Faithfulness stack via `/api/net`** `{target:'cortex', …}` (no restart, each independent): `learn_rule,
 feedback_mode, two_compartment, diff_neuromod, dale, dendritic, bounded_synapses, homeostasis, btsp,

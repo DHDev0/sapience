@@ -580,17 +580,20 @@ coupling only to fields that already exist:
 > **generalized-in-the-net** memory → gated by **oscillatory dynamic states** (which regions fire, at what
 > frequency, set by attention) → feeding back into the self-adapting attention.
 
-**Memory is generalized-in-the-net, not a buffer (verified).** The raw replay buffer is biologically
-wrong: hippocampal replay is *reconstructive/generative* — it builds never-experienced shortcuts (Gupta
-2010), pre-plays untraversed paths (Ólafsdóttir 2015), and sweeps to *future* goals (Pfeiffer-Foster 2013);
-under Complementary Learning Systems (McClelland 1995; Kumaran 2016) the cortex accumulates *generalized*
-structure in its weights, nothing stores raw episodes. The buffer-free mechanism is **generative self-replay**
-(Robins 1995; Shin 2017; van de Ven 2020): the cortex *dreams* from its own dynamics and hard-learns the
-dreams. **This is built and measured** — `SpikingBrain.generative_replay()` (diverse high-temperature dreams
-from sparse byte-cues, with two anti-"overfitted-brain" safeguards: a small veridical anchor fraction and a
-held-out acceptance monitor). On a forgetting-resistance test (learn topic A, then live through B–E), topic-A
-retention was **none 0.232 < raw-buffer 0.255 < generative 0.274** — dreaming from the net consolidates
-*better* than replaying stored text, with **no buffer** (`runs/generative_replay_test.py`).
+**Memory as generalized-in-the-net, not a buffer — the idea, and an honest negative result.** The raw
+replay buffer is biologically wrong: hippocampal replay is *reconstructive/generative* — it builds
+never-experienced shortcuts (Gupta 2010), pre-plays untraversed paths (Ólafsdóttir 2015), and sweeps to
+*future* goals (Pfeiffer-Foster 2013); under Complementary Learning Systems (McClelland 1995; Kumaran 2016)
+the cortex accumulates *generalized* structure in its weights, nothing stores raw episodes. The buffer-free
+mechanism is **generative self-replay** (Robins 1995; Shin 2017; van de Ven 2020): the cortex *dreams* from
+its own dynamics and hard-learns the dreams — built here as `SpikingBrain.generative_replay()` (diverse
+high-temperature dreams from sparse byte-cues, with two anti-"overfitted-brain" safeguards: a veridical-anchor
+fraction and a held-out acceptance monitor). **But the honest result is negative.** A single-seed pilot looked
+promising (generative 0.274 > buffer 0.255 > none 0.232); a **3-seed** re-measurement did **not** replicate
+(retention none 1.131 / buffer 1.031 / generative 0.236), and at anchor-fraction 0 the dreaming *corrupted* the
+representation — worse than doing nothing. So this is a compelling hypothesis that our current small-cortex
+implementation does **not** yet deliver; it stays **OFF** and the §16 ledger records the null. Whether a
+veridical anchor or a larger cortex rescues it is open (`runs/deeper_brain_measure.py`).
 
 **The drive/stress layer.** A `SpikingEndocrine` of slow scalars — a **drive deficit** (leaky integrator,
 met by a satiation event → a homeostatic-RL reward, Keramati-Gutkin, fed into the existing dopamine critic),
@@ -612,55 +615,62 @@ one real loop but flagged that the current histogram-based hippocampus cannot se
 uses sparse *byte-cues*, not vector reinstatement. Build order by value-per-effort, each behind a toggle with an
 acceptance test, landing one piece at a time (the lesson of the faithfulness build):
 
-- **P0 generative self-replay — done + verified.** `SpikingBrain.generative_replay` (above); forgetting-resistant
-  beyond the raw buffer.
-- **P1 `SpikingEndocrine` — done + verified** (`brain/endocrine.py`). Three bounded hormone scalars — a drive
-  deficit (met by learning-progress → a homeostatic-RL reward into the dopamine critic, and satiation → low NE →
-  focus), cortisol (a **one-sided** gate on plasticity — calm→optimal learning is full, only chronic-high cortisol
-  impairs, capped further by allostatic load; and it is the sleep-pressure term), and mood (a dopamine EMA that
-  damps cortisol). Verified: satiation emits reward + focuses; calm cortisol leaves plasticity full while
-  chronic-high impairs; chronic stress accrues allostatic load, and **sleep recovers it** (`runs/endocrine_test.py`).
-  Live via `/api/net endocrine`; metrics `cortisol/drive/mood/allostatic/plasticity_gain`.
-- **P2 dynamic states — done + verified** (`brain/dynamics.py`). A single entropy knob β (the normal↔psychedelic
-  dial) drives **selective ignition** — auxiliary systems run only when salient, so the brain is not all-on every
-  cycle (verified: 1-of-3 fire when one is salient) — and attention sets the **processing frequency** (a
-  gamma-short eligibility window when focused, alpha-long when disengaged). Live via `/api/net dynamics`; metrics
-  `beta/n_active/eff_freq`.
+- **P0 generative self-replay — built; benefit NOT established.** `SpikingBrain.generative_replay` (above). A
+  single-seed pilot suggested it beat the raw buffer on forgetting-resistance; a **3-seed re-measurement did not
+  replicate** (ledger below), and buffer-free dreaming *without* a veridical anchor corrupted the representation.
+  It stays OFF — not by caution but by measurement. Live via `/api/set sleep_mode=generative`.
+- **P1 `SpikingEndocrine` — built; neutral on loss, measured behavioural value** (`brain/endocrine.py`). Three
+  bounded hormone scalars — a drive deficit (met by learning-progress → a homeostatic-RL reward into the dopamine
+  critic, and satiation → low NE → focus), cortisol (a **one-sided** gate on plasticity — calm→optimal learning is
+  full, only chronic-high cortisol impairs, capped further by allostatic load; and it is the sleep-pressure term),
+  and mood (a dopamine EMA that damps cortisol). Verified: satiation emits reward + focuses; calm cortisol leaves
+  plasticity full while chronic-high impairs; chronic stress accrues allostatic load, and **sleep recovers it**
+  (`runs/endocrine_test.py`). Live via `/api/net endocrine`; metrics `cortisol/drive/mood/allostatic/plasticity_gain`.
+- **P2 dynamic states — built; neutral on loss, ~50% compute saved** (`brain/dynamics.py`). A single entropy knob β
+  (the normal↔psychedelic dial) drives **selective ignition** — auxiliary systems run only when salient, so the
+  brain is not all-on every cycle — and attention sets the **processing frequency** (a gamma-short eligibility
+  window when focused, alpha-long when disengaged). Live via `/api/net dynamics`; metrics `beta/n_active/eff_freq`.
 
-**The obligation of breadth: measured, not asserted.** §15.17 taught that a mechanism earns its place only
-after an A/B on the metric it claims to touch. The same discipline applies here. `runs/deeper_brain_measure.py`
-turns each of P1/P2 on in isolation over an identical cortex (16k neurons, same seed/data, endocrine driven from
-the live learning signal with a periodic "night" of sleep-relief) and measures the bits/byte effect; P0's benefit
-is a separate forgetting-resistance test. The honest ledger:
+**The obligation of breadth: measured, not asserted.** §15.17 taught that a mechanism earns its place only after
+an A/B on the metric it *actually* claims to touch. `runs/deeper_brain_measure.py` discharges that for §16 and
+writes the numbers to a committed artifact (`runs/deeper_brain_measure.json`): a bits/byte A/B for P1/P2 (identical
+16k cortex, same seed/data), a **3-seed** forgetting-resistance test for P0, and *behavioural* A/Bs that bits/byte
+cannot see. The honest ledger:
 
-| §16 mechanism | measured effect | verdict on bits/byte | where its value actually lives |
+| §16 mechanism | measured | verdict | where its value is (or isn't) |
 |---|---|---|---|
-| **P0** generative self-replay | retention **none 0.232 < buffer 0.255 < generative 0.274** | **HELPS memory** (forgetting-resistance) | catastrophic-forgetting resistance, buffer-free |
-| **P1** endocrine | bpb 3.999 → **3.998 (−0.001)** | **NEUTRAL** on learning | behavioural — drive-driven exploration/focus, chronic-stress regulation, sleep-pressure, over a *lifetime* (not a per-step bpb effect) |
-| **P2** dynamics | bpb 3.999 → **4.003 (+0.004)** | **NEUTRAL** on learning | selective compute (not-all-on realism) + the attention→frequency window |
-| P1+P2 | bpb 3.999 → **4.001 (+0.002)** | **NEUTRAL** | — |
+| **P0** generative self-replay | forgetting-resistance retention, **3 seeds**: none **1.131** / buffer **1.031** / generative **0.236** (noise ±0.22) | **NO benefit** — does not beat the buffer or no-replay; anchor-free dreaming *corrupts* | unproven; **default OFF** by measurement |
+| **P1** endocrine | bpb 3.999 → **3.998 (−0.001)**; **stress-protection** retention on/off **0.751 vs 0.302**; drive→arousal gen-entropy **3.96 vs 3.68** | **NEUTRAL on bpb; measured behavioural value** | protects prior knowledge under stress; drive→arousal→exploration |
+| **P2** dynamics | bpb 3.999 → **4.003 (+0.004)**; **~50%** of systems ignite per cycle | **NEUTRAL on bpb; ~50% compute saved** | not-all-on realism + selective compute |
+| adult-DG neurogenesis | separation/recall under interference **1.00 → 1.00** | **no measured gain** (test saturated) | separation of new memories — needs a harder test |
 
-The measurement earned its keep: the first run showed the endocrine *hurting* (+0.066) because a textbook
-*bidirectional* inverted-U throttled **calm** learning (resting cortisol sits below the optimum). That was a
-genuine design flaw the A/B exposed — the impairing arm (chronic-high) is the load-bearing one, so the gate is
-now one-sided (calm→optimal full, only chronic-high impairs), and the endocrine is now correctly neutral on
-learning. **The verdict is honest both ways:** P0 measurably helps memory and can carry its weight; P1 and P2 are
-**do-no-harm on bits/byte** — they are not learning-rate wins, they are *behavioural- and compute-realism* layers,
-and the ledger says so plainly. That is exactly why all three default **OFF**: they are opt-in enrichments whose
-value is measured where it lives, not smuggled in as if they lowered loss.
+The measurement earned its keep **twice**. First it exposed a design flaw: an early run showed the endocrine
+*hurting* bits/byte (+0.066) because a textbook *bidirectional* cortisol inverted-U throttled **calm** learning;
+the impairing arm (chronic-high) is the load-bearing one, so the gate is now one-sided and the endocrine is neutral
+on loss. Second — and this is the point of measuring — it **retracted an overclaim**: P0's single-seed "beats the
+buffer" did **not** survive three seeds, and dreaming without a veridical anchor made retention *worse than doing
+nothing*. **The honest verdict: no §16 mechanism is a bits/byte win.** P1 and P2 have *measured non-loss* value —
+stress-protection and drive-modulation for P1, ~50% compute-selectivity for P2 — so they are richer than cited
+scalars; P0 and neurogenesis show **no measured benefit yet** and are honestly labelled as such. All default
+**OFF**, now by evidence rather than caution.
 
 Two faithfulness constraints the same rule already covers, lest they read as "missing": **metabolic cost**
 (a spike-rate energy penalty) and **stochastic spiking** are built and measured as §15.17 toggles — metabolic
 costs ≈ +0.14 bpb (the expected price of an energy constraint; the brain learns to spike less), stochastic is
 ≈ neutral — both honest, both default off.
 
+**Adult-DG neurogenesis — built, measured null.** The dentate gyrus keeps adding granule cells in adulthood
+(Aimone/Gage), improving separation of *new* memories; `SpikingHippocampus.grow()` already adds DG cells and
+re-separates stored patterns identity-preservingly, so it is wired into the adult wake-phase behind a toggle
+(`/api/set neurogenesis`). But the A/B shows **no measured gain** (recall under interference 1.00 → 1.00 — the
+test saturated); it stays OFF until a harder separation regime can tell the two apart. Honest row, in the ledger.
+
 - **P3 (roadmap — explicitly NOT built).** Named so the ledger is not mistaken for completeness: the full
   SO-spindle-ripple sleep FSM (ripple-*gated* consolidation commit); a richer hippocampal trace so reinstatement
   carries *sequence*, not just letter statistics; typed PV/SOM/VIP interneuron **populations** (today they are
-  functional scalars, not spiking sub-nets); an STDP timing kernel; adult-DG **neurogenesis**; and an
-  **embodiment / closed sensorimotor loop**. Each will land the §15.17 way — one toggle, one A/B, one honest row —
-  or not at all.
+  functional scalars, not spiking sub-nets); an STDP timing kernel; and an **embodiment / closed sensorimotor
+  loop**. Each will land the §15.17 way — one toggle, one A/B, one honest row — or not at all.
 
-All three shipped layers default OFF (opt-in, each verified in isolation and A/B-measured above), are
-device/dtype-agnostic scalars, and persist across checkpoints — so the deeper brain can be switched on and tuned
-live without disturbing the running cortex.
+Every §16 mechanism defaults OFF (opt-in, each A/B-measured above — P1/P2 do-no-harm with measured non-loss
+value; P0 and neurogenesis measured nulls), is a device/dtype-agnostic scalar controller, and persists across
+checkpoints — so the deeper brain can be switched on and tuned live without disturbing the running cortex.

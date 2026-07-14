@@ -1,0 +1,80 @@
+{
+  "device": "cuda:0",
+  "note": "committed artifact for \u00a716 paper claims \u2014 regenerate with runs/deeper_brain_measure.py",
+  "bpb_ab": {
+    "baseline": 3.999,
+    "endocrine": 3.998,
+    "endocrine_delta": -0.001,
+    "dynamics": 4.003,
+    "dynamics_delta": 0.004,
+    "both": 4.001,
+    "both_delta": 0.002,
+    "verdict": "P1/P2 NEUTRAL on bits/byte (|\u0394|<0.05) = do-no-harm; value is behavioural/compute, not loss"
+  },
+  "p0_forgetting": {
+    "none": {
+      "retention_mean": 1.131,
+      "retention_min": 0.965,
+      "retention_max": 1.307,
+      "consolidation_sec": 0.0
+    },
+    "buffer": {
+      "retention_mean": 1.031,
+      "retention_min": 0.954,
+      "retention_max": 1.105,
+      "consolidation_sec": 3.13
+    },
+    "generative": {
+      "retention_mean": 0.236,
+      "retention_min": 0.112,
+      "retention_max": 0.332,
+      "consolidation_sec": 11.35
+    },
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "beats_none": false,
+    "beats_buffer": false,
+    "matches_buffer_within_noise": false,
+    "noise_floor": 0.22,
+    "verdict": "generative resists forgetting WORSE than the raw buffer (buffer-free) \u2014 and buffer-free dreaming at anchor_frac=0 actively CORRUPTED the representation (worse than no replay), so the earlier single-seed 'helps' does NOT replicate",
+    "corrupts": true,
+    "weak_forgetting_baseline": true
+  },
+  "p1_behaviour": {
+    "stress_protection": {
+      "retention_endocrine_on": 0.751,
+      "retention_endocrine_off": 0.302,
+      "cortisol_after_stress": 1.5,
+      "protects": true,
+      "verdict": "under an OOD stress flood the cortisol gate throttles plasticity and PROTECTS prior knowledge"
+    },
+    "drive_arousal": {
+      "ne_starved": 1.25,
+      "ne_sated": 0.503,
+      "gen_entropy_starved": 3.959,
+      "gen_entropy_sated": 3.677,
+      "arousal_raises_exploration": true,
+      "verdict": "unmet drive raises NE\u2192arousal\u2192 generation diversity (exploration); satiation focuses"
+    }
+  },
+  "p2_ignition": {
+    "mean_fraction_active": 0.498,
+    "n_systems": 5,
+    "compute_saved_frac": 0.502,
+    "not_all_on": true,
+    "verdict": "selective ignition runs ~50% of auxiliary systems per cycle (not all-on) \u2192 ~50% compute saved"
+  },
+  "neurogenesis": {
+    "recall_accuracy_baseline_DG": 1.0,
+    "recall_accuracy_after_neurogenesis": 1.0,
+    "delta": 0.0,
+    "n_patterns": 60,
+    "cue_noise": 0.35,
+    "helps_separation": false,
+    "verdict": "no measurable separation gain at this scale/interference"
+  },
+  "elapsed_sec": 992.9
+}
