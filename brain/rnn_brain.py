@@ -7,8 +7,8 @@ This is the fix, and it is faithful to the paper: a DEEP RECURRENT cortex trunk
 proves IS predictive coding in the β→0 limit — the paper's own boundary case. The
 recurrence gives it a persistent STATE that breaks the fixed-window ceiling: its
 hidden state h IS the brain's continuous stream-of-consciousness, carried across the
-always-thinking loop. It generates real, coherent words (measured ~1.2 bits/byte on
-web text, vs the cerebellum's fragments).
+always-thinking loop. It generates real, coherent words (measured ~0.5 bits/byte on
+web text — the fluency reference, cf. paper §-rate-cortex — vs the cerebellum's fragments).
 
 It is an nn.Module, so it runs on CPU or GPU (fp32 on CPU / bf16 on GPU), can be
 sharded across GPUs with FSDP2, and GROWS (wider/deeper, gated on data actually seen)

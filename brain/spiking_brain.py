@@ -598,9 +598,10 @@ class SpikingBrain(nn.Module):
         self.train()
         return prompt + bytes(out).decode("utf-8", "replace")
 
-    @torch.no_grad()
     def generative_replay(self, n=8, dream_len=160, temperature=1.1, cues=None,
                           probe=None, anchor=None, anchor_frac=0.2):
+        # NOT @torch.no_grad: the inner generate()/bits_per_byte() self-wrap in no_grad, and learn_text must
+        # keep grad enabled for the opt-in bptt route (loss.backward) — a blanket no_grad here crashed it.
         """§16 GENERATIVE SELF-REPLAY (pseudo-rehearsal) — the buffer-free consolidation. The cortex DREAMS
         sequences from its OWN dynamics and hard-learns them, so its generalized memory is rehearsed with NO
         raw replay buffer (CLS; Robins 1995, Shin 2017, van de Ven 2020). Diverse high-temperature dreams

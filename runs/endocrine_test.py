@@ -1,7 +1,8 @@
 """P1 acceptance test (§16): the SpikingEndocrine drive/cortisol/mood dynamics.
-Verifies: (1) satiation → focus (met drive lowers NE-gain, emits homeostatic reward); (2) cortisol
-inverted-U on plasticity; (3) graceful degradation — chronic stress raises allostatic load + drops the
-plasticity ceiling, and SLEEP recovers it.  Run: python runs/endocrine_test.py"""
+Verifies: (1) satiation → focus (met drive lowers NE-gain, emits homeostatic reward); (2) the ONE-SIDED
+cortisol gate on plasticity (calm→optimal = full, only chronic-high impairs); (3) graceful degradation —
+chronic stress raises allostatic load + drops the plasticity ceiling, and SLEEP recovers it.
+Run: python runs/endocrine_test.py"""
 import sys, math
 sys.path.insert(0, "/home/dander/workspace/zk/sapience")
 from brain.endocrine import SpikingEndocrine

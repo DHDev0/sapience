@@ -607,7 +607,7 @@ main{display:grid;grid-template-columns:340px 1fr;gap:10px;padding:10px}
   <div class=card style=margin-top:10px><h3>💾 resources — usage vs limit</h3><div id=resources></div></div>
   <div class=card style=margin-top:10px><h3>🎚 tune a module (live)</h3>
    <div style=display:flex;gap:4px>
-    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option></select>
+    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option><option>endocrine</option><option>dynamics</option></select>
     <input id=nt_key placeholder="param (lr, beta, da…)" style=flex:1><input id=nt_val placeholder="value" style=width:70px>
     <button class=b-go onclick=setNet()>set</button>
    </div>
@@ -847,12 +847,14 @@ API_HELP = {
                      "budget, min_awake, max_awake, debt_threshold, perceive_gap, think_chunk, "
                      "resonate_k, threads, learn_steps, visual, teacher, "
                      "grow_add, grow_until, prune_until, freeze_growth, freeze_sleep, freeze_learning, "
-                     "max_model_gb (= checkpoint cap), hard_disk_gb (replay cap), max_log_mb, max_tb_mb. "
+                     "max_model_gb (= checkpoint cap), hard_disk_gb (replay cap), max_log_mb, max_tb_mb, "
+                     "sleep_mode (buffer|generative), gr_dreams, gr_dream_len, gr_temperature, gr_anchor_frac (§16 P0 replay). "
                      "(initial neurons/layers/device/core need /api/start relaunch.)",
-    "POST /api/net": "tune a PART (or 'all') of the net live: {target: cortex|cerebellum|hippocampus|bg|neuromod|all, ...params} — "
+    "POST /api/net": "tune a PART (or 'all') of the net live: {target: cortex|cerebellum|hippocampus|bg|neuromod|endocrine|dynamics|all, ...params} — "
                      "cortex {lr,read_alpha,seq,think_temp,prune_frac,grow_syn_frac}, cerebellum {eta,sparsity,g_golgi,thr0,grow_syn_frac,prune_frac}, "
                      "hippocampus {beta,sparsity,capacity,thr,g_inh,grow_syn_frac,prune_frac}, bg {alpha_v,alpha_pi,beta,thr,grow_syn_frac,prune_frac}, "
-                     "neuromod {da,ach,ne,ht}. Every region has its own live synapse grow rate (grow_syn_frac).",
+                     "neuromod {da,ach,ne,ht}, endocrine {on,alpha_D,tau_C,C_star,C_sigma,k_thr,k_pe,k_need,drive_met,novelty_met,lam_mood,al_thr} (§16 P1), "
+                     "dynamics {on,beta0,kappa,ignite_thr,f_alpha,f_gamma} (§16 P2). Every region has its own live synapse grow rate (grow_syn_frac).",
     "POST /api/arch": "LIVE per-region OR global neuron/synapse surgery: {target: cortex|cerebellum|bg|hippocampus|all, op, amount?, density?}. "
                       "ops: grow_neurons, set_neurons (grow to a TARGET count), grow_synapses (amount<1 = fraction), "
                       "prune_synapses (amount = fraction), set_synapses (grow/prune to a TARGET count, or density 0–1), "
@@ -981,6 +983,11 @@ class H(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address. DEFAULT 127.0.0.1 (localhost only — the safe choice; the API can run "
+                         "shell tools and read local paths, so it must NOT be world-reachable). View a remote "
+                         "board over the printed `ssh -L` tunnel. Pass --host 0.0.0.0 ONLY on a trusted/isolated "
+                         "network to expose it directly.")
     ap.add_argument("--checkpoint", default=None, help="resume this run folder on autostart")
     ap.add_argument("--no-autostart", action="store_true", help="start the board only; launch from the web")
     ap.add_argument("--device", default="auto", help="auto | cpu | cuda | cuda:N | multi")
@@ -1018,11 +1025,14 @@ def main():
 
     with open(os.path.join(BASE, "dashboard.pid"), "w") as f:
         f.write(str(os.getpid()))
-    srv = ThreadingHTTPServer(("0.0.0.0", args.port), H)
+    srv = ThreadingHTTPServer((args.host, args.port), H)
     url = f"http://localhost:{args.port}"
     fwd = ssh_forward_hint(args.port)
     print("=" * 74)
-    print(f"  🧠  LIVING-BRAIN DASHBOARD  →  {url}")
+    print(f"  🧠  LIVING-BRAIN DASHBOARD  →  {url}   (bound {args.host})")
+    if args.host != "127.0.0.1":
+        print(f"  ⚠  EXPOSED on {args.host}: the API runs shell tools + reads local paths and has NO auth — "
+              f"only do this on a trusted, isolated network. The safe path is the ssh -L tunnel below.")
     if fwd:
         print(f"  on a REMOTE/SSH box — run this on your LAPTOP, then open {url} :")
         print(f"      {fwd}")

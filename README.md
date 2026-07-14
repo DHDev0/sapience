@@ -60,6 +60,11 @@ Viewing from a laptop over SSH (the dashboard also prints this itself):
 ssh -L 8181:localhost:8181 user@host      # then open http://localhost:8181 locally
 ```
 
+> **Security.** The board binds `127.0.0.1` (localhost) by default and is meant to be reached over the `ssh -L`
+> tunnel above — **not** exposed directly. The API can register and run shell tools and read local paths, and has
+> no authentication, so a reachable port is remote code execution. Only pass `--host 0.0.0.0` on a trusted,
+> isolated network, and only register tools you trust.
+
 ---
 
 ## The dashboard

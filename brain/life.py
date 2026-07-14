@@ -304,8 +304,9 @@ class BrainLife:
             gate = self.nm.tone["ach"] if self.modules_on else 1.0
             endo = getattr(self, "endocrine", None)
             if endo is not None and endo.on:                        # §16 endocrine gates plasticity + arousal
-                gate = gate * endo.plasticity_gain()                # cortisol inverted-U (acute sharpens, chronic impairs)
-                self.nm.tone["ne"] = endo.ne_gain()                 # satiation → focus (low NE); deficit → exploration
+                gate = gate * endo.plasticity_gain()                # cortisol one-sided gate (chronic-high impairs)
+                # NE (satiation→focus) is applied to the per-call tone copy below, NOT the canonical tone —
+                # so toggling endocrine OFF leaves no stale NE lingering until the next set_phase.
             dyn = getattr(self, "dynamics", None)
             if dyn is not None and dyn.on:                          # §16 P2 attention → processing frequency
                 self.brain._dyn_elig_beta = dyn.eligibility_beta(float(getattr(self.brain, "attention", 1.0)))
@@ -315,6 +316,8 @@ class BrainLife:
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr * gate
             tone = dict(self.nm.tone) if self.modules_on else None   # the 4 tones (diff_neuromod uses them per-pathway)
+            if tone is not None and endo is not None and endo.on:
+                tone["ne"] = endo.ne_gain()                          # §16 satiation→focus, per-call (canonical tone stays clean)
             r = self.brain.learn_text(text, epochs=1, max_steps=steps, gate=gate, tone=tone)
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr
@@ -345,6 +348,7 @@ class BrainLife:
     # ---- BIRTH: distil teacher outputs + real text to COHERENCE ------ #
     def _birth_corpus(self, kb=250):
         parts = []
+        self.born_from_teacher = False                    # provenance: did the frozen VLM actually contribute?
         if self.use_teacher:                              # the frozen teacher's "teachings"
             try:
                 from .llm_teacher import QwenVLTeacher
@@ -356,11 +360,13 @@ class BrainLife:
                     t = teacher.generate(s, max_new_tokens=96, temperature=0.7)
                     if t:
                         self.teacher_cps = self._ema(self.teacher_cps, len(t) / max(time.time() - _t0, 1e-3))
-                        self.teacher_name = "Qwen"
+                        self.teacher_name = "Qwen"; self.born_from_teacher = True
                         parts.append(t); self.log(f"teacher(Qwen {self.teacher_cps:.0f} c/s)> {t[:50]}")
                 del teacher
             except Exception as e:
-                self.log(f"teacher unavailable at birth: {str(e)[:50]}")
+                # LOUD + honest: without the teacher the brain is born on wikitext ONLY — the
+                # "born from a frozen VLM by distillation" story does NOT hold for this run.
+                self.log(f"⚠ BIRTH TEACHER (Qwen VLM) FAILED — born on wikitext ONLY, not by distillation: {str(e)[:70]}")
         try:                                              # real world text (wikitext-2)
             from datasets import load_dataset
             ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")

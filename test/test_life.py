@@ -90,12 +90,50 @@ def test_config_persistence_and_resume_awake():
     L = BrainLife(d, core="spiking", use_teacher=False, use_visual=False, emb=16, hidden=48, layers=1, device="cpu", seed=0)
     L.budget = 0.33; L.grow_add = 48; L.freeze_growth = True; L.learn_steps = 13
     L.set_net("hippocampus", {"beta": 15}); L.focus(topics=["coding"], mode="topics", label="code")
+    # §16 state must ALSO round-trip: P1 endocrine (params + hormone state), P2 dynamics params, P0 replay cfg
+    L.set_net("endocrine", {"on": True, "C_star": 0.42, "tau_C": 150.0})
+    L.endocrine.C = 0.37; L.endocrine.D_energy = 0.61; L.endocrine.AL = 0.09; L.endocrine.M = 0.44
+    L.set_net("dynamics", {"on": True, "beta0": 3.0, "ignite_thr": 0.4})
+    L.sleep_mode = "generative"; L.gr_dreams = 12; L.gr_temperature = 1.3; L.gr_anchor_frac = 0.25
     L.awake = False                                             # was asleep at save
     L.save_life()
     L2 = BrainLife(d, core="spiking", use_teacher=False, use_visual=False, emb=16, hidden=48, layers=1, device="cpu", resume=True)
     assert L2.budget == 0.33 and L2.grow_add == 48 and L2.freeze_growth and L2.learn_steps == 13
     assert L2.hippo.beta == 15.0 and L2.focus_label == "code"
     assert L2.awake is True                                     # resumes AWAKE (no spurious night)
+    # §16 P1 endocrine survived (both tunable params AND live hormone state D/C/M/AL)
+    assert L2.endocrine.on is True and abs(L2.endocrine.C_star - 0.42) < 1e-9 and abs(L2.endocrine.tau_C - 150.0) < 1e-9
+    assert abs(L2.endocrine.C - 0.37) < 1e-9 and abs(L2.endocrine.D_energy - 0.61) < 1e-9
+    assert abs(L2.endocrine.AL - 0.09) < 1e-9 and abs(L2.endocrine.M - 0.44) < 1e-9
+    # §16 P2 dynamics params survived
+    assert L2.dynamics.on is True and abs(L2.dynamics.beta0 - 3.0) < 1e-9 and abs(L2.dynamics.ignite_thr - 0.4) < 1e-9
+    # §16 P0 generative-replay cfg survived
+    assert L2.sleep_mode == "generative" and L2.gr_dreams == 12
+    assert abs(L2.gr_temperature - 1.3) < 1e-9 and abs(L2.gr_anchor_frac - 0.25) < 1e-9
+
+
+def test_string_bool_coercion_endocrine_dynamics():
+    # the load-bearing set_params coercion: 'false'/'0'/'off' must DISABLE, not truthy-enable
+    from brain.endocrine import SpikingEndocrine
+    from brain.dynamics import SpikingDynamics
+    for M in (SpikingEndocrine, SpikingDynamics):
+        m = M(); m.on = True
+        for falsey in ("false", "0", "off", "no", "", False):
+            m.set_params(on=falsey); assert m.on is False, f"{M.__name__}: {falsey!r} should disable"
+        for truthy in ("true", "1", "on", "yes", True):
+            m.set_params(on=truthy); assert m.on is True, f"{M.__name__}: {truthy!r} should enable"
+
+
+def test_endocrine_dynamics_drive_the_learn_loop():
+    # integration: with §16 ON, plasticity_gain gates the update and eligibility_beta reaches the trace
+    L = _life("endo_loop")
+    L.set_net("endocrine", {"on": True}); L.set_net("dynamics", {"on": True})
+    L.endocrine.C = 1.4                                          # chronic-high → gate should throttle the update
+    L._learn_text("the cat sat on the mat and the dog ran fast. " * 20, steps=4)
+    assert L.brain._dyn_elig_beta is not None                   # P2 frequency window reached the cortex
+    L.set_net("dynamics", {"on": False})
+    L._learn_text("water flows to the sea and rain falls from clouds. " * 20, steps=2)
+    assert L.brain._dyn_elig_beta is None                       # toggling P2 OFF restores the native timescale
 
 
 def test_bounded_logs():

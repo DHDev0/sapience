@@ -9,8 +9,9 @@ of the existing four tones + the self-adapting attention + the sleep-debt + the 
       2014: reward = the DROP in total deficit) and sharpens focus (Aston-Jones-Cohen: satiation → low tonic
       NE → phasic focused mode).
   cortisol C  — the slow stress hormone (HPA axis). Rises with unmet drive + prediction-error/threat, decays
-      over a wake-bout, and is RELIEVED by sleep. Inverted-U modulation of plasticity (Lupien 2009; Joëls):
-      moderate acute C sharpens learning, chronic-high C impairs it.
+      over a wake-bout, and is RELIEVED by sleep. ONE-SIDED modulation of plasticity (Lupien 2009; Joëls):
+      calm→optimal cortisol leaves learning at full plasticity, only chronic-high C impairs it (see
+      plasticity_gain — the §16 A/B showed a bidirectional inverted-U wrongly throttled calm learning).
   mood M  — a dopamine EMA that sets the 5-HT tone and DAMPS cortisol (resilience; Eldar-Niv).
   allostatic load AL  — chronic-stress cost: accrues while C is high, recovers only in low-C sleep, and caps
       the plasticity ceiling (McEwen allostatic load).
@@ -52,7 +53,8 @@ class SpikingEndocrine:
         D1 = self.D_energy + self.D_novelty
         r_home = max(0.0, D0 - D1)                                       # homeostatic-RL reward = deficit drop
         self.C = min(self.C_max, max(0.0, self.C + self.k_thr * float(threat) + self.k_pe * max(0.0, float(surprise))
-                     + self.k_need * D1 - self.C / self.tau_C - 0.02 * max(0.0, self.M - 0.5)))   # BOUNDED hormone
+                     + self.k_need * D1 - self.C / max(self.tau_C, 1e-6)                 # guard live-tuned tau_C=0
+                     - 0.02 * max(0.0, self.M - 0.5)))   # BOUNDED hormone
         self.M = (1.0 - self.lam_mood) * self.M + self.lam_mood * (0.5 + float(da))
         if self.C > self.al_thr:
             self.AL = min(1.0, self.AL + 0.001 * (self.C - self.al_thr))
