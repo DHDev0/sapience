@@ -95,6 +95,8 @@ class SpikingBrain(nn.Module):
         self.attention = 1.0
         self.loss_ema = None
         self.attn_sensitivity = 0.8            # how sharply attention drops with above-baseline loss
+        self.attn_rate_sens = 0.25             # how sharply attention drops when firing runs > 2× the homeostatic
+                                               # target (the over-excitation brake; loss-blind drift protection)
         # e-prop's top-down error path (§15.16). "learned" (DEFAULT) = Kolen-Pollack: the feedback
         # matrix B gets the SAME local gradient as the readout head (+ tiny decay), so it LEARNS to
         # align with the forward weights — no weight transport, strictly more faithful than fixed random.
@@ -475,7 +477,17 @@ class SpikingBrain(nn.Module):
         if getattr(self, "loss_ema", None) is None: self.loss_ema = L
         surprise = (L - self.loss_ema) / max(self.loss_ema, 1.0)     # >0 = worse than usual (struggling)
         sens = float(getattr(self, "attn_sensitivity", 0.8))
-        attn_t = min(1.3, max(0.2, 1.0 - sens * surprise))          # Yerkes–Dodson: high error → less plasticity
+        # OVER-EXCITATION brake: firing far above the homeostatic target is a REPRESENTATION runaway the
+        # loss-surprise term is BLIND to — training loss stays low while the net inflates (mem_mag/bpb drift
+        # up). Unlike a self-following EMA baseline, the fixed rate target is an ABSOLUTE anchor a slow drift
+        # cannot escape, so attention (and thus the effective rate) self-corrects the over-firing. Fires only
+        # past 2× target; live-tunable via attn_rate_sens (0 disables). Needs homeostasis' per-step spk_sum.
+        over = 0.0
+        if homeo and spk_sum is not None:
+            rate = float(spk_sum[-1].sum()) / (float(B * T) * float(cells[-1].hid))   # top-layer mean firing rate
+            over = min(3.0, max(0.0, rate / max(float(getattr(self, "target_rate", 0.08)), 1e-3) - 2.0))
+        rate_sens = float(getattr(self, "attn_rate_sens", 0.25))
+        attn_t = min(1.3, max(0.2, 1.0 - sens * surprise - rate_sens * over))   # loss-shock OR over-firing → less plasticity
         self.attention = 0.9 * float(getattr(self, "attention", 1.0)) + 0.1 * attn_t
         self.loss_ema = 0.98 * self.loss_ema + 0.02 * L             # slow learning-health baseline
         scale = float(gate) * lr * self.attention * ((0.5 + da) if diffnm else 1.0)   # ACh gates; ATTENTION self-adapts; DA reward-modulates
@@ -743,10 +755,11 @@ class SpikingBrain(nn.Module):
 
     # The faithfulness stack (§15.16): each biological constraint is an INDEPENDENT toggle (extends the
     # learn_rule switch), so its capability cost can be measured on the fidelity↔capability curve.
-    _FAITH_KEYS = ("learn_rule", "eprop_lr_scale", "feedback_mode", "fb_decay", "dale", "dendritic",
-                   "burst_thr", "bounded_synapses", "w_max", "homeostasis", "target_rate", "homeo_lr",
-                   "btsp", "btsp_beta", "two_compartment", "g_ap", "beta_ap", "som_baseline", "pv_gain",
-                   "diff_neuromod", "stochastic", "spike_noise", "metabolic", "metabolic_lambda")
+    _FAITH_KEYS = ("learn_rule", "eprop_lr_scale", "attn_sensitivity", "attn_rate_sens", "feedback_mode",
+                   "fb_decay", "dale", "dendritic", "burst_thr", "bounded_synapses", "w_max", "homeostasis",
+                   "target_rate", "homeo_lr", "btsp", "btsp_beta", "two_compartment", "g_ap", "beta_ap",
+                   "som_baseline", "pv_gain", "diff_neuromod", "stochastic", "spike_noise", "metabolic",
+                   "metabolic_lambda")
 
     @torch.no_grad()
     def set_faith(self, **kw):
@@ -770,7 +783,7 @@ class SpikingBrain(nn.Module):
                 elif k == "w_max":
                     v = max(1e-3, v)
                 elif k in ("target_rate", "homeo_lr", "pv_gain", "g_ap", "fb_decay", "burst_thr",
-                           "som_baseline", "spike_noise", "metabolic_lambda"):
+                           "som_baseline", "spike_noise", "metabolic_lambda", "attn_sensitivity", "attn_rate_sens"):
                     v = max(0.0, v)
                 elif k in ("btsp_beta", "beta_ap"):
                     v = min(0.9999, max(0.0, v))

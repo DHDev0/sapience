@@ -175,3 +175,22 @@ def test_develop_grows_synapses_keeps_neurons_fixed():
     assert grown > 0                                            # child GREW synapses (not neurons)
     assert pruned > 0                                          # adolescent PRUNED synapses
     assert b.hidden == 80                                       # neuron population unchanged
+
+
+def test_over_excitation_brake_lowers_attention():
+    # The self-adapting attention is loss-based; a SLOW representation runaway keeps training loss low
+    # while firing/mem_mag inflate (the live-brain divergence we hit). The over-excitation brake makes
+    # attention ALSO drop when firing exceeds ~2x the homeostatic target — an absolute anchor a drift
+    # can't escape. With a tiny target (everything over-fires), the brake must pull attention well below
+    # the loss-only baseline; attn_rate_sens=0 disables it (recovers the old loss-only behavior).
+    def run(rate_sens):
+        b = SpikingBrain(DEV, emb=32, hidden=128, layers=2, cell="lif", seed=0,
+                         sparse=True, rec_fanin=16, in_fanin=16, syn_density=0.5)
+        b.set_faith(learn_rule="eprop", homeostasis=True, target_rate=0.001, attn_rate_sens=rate_sens)
+        b.eprop_lr_scale = 2000
+        for _ in range(25):
+            b.learn_eprop(TXT, epochs=1, bs=8, max_steps=1, seq=32)
+        return b.attention
+    braked, loose = run(0.25), run(0.0)
+    assert braked < loose - 0.1          # over-firing throttles plasticity (self-corrects the runaway)
+    assert loose > 0.8                   # the loss-only path does NOT react (the failure mode) — control
