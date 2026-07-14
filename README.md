@@ -83,7 +83,8 @@ One page, updating live (each panel has a **⛶ fullscreen** toggle):
 ## What it can do
 
 - **Five spiking systems, operating together** (coupled by activation/reward, gradient-cut §6):
-  **§3 cortex** (growable LIF, membrane readout, surrogate-BPTT = predictive coding at β→0),
+  **§3 cortex** (growable LIF, membrane readout; learns by DEFAULT by **faithful e-prop** — see the
+  faithfulness stack below — with surrogate-BPTT kept as an opt-in, non-plausible capability reference),
   **§1 cerebellum** (fast supervised next-byte forward model, Golgi-controlled granule code,
   delta rule), **§2 basal ganglia** (dopamine actor-critic — curiosity), **§4 hippocampus**
   (modern-Hopfield episodic store — novelty-gated replay), **§5 neuromodulation** (wake/NREM/REM
@@ -112,6 +113,33 @@ One page, updating live (each panel has a **⛶ fullscreen** toggle):
 - **Bounded logging/checkpoints** — log, TensorBoard, replay, and checkpoint all have live caps.
 - **Checkpoint / resume** across devices (CPU ↔ GPU), continuing cycle, age, growth, clock, mind,
   and **all your live tuning**.
+
+## Faithful learning — the biological stack (measured, not asserted)
+
+The cortex learns by **e-prop by default** (forward-in-time eligibility traces + a top-down learning
+signal + a three-factor neuromodulator gate — **no** backprop-through-time, **no** weight transport;
+`learn_rule="bptt"` keeps surrogate-BPTT as an opt-in capability reference). On top of that, **every
+biological constraint is an independent, live-toggleable axis** (`POST /api/net {target:cortex, …}` or
+the dashboard's *faithfulness stack* panel), so each one's capability cost is *measured*:
+
+| toggle | what it makes faithful |
+|---|---|
+| `feedback_mode` = `learned`\|`random` | learned (Kolen–Pollack) vs. fixed-random (DFA) top-down feedback |
+| `two_compartment` | **unified apical circuit** — error runs *through* an apical dendrite, gated by a VIP→SOM disinhibition microcircuit driven by the neuromodulator, bursting onto somatic spikes (subsumes `dendritic`) |
+| `dale` | Dale's law — each neuron excitatory or inhibitory (sign-locked outgoing synapses) |
+| `dendritic` | standalone apical burst-coded error (not yet routed through the two-compartment neuron) |
+| `bounded_synapses` | Fusi bounded weights (±`w_max`) |
+| `homeostasis` | intrinsic firing-rate homeostasis (per-neuron threshold → target rate) |
+| `btsp` | behavioral-timescale eligibility (the trace outlives the membrane) |
+| `diff_neuromod` | the 4 tones gate 4 pathways — ACh→encoding, DA→reward, NE→gain, 5-HT→apical patience (couples learning to wake/sleep) |
+| `stochastic` | probabilistic (noisy) spiking |
+| `metabolic` | spike-rate energy penalty in the objective |
+
+Each surfaces a metric (`fb_align_cos`, `ei_frac_excit`, `burst_frac`, `apical_mag`, `homeo_thr_mean`,
+`synapse_sat_frac`) in `GET /api/state` → `net.weights`. The measured **capability-vs-fidelity curve**
+— how many bits/byte each constraint costs — is `runs/fidelity_capability_curve.{py,md}`; the honest
+cortical-algorithm survey + roadmap (real interneuron populations, STDP, prospective-configuration, ripple-gated
+consolidation, DG neurogenesis, embodiment) is `runs/cortical_algorithm_research.md` and paper §15.17.
 
 ## Everything is API-driven
 
@@ -148,6 +176,12 @@ perceive_gap, think_chunk, learn_steps, resonate_k, threads, grow_add, grow_unti
 freeze_growth, freeze_sleep, freeze_learning, max_model_gb (=checkpoint cap), hard_disk_gb (replay
 cap), max_log_mb, max_tb_mb, visual, teacher`. Only initial `hidden` (neuron population), `syn_density`,
 `layers`, `device`, `core` need `/api/start` (which resumes the checkpoint, so nothing is lost).
+
+**Faithfulness stack via `/api/net`** `{target:'cortex', …}` (no restart, each independent): `learn_rule,
+feedback_mode, two_compartment, diff_neuromod, dale, dendritic, bounded_synapses, homeostasis, btsp,
+stochastic, metabolic` + their hyperparameters (`eprop_lr_scale, fb_decay, burst_thr, w_max, target_rate,
+homeo_lr, btsp_beta, g_ap, beta_ap, som_baseline, pv_gain, spike_noise, metabolic_lambda`). Read the live
+settings back from `GET /api/state` → `netparams.cortex`.
 
 **Per-module live via `/api/net`**: cortex `{lr, read_alpha, seq, think_temp, prune_frac, grow_syn_frac}`
 · cerebellum `{eta, sparsity, g_golgi, thr0}` · hippocampus `{beta, sparsity, capacity, thr, g_inh}`
@@ -222,7 +256,7 @@ The whole codebase is covered by a fast, self-contained suite (no pytest needed 
 network and uses tiny CPU configs, so it runs in seconds):
 
 ```bash
-python test/run_tests.py              # run everything (~41 tests)
+python test/run_tests.py              # run everything (~85 tests)
 python test/run_tests.py cortex       # only test_cortex.py
 pytest test/                          # also works if you prefer pytest
 ```

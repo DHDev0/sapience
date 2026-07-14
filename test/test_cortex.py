@@ -23,6 +23,67 @@ def test_eprop_learns_dense_and_sparse():
         assert b.bits_per_byte(TXT) < bpb0 - 0.3                  # genuinely learns forward-in-time
 
 
+def test_faithfulness_toggles_each_and_all_learn():
+    # Every biological faithfulness constraint is an INDEPENDENT toggle (§15.16) that must still LEARN —
+    # individually AND all-together (the hard integration part). Metrics must surface for each.
+    combos = [
+        ("random_fb", dict(feedback_mode="random")),
+        ("learned_fb", dict(feedback_mode="learned")),
+        ("dale", dict(feedback_mode="learned", dale=True)),
+        ("dendritic", dict(feedback_mode="learned", dendritic=True)),
+        ("bounded", dict(feedback_mode="learned", bounded_synapses=True)),
+        ("homeostasis", dict(feedback_mode="learned", homeostasis=True)),
+        ("btsp", dict(feedback_mode="learned", btsp=True)),
+        ("unified_two_compartment", dict(feedback_mode="learned", two_compartment=True)),
+        ("diff_neuromod", dict(feedback_mode="learned", diff_neuromod=True)),
+        ("stochastic", dict(feedback_mode="learned", stochastic=True)),
+        ("metabolic", dict(feedback_mode="learned", metabolic=True)),
+        ("all", dict(feedback_mode="learned", two_compartment=True, diff_neuromod=True, stochastic=True,
+                     metabolic=True, dale=True, bounded_synapses=True, homeostasis=True, btsp=True)),
+    ]
+    for name, cfg in combos:
+        b = SpikingBrain(DEV, emb=32, hidden=64, layers=2, cell="lif", seed=0,
+                         sparse=True, rec_fanin=8, in_fanin=8, syn_density=0.6)
+        b.eprop_lr_scale = 4000.0
+        applied = b.set_faith(learn_rule="eprop", **cfg)
+        assert all(b.faith_config()[k] == v for k, v in cfg.items())          # toggles took
+        bpb0 = b.bits_per_byte(TXT)
+        for _ in range(90):
+            b.learn_eprop(TXT, epochs=1, bs=16, max_steps=1, seq=32)
+        assert b.bits_per_byte(TXT) < bpb0 - 0.3, f"{name} failed to learn"    # each still descends
+    # the relevant metric surfaces for each constraint (the "all" brain has every one active)
+    ws = b.weight_stats()
+    for k in ("fb_align_cos", "ei_frac_excit", "burst_frac", "apical_mag", "homeo_thr_mean", "synapse_sat_frac"):
+        assert k in ws, f"missing metric {k}"
+
+
+def test_metabolic_cost_lowers_spike_rate():
+    # the metabolic energy penalty must REDUCE firing (guards against a sign inversion that would
+    # amplify spiking instead of penalising it).
+    def spk(metabolic):
+        b = SpikingBrain(DEV, emb=32, hidden=64, layers=2, cell="lif", seed=0,
+                         sparse=True, rec_fanin=8, in_fanin=8, syn_density=0.6)
+        b.eprop_lr_scale = 4000.0
+        b.set_faith(learn_rule="eprop", feedback_mode="learned", metabolic=metabolic, metabolic_lambda=0.3)
+        for _ in range(60):
+            b.learn_eprop(TXT, epochs=1, bs=16, max_steps=1, seq=32)
+        return b.spike_rate(TXT)
+    assert spk(True) < spk(False)                                # penalty lowers firing, never raises it
+
+
+def test_dale_law_sign_constraint_holds():
+    # under Dale's law, every recurrent synapse keeps the sign of its PREsynaptic neuron's E/I type.
+    b = SpikingBrain(DEV, emb=32, hidden=48, layers=1, cell="lif", seed=0,
+                     sparse=True, rec_fanin=8, in_fanin=8, syn_density=0.8)
+    b.set_faith(learn_rule="eprop", dale=True)
+    for _ in range(20):
+        b.learn_eprop(TXT, epochs=1, bs=8, max_steps=1, seq=32)
+    c = b.cells[0]; sign = b._ei_sign[0][c.rec_col.long()]                     # expected sign per edge
+    live = c.rec_val * c.rec_mask                                              # active synapses
+    bad = ((live > 0) & (sign < 0)) | ((live < 0) & (sign > 0))
+    assert int(bad.sum()) == 0                                                 # Dale's law never violated
+
+
 def test_eprop_neuromod_gate_scales_update():
     # the three-factor gate M must scale the update — gate=0 → NO weight change (§5 coupling is real).
     b = SpikingBrain(DEV, emb=32, hidden=64, layers=2, cell="lif", seed=0)

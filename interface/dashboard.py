@@ -107,8 +107,8 @@ class Controller:
                                  sparse_hidden_threshold=int(cfg.get("sparse_hidden_threshold", 8192)),
                                  rec_fanin=int(cfg.get("rec_fanin", 64)),
                                  in_fanin=int(cfg.get("in_fanin", 64)),
-                                 learn_rule=cfg.get("learn_rule", "bptt"),
-                                 eprop_lr_scale=float(cfg.get("eprop_lr_scale", 15.0)),
+                                 learn_rule=cfg.get("learn_rule", "eprop"),   # faithful default; "bptt" = opt-in fast ref
+                                 eprop_lr_scale=float(cfg.get("eprop_lr_scale", 2000.0)),
                                  max_model_gb=float(cfg.get("max_model_gb", 14.0)),
                                  max_log_mb=float(cfg.get("max_log_mb", 20.0)),
                                  max_tb_mb=float(cfg.get("max_tb_mb", 60.0)),
@@ -607,6 +607,10 @@ main{display:grid;grid-template-columns:340px 1fr;gap:10px;padding:10px}
    </div>
    <div id=netparams style=margin-top:6px></div>
   </div>
+  <div class=card style=margin-top:10px><h3>🧠 faithfulness stack (live toggles — §15.16)</h3>
+   <div id=faithbtns style=display:flex;flex-wrap:wrap;gap:4px></div>
+   <small>each biological constraint is independent; its capability cost is on the fidelity curve. click to flip live.</small>
+  </div>
   <div class=card style=margin-top:10px><h3>👁👂 observations — replay what it sensed</h3><div id=obs></div></div>
  </div>
  <div>
@@ -682,7 +686,15 @@ function renderArch(a){const el=document.getElementById('archdiag');if(!el)retur
   h+='<div class=metric><span>'+k+'<small>'+esc(extra)+'</small></span><b>'+fmt(p.neurons)+' n · '+syn+'</b></div>';}
  el.innerHTML=h;}
 function renderNet(nd,np){const el=document.getElementById('netdiag');if(el){const rows=[['train perplexity ↓',nd.perplexity_train],['gen perplexity',nd.perplexity_gen],['gen entropy (bits)',nd.gen_entropy],['cortex spike rate',nd.spike_rate],['cerebellum MSE ↓',nd.cerebellum_mse],['BG spike rate',nd.bg_spike_rate],['hippo spike rate',nd.hippo_spike_rate],['hippo recall fidelity',nd.hippo_fidelity],['BG policy entropy',nd.bg_policy_entropy]];Object.entries(nd.weights||{}).forEach(e=>rows.push([e[0],e[1]]));el.innerHTML=rows.filter(r=>r[1]!=null).map(r=>'<div class=metric><span>'+r[0]+'</span><b>'+esc(''+r[1])+'</b></div>').join('')||'<small>computing…</small>';}
- const pe=document.getElementById('netparams');if(pe){let h='';Object.entries(np||{}).forEach(m=>{h+='<div style=color:var(--acc);margin-top:3px>'+m[0]+'</div>'+Object.entries(m[1]).map(kv=>'<div class=metric><span>&nbsp;&nbsp;'+kv[0]+'</span><b>'+esc(''+kv[1])+'</b></div>').join('');});pe.innerHTML=h;}}
+ const pe=document.getElementById('netparams');if(pe){let h='';Object.entries(np||{}).forEach(m=>{h+='<div style=color:var(--acc);margin-top:3px>'+m[0]+'</div>'+Object.entries(m[1]).map(kv=>'<div class=metric><span>&nbsp;&nbsp;'+kv[0]+'</span><b>'+esc(''+kv[1])+'</b></div>').join('');});pe.innerHTML=h;}
+ renderFaith(np);}
+function setFaith(k,v){post('/api/net',{target:'cortex',[k]:v}).then(r=>flash('faith '+k+'='+v+': '+esc(JSON.stringify(r.applied||r.err||r))));}
+function renderFaith(np){const el=document.getElementById('faithbtns');if(!el||!np||!np.cortex)return;const c=np.cortex;let h='';
+ h+='<button class=b-go onclick="setFaith(\'learn_rule\',\''+(c.learn_rule=='eprop'?'bptt':'eprop')+'\')">rule: '+esc(''+c.learn_rule)+'</button>';
+ h+='<button class=b-go onclick="setFaith(\'feedback_mode\',\''+(c.feedback_mode=='learned'?'random':'learned')+'\')">feedback: '+esc(''+c.feedback_mode)+'</button>';
+ ['two_compartment','diff_neuromod','dale','dendritic','bounded_synapses','homeostasis','btsp','stochastic','metabolic'].forEach(k=>{const on=!!c[k];
+  h+='<button class=b-go style="opacity:'+(on?1:.45)+'" onclick="setFaith(\''+k+'\','+(on?'false':'true')+')">'+k.replace('_synapses','')+': '+(on?'ON':'off')+'</button>';});
+ el.innerHTML=h;}
 function renderObs(obs){const el=document.getElementById('obs');if(!el)return;el.innerHTML=(obs&&obs.length)?obs.slice().reverse().map(o=>{const url='/api/observe?i='+o.i;const m=o.modality=='audio'?'<audio controls src="'+url+'" style=height:26px;max-width:150px></audio>':o.modality=='image'?'<img src="'+url+'" style=height:40px;image-rendering:pixelated;border:1px solid #234>':'<small>'+o.modality+'</small>';return '<div class=metric style=align-items:center><span>'+o.ts+' <small>['+o.modality+'] '+esc(o.label||'')+'</small></span><span>'+m+'</span></div>';}).join(''):'<small>no non-text observations yet — register an audio/image tool and it appears here to replay</small>';}
 async function applyLive(){const chk=id=>document.getElementById(id).checked;
  const cfg={budget:+v('c_budget'),min_awake:+v('c_min'),max_awake:+v('c_max'),resonate_k:+v('c_resk'),perceive_gap:+v('c_pgap'),think_chunk:+v('c_think'),learn_steps:+v('c_lsteps'),max_model_gb:+v('c_mgb'),max_log_mb:+v('c_logmb'),max_tb_mb:+v('c_tbmb'),hard_disk_gb:+v('c_diskgb'),grow_add:+v('c_growadd'),grow_until:+v('c_growuntil'),prune_until:+v('c_pruneuntil'),freeze_growth:chk('c_fgrow'),freeze_sleep:chk('c_fsleep'),freeze_learning:chk('c_flearn'),visual:v('c_visual')==1};

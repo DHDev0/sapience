@@ -115,7 +115,7 @@ class BrainLife:
                  max_ram_mb=64.0, hard_disk_gb=10.0, threads=None, resonate_k=4,
                  max_log_mb=20.0, max_tb_mb=60.0, syn_density=0.5,
                  sparse=None, sparse_hidden_threshold=8192, rec_fanin=64, in_fanin=64,
-                 learn_rule="bptt", eprop_lr_scale=15.0,
+                 learn_rule="eprop", eprop_lr_scale=2000.0,   # faithful e-prop is the default; "bptt" = opt-in fast ref
                  think_chunk=20, perceive_gap=6.0, resume=False, use_tb=True, seed=0):
         os.makedirs(resdir, exist_ok=True)
         self.resdir = resdir
@@ -277,8 +277,8 @@ class BrainLife:
 
     # ---- learning helpers -------------------------------------------- #
     def _learn_text(self, text, steps=6):
-        """Core learning path: backprop-learn perceived TEXT (§3.5 β→0 PC), advance the
-        mind state, and archive to tiered episodic memory (RAM hot + SSD compressed)."""
+        """Core learning path: learn perceived TEXT (by default faithful e-prop, §15.17; BPTT if
+        selected), advance the mind state, and archive to tiered episodic memory (RAM hot + SSD compressed)."""
         if not text:
             return 0.0
         self.clock.tick()
@@ -295,7 +295,8 @@ class BrainLife:
             eprop = getattr(self.brain, "learn_rule", "bptt") == "eprop"
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr * gate
-            r = self.brain.learn_text(text, epochs=1, max_steps=steps, gate=gate)
+            tone = dict(self.nm.tone) if self.modules_on else None   # the 4 tones (diff_neuromod uses them per-pathway)
+            r = self.brain.learn_text(text, epochs=1, max_steps=steps, gate=gate, tone=tone)
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr
             if isinstance(r, tuple):                    # (first_loss, last_loss): free progress
@@ -527,9 +528,12 @@ class BrainLife:
                         "seq": self.brain.seq, "think_temp": getattr(self, "think_temp", 0.6),
                         "prune_frac": getattr(self.brain, "prune_frac", 0.05),
                         "grow_syn_frac": getattr(self.brain, "grow_syn_frac", 0.15),
-                        "syn_density": getattr(self.brain, "syn_density", 1.0),
-                        "learn_rule": getattr(self.brain, "learn_rule", "bptt"),
-                        "eprop_lr_scale": getattr(self.brain, "eprop_lr_scale", 15.0)}}
+                        "syn_density": getattr(self.brain, "syn_density", 1.0)}}
+        if hasattr(self.brain, "faith_config"):          # the full faithfulness stack (each an independent toggle)
+            p["cortex"].update(self.brain.faith_config())
+        else:
+            p["cortex"].update(learn_rule=getattr(self.brain, "learn_rule", "eprop"),
+                               eprop_lr_scale=getattr(self.brain, "eprop_lr_scale", 2000.0))
         if self.modules_on:
             p["hippocampus"] = {"beta": self.hippo.beta, "sparsity": self.hippo.a, "capacity": self.hippo.cap,
                                 "thr": getattr(self.hippo, "thr", None), "g_inh": getattr(self.hippo, "g_inh", None),
@@ -576,6 +580,11 @@ class BrainLife:
                     self.brain.eprop_lr_scale = max(0.1, float(p["eprop_lr_scale"])); applied["eprop_lr_scale"] = self.brain.eprop_lr_scale
                 if "learn_rule" in p and p["learn_rule"] in ("eprop", "bptt"):
                     self.brain.learn_rule = p["learn_rule"]; applied["learn_rule"] = self.brain.learn_rule
+                # faithfulness stack — every biological constraint is an independent LIVE toggle
+                # (feedback_mode, dale, dendritic, bounded_synapses, homeostasis, btsp + their hyperparams).
+                faith = {k: p[k] for k in p if k in getattr(self.brain, "_FAITH_KEYS", ())}
+                if faith:
+                    applied.update(self.brain.set_faith(**faith))
             elif target == "hippocampus" and self.modules_on:
                 if "beta" in p: self.hippo.beta = float(p["beta"]); applied["beta"] = self.hippo.beta
                 if "sparsity" in p: self.hippo.a = float(p["sparsity"]); applied["sparsity"] = self.hippo.a

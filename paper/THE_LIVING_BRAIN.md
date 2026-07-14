@@ -25,7 +25,7 @@ the neuromodulatory glue — a scalar tone, not a network:
 
 | module | structure (region-specific) | teaching signal | file |
 |---|---|---|---|
-| §3 **Cortex** (spiking, growable) | stacked leaky-integrate-and-fire recurrent layers; **readout taps the analog membrane** of the top layer, not the binary spike | next-byte error, surrogate-BPTT (= β→0 PC, §3.5) | `spiking_brain.py` |
+| §3 **Cortex** (spiking, growable) | stacked leaky-integrate-and-fire recurrent layers; **readout taps the analog membrane** of the top layer, not the binary spike | next-byte error via **e-prop** (forward-in-time eligibility + top-down signal + 3-factor gate; §15.17); BPTT (= β→0 PC) opt-in | `spiking_brain.py` |
 | §1 **Cerebellum** (spiking, growable) | sparse LIF granule expansion → Purkinje readout, with a **Golgi feedback-inhibition loop** holding granule sparsity at target | climbing-fibre error, delta rule ΔW=−η·c·g | `spiking_modules.py` |
 | §2 **Basal ganglia** (spiking, growable) | LIF **medium-spiny neurons** → critic + softmax actor; the dopamine RPE trains *both* (policy gradient) | dopamine RPE δ = r + γV′ − V | `spiking_modules.py` |
 | §4 **Hippocampus** (spiking, growable) | sparse dentate-gyrus separation + a modern-Hopfield store with **spiking CA3 winner-take-all** recall (LIF memory neurons + lateral inhibition → CA1 read-out) | one-shot, novelty-gated write; pattern completion | `spiking_modules.py` |
@@ -41,12 +41,14 @@ brain actually *operates* as five systems.
 ## 15.2 The spiking substrate
 
 `brain/spiking.py`. Leaky integrate-and-fire neurons: `v ← β·v·(1−s) + Wx + Rs`, fire when
-`v > θ`. The Heaviside spike is non-differentiable, so learning uses a **surrogate gradient**
-(fast-sigmoid) — and §3.5 tells us what that surrogate-BPTT *is*: predictive coding in the
-β→0 limit. So the learning stays inside the paper's own framework while the architecture is
-genuinely spiking (membranes, thresholds, spikes). The cortex's `TwoCompartmentLIF`
-implements §3.7 directly: a somatic compartment (basal feedforward + recurrent drive) and an
-apical dendrite carrying the top-down error that modulates firing.
+`v > θ`. The Heaviside spike is non-differentiable, so the *pseudo-derivative* used by both
+learning rules is a **surrogate gradient** (fast-sigmoid). By default the cortex learns by
+**e-prop** (§15.17) — forward-in-time, local, no backward pass; the opt-in `learn_rule="bptt"`
+reference is surrogate-BPTT, which §3.5 identifies as predictive coding in the β→0 limit, so even
+the non-plausible reference stays inside the paper's framework while the architecture is genuinely
+spiking (membranes, thresholds, spikes). The cortex's `TwoCompartmentLIF` implements §3.7 directly:
+a somatic compartment (basal feedforward + recurrent drive) and an apical dendrite carrying the
+top-down error that modulates firing — the substrate the §15.17 dendritic/burst-error toggle uses.
 
 **Membrane readout (a measured 2× win).** The original cortex applied its readout head to the
 binary *spike* vector — ~1 bit/neuron, discarding the analog membrane the neuron actually
@@ -103,16 +105,16 @@ editable live per part by API.
 
 The design study established a hard truth: a purely local-rule model over raw bytes learns
 byte statistics, not language. Two faithful ways forward, both grounded in §3.5:
-- **Spiking, five-module, growable (chosen — fidelity first):** the architecture above.
-  Five distinct structures, four genuinely spiking + growable (cortex, cerebellum, hippocampus,
-  basal ganglia) plus the §5 neuromodulatory glue. With the membrane readout
+- **Spiking, five-module, growable (chosen — fidelity first):** the architecture above, learning
+  by default via **faithful e-prop** (§15.17). Five distinct structures, four genuinely spiking +
+  growable (cortex, cerebellum, hippocampus, basal ganglia) plus the §5 neuromodulatory glue. With the membrane readout
   and a longer context window its capability has improved from the original ~4 bits/byte to
   **~3.1–3.2 bits/byte** (born at ~3.3, evolving down over its first nights), with real
   word-like fragments emerging (*"…was from the … to the … and …"*). Still modest versus a
   rate GRU — the accepted cost of fidelity — but markedly better than before, and it keeps
   improving as it lives.
-- **Rate recurrent cortex (kept as the capability reference):** a byte GRU trained the same
-  way (backprop = β→0 PC). It reaches ~0.5 bits/byte and writes coherent sentences (*"The
+- **Rate recurrent cortex (kept as the capability reference):** a byte GRU trained by plain
+  backprop (= β→0 PC). It reaches ~0.5 bits/byte and writes coherent sentences (*"The
   ocean is … He also added with the starter Cullen …"*), but it is not spiking and cannot grow
   cleanly. Available as `--core rnn` for when capability is the priority. `brain/rnn_brain.py`.
 
@@ -154,8 +156,10 @@ knows what time it is; a fixed time-probe measures how well it has learned to te
 
 `brain/life.py`. Sleep debt (§7.6) rises as the brain learns while awake; the brain DECIDES
 when to sleep — at least `min_awake`, by `max_awake` at the latest, and in between once the
-debt crosses a threshold. Sleep is the deep-learning phase, as in biology: it replays heavy
-BPTT on the whole-life memory (§15.10), then applies a §8.4 SHY multiplicative downscale so it
+debt crosses a threshold. Sleep is the deep-learning phase, as in biology: it replays the
+whole-life memory heavily under the default learning rule (faithful e-prop, §15.17; waking
+thought stays fast while sleep does the consolidation) (§15.10), then applies a §8.4 SHY
+multiplicative downscale so it
 also renormalises rather than only potentiating. (Honestly this is an *open-loop* constant
 downscale — a small fixed factor over all weights — not yet a closed-loop restore of the §9
 balance ⟨Δw⟩_wake + ⟨Δw⟩_sleep ≈ 0 scaled to the night's actual potentiation; that, and a
@@ -270,7 +274,7 @@ gradients** (§6), at *zero* throughput cost (measured 1.00× with the modules o
   Δw = η·M(t)·e), so waking encodes at full plasticity and you can throttle it live via
   `/api/net`. (Only wake and NREM tones are entered; a REM sub-phase is named as roadmap, not
   claimed as running.)
-- **§1 cerebellum → a fast supervised forward model.** Alongside the slow BPTT cortex it runs a
+- **§1 cerebellum → a fast supervised forward model.** Alongside the slow e-prop cortex it runs a
   *fast* supervised next-byte predictor, learned by its own climbing-fibre delta rule and
   gradient-cut from the cortex (§6): a bag-of-bytes window is the mossy input, a Golgi-controlled
   sparse granule expansion the hidden code, a Purkinje readout the prediction. Its error
@@ -386,9 +390,10 @@ What is real, on CPU: five different structures (§1–§5) — four growable sp
 (cortex, cerebellum, hippocampus, and the basal-ganglia LIF medium-spiny actor-critic) plus a
 scalar neuromodulatory glue — coupled by the gradient cut and now **actually operating
 together** (§15.14), the neuromodulator ACh tone genuinely gating cortical plasticity; a spiking
-cortex that learns by
-surrogate-BPTT (= β→0 PC), reads its graded membrane, runs ~7× faster after a bit-identical
-vectorisation, and grows by §10 synaptogenesis with the function preserved; parallel thought
+cortex that learns by DEFAULT by **faithful e-prop** (forward-in-time eligibility + a top-down
+learning signal + the three-factor gate; no BPTT, no weight transport — §15.17), with surrogate-BPTT
+(= β→0 PC) kept as an opt-in capability reference, reads its graded membrane, runs ~7× faster after a
+bit-identical vectorisation, and grows by §10 synaptogenesis with the function preserved; parallel thought
 resonance; a unified byte code for every sense; an internal clock; an autonomous,
 homeostatically-balanced, learning-during-sleep 24-hour loop with novelty-gated replay and
 dopamine-driven curiosity; continuous thinking with non-blocking human feedback; a compressed,
@@ -412,3 +417,134 @@ yet has long-range coherence, in-context learning, or reasoning — those exceed
 assignment and are named, not oversold, as the next chapter: a deeper temporal spiking trunk
 and the two-compartment top-down path (which needs the slower time-outer schedule). The step
 §13 called last — instantiate the whole thing and watch it live — is taken here.
+
+## 15.17 The faithfulness stack, and its measured price
+
+The cortex no longer learns by backprop-in-a-costume. **e-prop is now the default rule** — a
+forward-in-time approximation to BPTT (Bellec et al. 2020): a per-synapse *eligibility trace* is
+kept online, a *top-down learning signal* gates it, and a *three-factor* neuromodulator term
+(the ACh tone, §15.14) opens or closes plasticity. There is no backward pass through time, no
+weight transport, no separate error network — the update is `@torch.no_grad`, computed by hand
+from local traces and applied with `w.add_`. Surrogate-BPTT + Adam is kept only as the opt-in,
+non-plausible **capability reference** (`learn_rule="bptt"`). The single non-local operation that
+remained (a global gradient-norm clip) is gone: the update is `Δw_ji = −η·M·clamp(mean_t[L_j·e_ji]/N_j, ±Δ)`,
+where each synapse sees only its own pre-trace, post learning-signal, and the diffuse M, and the
+per-postsynaptic-**fan-in** normalisation `N_j` (a homeostatic input-scaling) makes the stable rate
+**width-invariant** — verified identical descent at 8k↔64k↔256k neurons.
+
+On top of that, **every biological constraint is an independent, live-toggleable axis** (extending
+the `learn_rule` switch — `set_faith(...)` / `POST /api/net`), so each one's cost can be *measured*
+rather than asserted:
+
+- **Learned feedback (Kolen–Pollack)** vs. fixed-random DFA — the top-down matrix *learns* to align
+  with the readout (its own local gradient + a decay), removing the random-alignment gap without
+  weight transport. Metric: the feedback↔forward cosine.
+- **Dale's law** — each neuron is excitatory or inhibitory; its outgoing synapses share one sign
+  (~80/20 E:I), re-projected after every step. Shrinks the usable weight space.
+- **Dendritic / burst error** — the learning signal is delivered as an apical **burst** that rides a
+  somatic spike and is thresholded (Naud/Richards) — low-bandwidth, noisy, activity-coupled.
+- **Unified two-compartment circuit** — the biological *completion* of the above (see below).
+- **Bounded synapses** (Fusi) — weights clamped to ±w_max (real synapses are bounded, low-precision).
+- **Firing-rate homeostasis** (metaplasticity) — each neuron's threshold drifts to hold a target rate
+  (Turrigiano), keeping a continually-learning net off silence and saturation.
+- **BTSP eligibility** (Bittner–Magee) — the eligibility trace outlives the membrane, widening the
+  temporal-credit window beyond e-prop's ~10-step decay.
+- **Differentiated neuromodulation** — the four tones gate four pathways (ACh→cortical encoding/the
+  VIP drive, DA→reward-scaled plasticity, NE→somatic gain, 5-HT→apical patience), not one scalar dial.
+- **Stochastic spiking** — probabilistic firing (membrane noise before threshold; noisy vesicle release).
+- **Metabolic cost** — a spike-rate penalty in the learning signal (real coding is energy-constrained).
+
+**One circuit, not separate toggles (the unification).** The toggles above are *axes*, but three of
+them are really one biological circuit, and `two_compartment=True` fuses them: each neuron gets an
+**apical dendrite** (the §3.7 `TwoCompartmentLIF` compartment, now load-bearing) with its own membrane
+`ap ← β_ap·ap + gate·(err·B)`; the top-down error is **admitted only through a VIP→SOM disinhibition
+gate** — SOM inhibition rises with local activity, and VIP, driven by the neuromodulator "learn-now"
+tone `M`, disinhibits it (`gate = (VIP − SOM)₊`); the apical membrane then **bursts onto somatic
+spikes** to drive plasticity and **feeds back onto somatic firing** (`drive += g_ap·ap`), with PV
+supplying fast divisive gain control. So the *substrate* (apical compartment), the *error delivery*
+(into it), the *interneurons* (SOM/VIP gate), and the *neuromodulator* (drives VIP) stop being four
+separate features and become **one microcircuit** — the error runs *through* the apical dendrite, not
+alongside it. This subsumes the standalone `dendritic` toggle (kept for the not-yet-routed comparison).
+
+**The measured capability–fidelity curve.** Training an otherwise-identical 16k-neuron cortex under
+each constraint (added one at a time, identical seed/data, 220 steps) gives the cost of each
+biological commitment — the thing the field usually hand-waves about:
+
+| Configuration | bits/byte | cost vs. plausible base |
+|---|---|---|
+| BPTT (non-plausible ceiling) | 2.42 | −3.78 |
+| e-prop + random feedback (DFA) | 6.21 | +0.01 |
+| + learned feedback (Kolen–Pollack) | 6.20 | 0.00 |
+| + Dale's law | 5.58 | −0.62 |
+| + dendritic / burst error (standalone) | 6.58 | +0.38 |
+| + bounded synapses | 6.20 | 0.00 |
+| + firing-rate homeostasis | 6.21 | +0.01 |
+| + BTSP long eligibility | 6.06 | −0.14 |
+| + **unified two-compartment** (apical/SOM-VIP/neuromod) | 5.90 | −0.30 |
+| + differentiated neuromodulation (4 tones → 4 pathways) | 5.96 | −0.24 |
+| + stochastic spiking | 6.19 | −0.01 |
+| + metabolic cost | 6.34 | +0.14 |
+| **full faithful stack** (all mechanisms) | **5.10** | **−1.10** |
+
+The honest reading: **the dominant price of plausibility is the learning *rule*** — e-prop costs
+~3.8 bits/byte against BPTT — while the individual biological *constraints* are mostly near-neutral
+or even *helpful* at this scale. Three results stand out. First, **routing the error through the
+apical compartment beats bolting it on**: the unified `two_compartment` circuit (5.90) is far better
+than the standalone `dendritic` burst (6.58) — the SOM/VIP-gated apical integration is not only more
+faithful but more capable than a thresholded side-signal. Second, **differentiating the
+neuromodulator helps** (−0.24 in isolation): four tones gating four pathways (ACh→encoding,
+DA→reward-scaling, NE→gain, 5-HT→patience) out-learn one scalar dial, and it couples learning to the
+wake/sleep cycle (verified: NREM tones down-modulate plasticity vs. wake). Third, **the constraints
+co-operate rather than compound**: the full stack (5.10) *beats* plain e-prop+learned-feedback (6.20)
+by ~1.1 bits/byte — the genuinely unexplored result, since stacking that many approximations usually
+makes a net learn far worse or not at all. Two findings to hold honestly. **Dale's law shows a small
+*improvement*, not the expected cost** — consistent in sign across seeds (−0.12 to −0.14 at 16k, both
+seeds; −0.6 in the headline config), a real regularisation effect rather than noise, though its
+magnitude is config-dependent and it raises the spike rate (so we leave it off the default live run for
+stability). And **the metabolic penalty correctly *costs* capability** (+0.14) while pulling the spike
+rate down (0.040→0.033) — the honest energy↔capability trade, and the sign that a first
+implementation got backwards (a spike penalty must *raise* the per-neuron error, not lower it). (Reproduce:
+`runs/fidelity_capability_curve.py`; the numbers refresh into `runs/fidelity_capability_curve.{json,md}`.)
+
+**Where this sits, and the permanent gap.** On the *learning rule* this is frontier-grade — few
+groups run e-prop + learned feedback + Dale + dendritic/burst + three-factor neuromod + homeostasis
+in one spiking net that learns language-like bytes continually. But "faithful to how the brain
+learns" is roughly a dozen independent axes, and the true cortical algorithm is *unknown* — there is
+no confirmed single algorithm (predictive coding, the NGRAD/backprop-approximation family, and
+"prospective configuration"/equilibrium-style relaxation are live, partly-incompatible hypotheses;
+the strongest phenomenon-level evidence is for prediction-error responses gated by SST/VIP
+interneurons — Furutachi/Mrsic-Flogel/Hofer, *Nature* 2024 — but that does not uniquely confirm any
+one algorithm). So the honest status is: frontier on the rule, **mid-field on the other axes, and
+provably short of "solved," because solved is not yet knowable by anyone.**
+
+**The roadmap (named, not oversold).** Ranked by whether they genuinely change *learning*:
+
+- *Group A — changes learning (built):* the **PV/SOM/VIP-gated apical circuit** (unified
+  `two_compartment`) and **differentiated four-tone neuromodulation** are now in — the connective
+  tissue between dendritic error and neuromodulation, and the four-pathway modulator that plugs into
+  it. What remains in this tier: **real interneuron populations** — PV/SOM/VIP are currently
+  *functional mean-field* terms (`som = som_b·⟨z⟩`, `vip = ACh`, PV = divide-by-mean), not separate
+  spiking LIF populations with their own connectomes and Dale typing; making them explicit populations
+  is the faithful version. **STDP** (a millisecond spike-timing kernel for the eligibility, not a rate
+  low-pass). **Cascade/complex synapses** (Fusi) for catastrophic-forgetting resistance beyond a bound.
+  A short **relaxation / prospective-configuration** micro-phase (settle activity under top-down nudging
+  before the update) — the biggest single lever per the literature (Song et al., *Nat. Neurosci.* 2024),
+  complementing e-prop's temporal traces with spatial relaxation, and a knob to test a predictive-coding
+  objective against the current global readout.
+- *Group B — when it learns:* **sharp-wave-ripple / theta-gamma gating** of replay (we schedule
+  replay by a debt heuristic; biology gates it on oscillation events); **adult dentate-gyrus
+  neurogenesis** (the one place automatic neuron growth is the faithful choice).
+- *Group C — realism, steeper diminishing returns:* richer dendrites (NMDA plateaus), stochastic
+  spiking + a metabolic/energy term, short-term plasticity.
+- *Group D — the setup, not the synapse:* a closed **sensorimotor / active-inference loop** where the
+  brain's outputs contingently reshape its future input. This is arguably the deepest gap in how the
+  brain learns — biological learning is grounded in an action–perception loop with consequences — and
+  it is about the *setup*, not the rule. Our brain reads and talks to Claude, but its words do not yet
+  change its world.
+
+Faithfulness is **asymptotic**: the brain has effectively unbounded biophysical detail, so there is
+always another axis. The research value is not checking every box — it is (1) separating the axes
+that change learning (group A) from the realism that does not (group C), and (2) *measuring the
+fidelity-vs-capability curve as each is added*. That curve — "here is exactly how much each
+biological constraint costs" — is the contribution; the full survey lives in
+`runs/cortical_algorithm_research.md`.

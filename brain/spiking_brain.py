@@ -3,9 +3,13 @@ spiking_brain.py — SpikingBrain: a growable spiking cortex (§3), the faithful
 
 A stack of leaky integrate-and-fire layers over the byte stream: byte → embedding →
 spiking recurrent layers (membrane carries temporal context) → readout → next byte.
-It is trained by surrogate-gradient backprop-through-time, which §3.5 identifies as
-predictive coding in the β→0 limit — so the learning stays inside the paper's framework
-while the architecture is genuinely spiking. It GROWS by §10 synaptogenesis (add LIF
+By DEFAULT it learns by e-prop (§15.16): forward-in-time eligibility traces + a random-
+feedback learning signal + a three-factor neuromodulator gate — no backprop-through-time,
+no weight transport, a fully local + biologically plausible rule (the faithful default).
+A surrogate-BPTT + Adam path — which §3.5 identifies as predictive coding in the β→0 limit —
+is kept as the opt-in fast, non-plausible reference (learn_rule="bptt"). Random e-prop is a
+weaker temporal-credit learner than true BPTT: the accepted price of plausibility, so its
+bits/byte sits somewhat above the BPTT run's. It GROWS by §10 synaptogenesis (add LIF
 neurons, identity-preserving). Drop-in for the living loop (same generate / learn_text /
 think / develop / model_gb / save / load surface).
 
@@ -71,14 +75,68 @@ class SpikingBrain(nn.Module):
         self.grow_until, self.prune_until = 8, 16
         self.grow_syn_frac, self.prune_frac = 0.15, 0.05
         # learning rule: "eprop" = biologically faithful e-prop (forward-in-time, local eligibility
-        # traces + random-feedback learning signal, no weight transport, three-factor neuromod gate);
-        # "bptt" = surrogate backprop-through-time + Adam (the fast, non-plausible reference).
-        self.learn_rule = "bptt"
+        # traces + random-feedback learning signal, no weight transport, three-factor neuromod gate) —
+        # the DEFAULT, since faithfulness is the point; "bptt" = surrogate backprop-through-time + Adam,
+        # the opt-in fast, non-plausible reference (learns lower bits/byte, but breaks plausibility).
+        self.learn_rule = "eprop"
         # e-prop learning rate. The update divides each synapse by its postsynaptic neuron's fan-in
-        # (N_j, see _eprop_step), which makes the effective rate width-invariant — so this raw scale is
-        # large and TRANSFERS across network size (verified identical descent 8k↔64k↔256k).
-        self.eprop_lr_scale = 10000.0
+        # (N_j, see _eprop_step), which makes the effective rate width-invariant → this raw scale TRANSFERS
+        # across network size (identical descent 8k↔64k↔256k). 2000 is the sustainably-stable default:
+        # higher (e.g. 10000) descends faster short-term but can run away over long training once
+        # synaptogenesis inflates the representation magnitude (measured). Tune up cautiously ≤4000.
+        self.eprop_lr_scale = 2000.0
         self._fanin_pow = 1.0                  # divide the update by N_j^p (p=1 → width-invariant descent)
+        # e-prop's top-down error path (§15.16). "learned" (DEFAULT) = Kolen-Pollack: the feedback
+        # matrix B gets the SAME local gradient as the readout head (+ tiny decay), so it LEARNS to
+        # align with the forward weights — no weight transport, strictly more faithful than fixed random.
+        # "random" = classic DFA (fixed random B, biologically plausible but leaves an alignment gap).
+        self.feedback_mode = "learned"
+        self.fb_decay = 1e-4                    # Kolen-Pollack weight decay that pulls B and W together
+        # Dale's law (§15.16): each neuron is excitatory or inhibitory — its RECURRENT outgoing synapses
+        # all share one sign (imposed on the neuron→neuron connectome by _project_dale; the feedforward
+        # input projection is left unconstrained). A real biophysical constraint that SHRINKS the usable
+        # weight space (costs capability).
+        # Independently toggleable (off by default; measured). Dendritic/burst error delivery: see below.
+        self.dale = False
+        # dendritic error (§15.16): deliver the top-down learning signal L as an APICAL-dendrite drive
+        # that is BURST-coded (thresholded, low-bandwidth) rather than a clean somatic scalar — the
+        # Naud/Richards burst-prop picture. Independently toggleable; costs capability (noisy, low-BW).
+        self.dendritic = False
+        self.burst_thr = 0.5                   # apical-burst threshold (fraction of mean |L|) when dendritic
+        # More faithfulness constraints (§15.16, each INDEPENDENTLY toggleable + measured; all cost some
+        # capability — that is the point of the fidelity↔capability curve). See set_faith()/faith_config().
+        self.bounded_synapses = False          # Fusi bounded synapses: weights clamped to ±w_max (real
+        self.w_max = 1.0                       #   synapses are bounded + low-precision → stability/forgetting)
+        self.homeostasis = False               # intrinsic firing-rate homeostasis (metaplasticity): each
+        self.target_rate = 0.08                #   neuron's threshold drifts to hold a target spike rate
+        self.homeo_lr = 0.02                   #   (Turrigiano) — keeps a continual net off silence/saturation
+        self.btsp = False                      # behavioral-timescale plasticity (Bittner–Magee): the
+        self.btsp_beta = 0.98                  #   eligibility trace outlives the membrane (seconds-long
+        #   credit window) — decouples the eligibility decay from the membrane decay c.beta.
+        # UNIFIED two-compartment cortical microcircuit (§15.17) — the biological completion that stitches
+        # the substrate, the error delivery, the interneurons, and the neuromodulator into ONE circuit
+        # (not separate toggles). Each neuron gets an APICAL dendrite (TwoCompartmentLIF §3.7) that
+        # (a) INTEGRATES the top-down error over time, (b) admitted only through a VIP→SOM DISINHIBITION
+        # gate driven by the neuromod "learn-now" tone M, (c) burst-codes it onto somatic spikes to drive
+        # plasticity, and (d) FEEDS BACK onto somatic firing. PV gives fast feedforward divisive gain
+        # control. When on, this SUBSUMES the standalone `dendritic` toggle — error runs THROUGH the apical
+        # compartment, not alongside it. (Turning it off falls back to the somatic learning signal.)
+        self.two_compartment = False
+        self.g_ap = 0.15                       # apical→soma feedback coupling (the TwoCompartmentLIF gain)
+        self.beta_ap = 0.9                     # apical-dendrite membrane decay (integrates the error)
+        self.som_baseline = 0.5                # SOM activity-driven apical inhibition strength
+        self.pv_gain = 0.3                     # PV feedforward divisive-normalization strength
+        # Differentiated neuromodulation (§15.17): the four tones gate DISTINCT pathways rather than one
+        # scalar — ACh gates cortical encoding/plasticity (the VIP "learn-now" drive), DA reward-modulates
+        # the plasticity magnitude, NE sets somatic gain (surprise/attention), 5-HT sets apical patience.
+        self.diff_neuromod = False
+        # Stochastic spiking + metabolic cost (§15.17): real neurons fire probabilistically (noisy vesicle
+        # release) and are energy-constrained. `stochastic` adds membrane noise before threshold; `metabolic`
+        # adds a spike-rate penalty to the learning signal (a synapse driving excess spikes is pushed down).
+        self.stochastic = False
+        self.spike_noise = 0.1
+        self.metabolic = False
+        self.metabolic_lambda = 0.01
         self._mind = None                      # persistent per-layer state = stream of thought
         self._last = None
         # §10: the NEURON count is fixed at birth; the SYNAPSE count is what develops. Seed a
@@ -131,10 +189,10 @@ class SpikingBrain(nn.Module):
 
     # ---- LEARN: surrogate-gradient BPTT (= PC at β→0, §3.5) ---------- #
     def learn_text(self, text, epochs=1, bs=16, max_steps=12, store=True,
-                   replay_interleave=0, consolidate_rounds=0, seq=None, on_step=None, gate=1.0):
+                   replay_interleave=0, consolidate_rounds=0, seq=None, on_step=None, gate=1.0, tone=None):
         if getattr(self, "learn_rule", "bptt") == "eprop":     # faithful forward-in-time route
             return self.learn_eprop(text, epochs=epochs, bs=bs, max_steps=max_steps, seq=seq,
-                                    on_step=on_step, gate=gate)
+                                    on_step=on_step, gate=gate, tone=tone)
         data = text if isinstance(text, list) else self.to_bytes(text)
         seq = seq or self.seq                          # sleep can consolidate on a longer context
         if len(data) <= seq + 1:
@@ -193,8 +251,9 @@ class SpikingBrain(nn.Module):
                 b[:, :self._fb[l].shape[1]] = self._fb[l]; self._fb[l] = b
 
     @torch.no_grad()
-    def learn_eprop(self, text, epochs=1, bs=16, max_steps=12, seq=None, on_step=None, gate=1.0):
-        """Train the cortex by e-prop (see above). Returns (first_loss, last_loss) like learn_text."""
+    def learn_eprop(self, text, epochs=1, bs=16, max_steps=12, seq=None, on_step=None, gate=1.0, tone=None):
+        """Train the cortex by e-prop (see above). Returns (first_loss, last_loss) like learn_text.
+        `tone` = the §5 neuromodulator dict {da,ach,ne,ht}; used per-pathway when diff_neuromod is on."""
         data = text if isinstance(text, list) else self.to_bytes(text)
         seq = seq or self.seq
         if len(data) <= seq + 1:
@@ -208,7 +267,7 @@ class SpikingBrain(nn.Module):
                 i = torch.randint(0, n - seq - 1, (bs,), device=self.device)
                 x = torch.stack([t[k:k + seq] for k in i])
                 y = torch.stack([t[k + 1:k + seq + 1] for k in i])
-                loss = self._eprop_step(x, y, gate)
+                loss = self._eprop_step(x, y, gate, tone=tone)
                 last = loss
                 if first is None: first = last
                 if on_step is not None:
@@ -219,7 +278,7 @@ class SpikingBrain(nn.Module):
     _EP_CHUNK = 1 << 26                                        # cap on any transient (chunk, nnz) buffer
 
     @torch.no_grad()
-    def _eprop_step(self, x, y, gate=1.0):
+    def _eprop_step(self, x, y, gate=1.0, tone=None):
         """One e-prop gradient step over a (B,T) window — pure PyTorch, NO O(H²) anywhere. Eligibility
         traces are per-neuron (O(H)); the recurrent grad is accumulated PER SYNAPSE by gather/scatter
         (O(nnz) for a sparse cortex, so it scales to hundreds of thousands of neurons). Timestep-outer
@@ -250,7 +309,34 @@ class SpikingBrain(nn.Module):
             if sp(c) and c.sparse_in: g_in.append(torch.zeros_like(c.in_val)); g_in_b.append(torch.zeros_like(c.in_bias))
             else: g_in.append(torch.zeros_like(c.Win.weight)); g_in_b.append(torch.zeros_like(c.Win.bias))
         gHead = torch.zeros_like(self.head.weight); gHead_b = torch.zeros_like(self.head.bias)
-        lr = self.lr * getattr(self, "eprop_lr_scale", 15.0)
+        gE = torch.zeros_like(self.E.weight)                   # the sensory byte-embedding also learns (e-prop)
+        learned_fb = getattr(self, "feedback_mode", "learned") == "learned"
+        gFB = [torch.zeros_like(self._fb[l]) for l in range(len(cells) - 1)] if learned_fb else None
+        dendritic = getattr(self, "dendritic", False)          # apical burst-coded error delivery?
+        burst_thr = float(getattr(self, "burst_thr", 0.5))
+        burst_frac = 0.0
+        btsp = getattr(self, "btsp", False)                    # long (behavioral-timescale) eligibility?
+        ebeta = float(getattr(self, "btsp_beta", 0.98))
+        homeo = getattr(self, "homeostasis", False)            # intrinsic firing-rate homeostasis?
+        bounded = getattr(self, "bounded_synapses", False)     # Fusi bounded weights?
+        twocomp = getattr(self, "two_compartment", False)      # UNIFIED apical/interneuron/neuromod circuit?
+        g_ap = float(getattr(self, "g_ap", 0.15)); beta_ap = float(getattr(self, "beta_ap", 0.9))
+        som_b = float(getattr(self, "som_baseline", 0.5)); pv_g = float(getattr(self, "pv_gain", 0.3))
+        ap = [torch.zeros(B, c.hid, device=dev) for c in cells] if twocomp else None   # apical dendrite state
+        # differentiated neuromodulation: the 4 tones gate 4 distinct pathways (else one scalar `gate`=ACh).
+        diffnm = getattr(self, "diff_neuromod", False) and isinstance(tone, dict)
+        da = float(tone.get("da", 0.5)) if diffnm else 0.5     # DA → reward-modulated plasticity magnitude
+        ne_gain = (0.5 + float(tone.get("ne", 1.0))) if diffnm else 1.0   # NE → somatic gain (surprise/attention)
+        ht = float(tone.get("ht", 0.5)) if diffnm else 0.5     # 5-HT → patience (apical + eligibility timescale)
+        ht_pat = (0.85 + 0.3 * ht) if diffnm else 1.0          # stretches the eligibility window (works w/o twocomp)
+        if diffnm: beta_ap = min(0.99, beta_ap * (0.7 + 0.6 * ht))        # 5-HT → apical patience (twocomp)
+        stoch = getattr(self, "stochastic", False)             # probabilistic (noisy) spiking?
+        snoise = float(getattr(self, "spike_noise", 0.1))
+        metab = getattr(self, "metabolic", False)              # spike-rate energy penalty on the update?
+        mlam = float(getattr(self, "metabolic_lambda", 0.01))
+        if homeo:
+            self._ensure_homeo(); spk_sum = [torch.zeros(c.hid, device=dev) for c in cells]
+        lr = self.lr * getattr(self, "eprop_lr_scale", 2000.0)
         CH = self._EP_CHUNK
         def spmm(val, col, row, xin, out_dim):                 # y[b,row] += val · xin[b,col]  (O(nnz·B))
             cl = col.long(); ch = max(1, min(B, CH // max(1, cl.numel())))
@@ -282,15 +368,24 @@ class SpikingBrain(nn.Module):
                         if c.sparse_in else c.Win(layer_in)
                 else:
                     rec = c.Wrec(z_prev); pre = c.Win(layer_in)
-                v[l] = c.beta * v[l] * (1.0 - z_prev) + pre + rec
+                drive = pre + rec
+                if twocomp:                                    # PV fast divisive gain control + apical→soma feedback
+                    drive = drive / (1.0 + pv_g * z_prev.mean(1, keepdim=True)) + g_ap * ap[l]
+                if diffnm: drive = drive * ne_gain             # NE sets somatic gain (surprise/attention)
+                v[l] = c.beta * v[l] * (1.0 - z_prev) + drive
                 if al[l]:
                     a[l] = c.rho * a[l] + z_prev               # adaptation from the previous spike
                     thr = c.thr0 + c.beta_adapt * a[l]         # adaptive threshold
                 else:
                     thr = c.thr
-                psi_l = self._psi(v[l] - thr); z[l] = (v[l] >= thr).float()
-                eps_rec[l] = c.beta * eps_rec[l] + z_prev      # ε^v forward eligibility (per pre-neuron)
-                eps_in[l] = c.beta * eps_in[l] + layer_in
+                if homeo: thr = thr + self._thr_adapt[l]       # intrinsic homeostasis offset (metaplasticity)
+                vfire = v[l] + snoise * torch.randn_like(v[l]) if stoch else v[l]   # stochastic (noisy) firing
+                psi_l = self._psi(vfire - thr); z[l] = (vfire >= thr).float()
+                if homeo: spk_sum[l] = spk_sum[l] + z[l].sum(0)
+                eb = ebeta if btsp else c.beta                 # BTSP: eligibility outlives the membrane
+                if diffnm: eb = min(0.995, eb * ht_pat)        # 5-HT stretches the eligibility window (patience)
+                eps_rec[l] = eb * eps_rec[l] + z_prev          # ε^v forward eligibility (per pre-neuron)
+                eps_in[l] = eb * eps_in[l] + layer_in
                 if al[l]:                                      # ε^a = ψ_j·ε^v_i + (ρ − β_a·ψ_j)·ε^a (per synapse)
                     ba, rho = c.beta_adapt, c.rho
                     if sp(c):
@@ -311,9 +406,32 @@ class SpikingBrain(nn.Module):
             err = p - oh                                        # CE gradient wrt logits
             tot_loss += float(-(oh * (p + 1e-9).log()).sum(1).mean())
             gHead += err.t() @ top_v.float(); gHead_b += err.sum(0)   # head grad is LOCAL in time
+            if learned_fb:                                     # Kolen-Pollack: B learns the head's grad (top
+                for l in range(len(cells) - 1):                # layer) / an error·activity correlation (lower)
+                    gFB[l] += err.t() @ v[l].float()
             for l, c in enumerate(cells):
-                Lsig = err @ self._fb[l].float()               # random-feedback learning signal
+                Lsig = err @ self._fb[l].float()               # top-down learning signal (random or learned B)
+                if twocomp:                                    # UNIFIED apical circuit — error runs THROUGH the
+                    vip = float(gate)                          # apical dendrite, not alongside it:
+                    som = som_b * z[l].mean(1, keepdim=True)    #  SOM inhibition ∝ population activity, and
+                    agate = (vip - som).clamp(min=0.0)         #  VIP (neuromod "learn-now" tone) DISINHIBITS it
+                    ap[l] = beta_ap * ap[l] + agate * Lsig     #  → the apical compartment integrates the gated error
+                    thr_b = burst_thr * (ap[l].abs().mean(1, keepdim=True) + 1e-9)
+                    brst = (ap[l].abs() > thr_b).float() * z[l]  # apical BURST rides a somatic spike (plateau)
+                    Lsig = ap[l] * brst
+                    if l == len(cells) - 1: burst_frac = float(brst.mean())
+                elif dendritic:                                # standalone apical burst code (Naud/Richards),
+                    thr = burst_thr * (Lsig.abs().mean(1, keepdim=True) + 1e-9)   # not yet routed through a
+                    brst = (Lsig.abs() > thr).float() * z[l]   # two-compartment neuron — low-bandwidth, noisy
+                    Lsig = Lsig * brst
+                    if l == len(cells) - 1: burst_frac = float(brst.mean())
+                if metab: Lsig = Lsig + mlam * z[l]            # metabolic cost: a spike-rate loss (mlam·Σz)
+                #   has dLoss/dz=+mlam → ADDS to the per-neuron error, pushing incoming weights DOWN (less firing)
                 g = (Lsig * psi[l]).float()                    # g_j = L_j · ψ_j
+                if l == 0 and getattr(c, "Win", None) is not None:   # the byte-embedding learns too: project the
+                    gE.index_add_(0, x[:, tt].long(), g @ c.Win.weight)   # layer-0 signal back to the used rows.
+                    #   (this input-projection gradient is the ONE weight-transport path in the rule — a
+                    #   deliberate, disclosed exception; all cortical credit still flows through _fb, not W^T.)
                 ba = c.beta_adapt if al[l] else 0.0            # e_ji = ψ_j(ε^v_i − β_a·ε^a_ji); grad = Σ g_j·(ε^v_i − β_a·ε^a_ji)
                 if sp(c):
                     g_rec[l] += sddmm(g, eps_rec[l], c.rec_row, c.rec_col)     # membrane part, O(nnz)
@@ -340,7 +458,8 @@ class SpikingBrain(nn.Module):
         # fan-in-coherent (g_ji ∝ pre-activity), so dividing by its OWN afferent count makes the drive
         # change O(1) and the stable rate width-invariant (input scaling; each neuron knows only N_j).
         p = float(getattr(self, "_fanin_pow", 1.0))
-        denom = float(B * T); dmax = 0.02; scale = float(gate) * lr
+        denom = float(B * T); dmax = 0.02
+        scale = float(gate) * lr * ((0.5 + da) if diffnm else 1.0)   # ACh gates (gate); DA reward-modulates the magnitude
         def _upd(w, g, fin):
             w.add_((scale * (g / (denom * float(fin) ** p))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
         for l, c in enumerate(cells):
@@ -354,6 +473,27 @@ class SpikingBrain(nn.Module):
                 _upd(c.Wrec.weight, g_rec[l], c.Wrec.weight.shape[1])
                 _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
         _upd(self.head.weight, gHead, self.head.weight.shape[1]); _upd(self.head.bias, gHead_b, 1)
+        _upd(self.E.weight, gE, self.E.weight.shape[1])        # sensory byte-embedding update (no longer frozen)
+        if learned_fb:                                         # Kolen-Pollack: mirror the head/error grad into
+            fb_dec = float(getattr(self, "fb_decay", 1e-4))    # B, then weight-decay → B aligns with W, locally
+            for l in range(len(cells)):
+                _upd(self._fb[l], gHead if l == len(cells) - 1 else gFB[l], self._fb[l].shape[1])
+                self._fb[l].mul_(1.0 - fb_dec)
+        if bounded:                                            # Fusi bounded synapses: clamp to ±w_max
+            wm = float(getattr(self, "w_max", 1.0))
+            for c in cells:
+                if sp(c):
+                    c.rec_val.data.clamp_(-wm, wm)
+                    if c.sparse_in: c.in_val.data.clamp_(-wm, wm)
+                else:
+                    c.Wrec.weight.data.clamp_(-wm, wm); c.Win.weight.data.clamp_(-wm, wm)
+        if homeo:                                              # intrinsic homeostasis: threshold → target rate
+            for l in range(len(cells)):
+                self._thr_adapt[l] += self.homeo_lr * (spk_sum[l] / float(B * T) - float(self.target_rate))
+        if getattr(self, "dale", False):
+            self._project_dale()                               # re-impose E/I sign law after the update
+        self._burst_frac = burst_frac
+        if twocomp: self._apical_mag = float(ap[-1].abs().mean())   # apical-dendrite drive magnitude
         self._apply_prune_mask()
         return tot_loss / T
 
@@ -496,14 +636,113 @@ class SpikingBrain(nn.Module):
 
     @torch.no_grad()
     def weight_stats(self):
-        """Per-layer weight magnitude (mean |W|) and spread (std) — a blow-up/collapse read."""
+        """Per-layer weight magnitude (mean |W|) and spread (std) — a blow-up/collapse read — plus the
+        faithfulness metrics: feedback↔forward alignment (how far learned feedback has aligned with the
+        readout; ~0 for random DFA, →1 for Kolen-Pollack) and the excitatory fraction under Dale's law."""
         out = {}
         for i, c in enumerate(self.cells):
             w = (c.rec_val if self._is_sparse(c) else c.Win.weight).detach()   # sparse: value vector
             out[f"L{i}_w_absmean"] = float(w.abs().mean())
             out[f"L{i}_w_std"] = float(w.std())
         out["head_w_std"] = float(self.head.weight.detach().std())
+        if getattr(self, "_fb", None):                                         # feedback↔forward alignment
+            fb = self._fb[-1].detach().flatten().float(); hw = self.head.weight.detach().flatten().float()
+            out["fb_align_cos"] = float(torch.dot(fb, hw) / (fb.norm() * hw.norm() + 1e-9))
+        if getattr(self, "dale", False) and getattr(self, "_ei_sign", None):
+            out["ei_frac_excit"] = float((torch.cat(self._ei_sign) > 0).float().mean())
+        if getattr(self, "dendritic", False) or getattr(self, "two_compartment", False):
+            out["burst_frac"] = float(getattr(self, "_burst_frac", 0.0))       # apical error bandwidth
+        if getattr(self, "two_compartment", False):
+            out["apical_mag"] = float(getattr(self, "_apical_mag", 0.0))       # apical-dendrite drive
+        if getattr(self, "homeostasis", False) and getattr(self, "_thr_adapt", None):
+            out["homeo_thr_mean"] = float(torch.cat(self._thr_adapt).mean())   # homeostatic threshold drift
+        if getattr(self, "bounded_synapses", False):                          # fraction of synapses saturated
+            wm = float(getattr(self, "w_max", 1.0)); c0 = self.cells[0]
+            w0 = (c0.rec_val if self._is_sparse(c0) else c0.Wrec.weight).detach().abs()
+            out["synapse_sat_frac"] = float((w0 >= 0.999 * wm).float().mean())
         return out
+
+    def _ensure_ei(self):
+        """Assign each neuron an excitatory (+1) or inhibitory (−1) type for Dale's law — a neuron's
+        OUTGOING synapses all share one sign. Fixed at birth (like a real cell's E/I identity), ~80/20
+        E:I (the cortical ratio); grows with the layer so new neurons also get a type."""
+        g = torch.Generator(device="cpu").manual_seed(4242)
+        if not hasattr(self, "_ei_sign"):
+            self._ei_sign = []
+        while len(self._ei_sign) < len(self.cells):
+            h = self.cells[len(self._ei_sign)].hid
+            self._ei_sign.append(torch.where(torch.rand(h, generator=g) < 0.8, 1.0, -1.0).to(self.device))
+        for l, c in enumerate(self.cells):                                     # extend if a layer grew
+            if self._ei_sign[l].numel() < c.hid:
+                add = c.hid - self._ei_sign[l].numel()
+                s = torch.where(torch.rand(add, generator=g) < 0.8, 1.0, -1.0).to(self.device)
+                self._ei_sign[l] = torch.cat([self._ei_sign[l], s])
+
+    # The faithfulness stack (§15.16): each biological constraint is an INDEPENDENT toggle (extends the
+    # learn_rule switch), so its capability cost can be measured on the fidelity↔capability curve.
+    _FAITH_KEYS = ("learn_rule", "eprop_lr_scale", "feedback_mode", "fb_decay", "dale", "dendritic",
+                   "burst_thr", "bounded_synapses", "w_max", "homeostasis", "target_rate", "homeo_lr",
+                   "btsp", "btsp_beta", "two_compartment", "g_ap", "beta_ap", "som_baseline", "pv_gain",
+                   "diff_neuromod", "stochastic", "spike_noise", "metabolic", "metabolic_lambda")
+
+    @torch.no_grad()
+    def set_faith(self, **kw):
+        """Set any faithfulness toggle / hyperparameter LIVE (type, e.g. feedback_mode, and hyperparams).
+        Each constraint is independent. Applies enable-time projections so a freshly-toggled constraint
+        takes effect immediately. Returns the applied subset."""
+        applied = {}
+        for k, v in kw.items():
+            if k not in self._FAITH_KEYS:
+                continue
+            if k == "learn_rule":                          # invalid values must NOT silently disable e-prop
+                if v not in ("eprop", "bptt"): continue
+            elif k == "feedback_mode":
+                if v not in ("learned", "random"): continue
+            else:
+                cur = getattr(self, k, None)
+                if isinstance(cur, bool):    v = bool(v)
+                elif isinstance(cur, float): v = float(v)
+                if k == "eprop_lr_scale":                  # clamp numeric hyperparams to sane ranges
+                    v = max(0.1, v)
+                elif k == "w_max":
+                    v = max(1e-3, v)
+                elif k in ("target_rate", "homeo_lr", "pv_gain", "g_ap", "fb_decay", "burst_thr",
+                           "som_baseline", "spike_noise", "metabolic_lambda"):
+                    v = max(0.0, v)
+                elif k in ("btsp_beta", "beta_ap"):
+                    v = min(0.9999, max(0.0, v))
+            setattr(self, k, v); applied[k] = getattr(self, k)
+        if self.dale:        self._project_dale()          # make weights Dale-compliant immediately
+        if self.homeostasis: self._ensure_homeo()
+        return applied
+
+    def faith_config(self):
+        """The current state of every faithfulness toggle/hyperparameter — the fidelity axis settings."""
+        return {k: getattr(self, k, None) for k in self._FAITH_KEYS}
+
+    def _ensure_homeo(self):
+        """Per-neuron intrinsic-threshold offset for firing-rate homeostasis (metaplasticity). Grows
+        with each layer so new neurons also get a homeostatic setpoint."""
+        if not hasattr(self, "_thr_adapt"):
+            self._thr_adapt = []
+        while len(self._thr_adapt) < len(self.cells):
+            self._thr_adapt.append(torch.zeros(self.cells[len(self._thr_adapt)].hid, device=self.device))
+        for l, c in enumerate(self.cells):
+            if self._thr_adapt[l].numel() < c.hid:
+                pad = torch.zeros(c.hid - self._thr_adapt[l].numel(), device=self.device)
+                self._thr_adapt[l] = torch.cat([self._thr_adapt[l], pad])
+
+    @torch.no_grad()
+    def _project_dale(self):
+        """Re-impose Dale's law on the RECURRENT (neuron→neuron) connectome: every outgoing synapse
+        takes the sign of its PREsynaptic neuron's type. Magnitude preserved; only the sign is clamped."""
+        self._ensure_ei()
+        for l, c in enumerate(self.cells):
+            s = self._ei_sign[l]
+            if self._is_sparse(c):
+                c.rec_val.data.copy_(s[c.rec_col.long()] * c.rec_val.data.abs())   # rec_col = presynaptic
+            else:
+                c.Wrec.weight.data.copy_(s.unsqueeze(0) * c.Wrec.weight.data.abs())  # column = presynaptic
 
     # ---- §10 development: NEURONS FIXED at birth, SYNAPSES grow then prune ---- #
     # Biologically faithful: the neuron count is largely set at birth (neurogenesis is ~complete),
@@ -708,7 +947,11 @@ class SpikingBrain(nn.Module):
                         grow_syn_frac=getattr(self, "grow_syn_frac", 0.15),
                         prune_frac=getattr(self, "prune_frac", 0.05),
                         sparse_cfg=getattr(self, "sparse_cfg", None),
-                        pmask=getattr(self, "_pmask", None)), path)
+                        pmask=getattr(self, "_pmask", None),
+                        faith=self.faith_config(),                         # every fidelity-axis setting
+                        fb=(getattr(self, "_fb", None) if self.feedback_mode == "learned" else None),
+                        ei=getattr(self, "_ei_sign", None),                # Dale E/I typing (learned state)
+                        thr_adapt=getattr(self, "_thr_adapt", None)), path)  # homeostatic thresholds
 
     def load(self, path):
         d = torch.load(path, map_location=self.device)
@@ -753,6 +996,12 @@ class SpikingBrain(nn.Module):
         self.syn_density = d.get("syn_density", getattr(self, "syn_density", 1.0))
         self.grow_syn_frac = d.get("grow_syn_frac", getattr(self, "grow_syn_frac", 0.15))
         self.prune_frac = d.get("prune_frac", getattr(self, "prune_frac", 0.05))
+        for k, v in (d.get("faith") or {}).items():                      # restore every fidelity-axis setting
+            setattr(self, k, v)
+        if d.get("fb") is not None:   self._fb = [t.to(self.device) for t in d["fb"]]        # aligned feedback
+        if d.get("ei") is not None:   self._ei_sign = [t.to(self.device) for t in d["ei"]]   # Dale E/I typing
+        if d.get("thr_adapt") is not None: self._thr_adapt = [t.to(self.device) for t in d["thr_adapt"]]
+        if getattr(self, "dale", False): self._project_dale()
         return self
 
     @staticmethod

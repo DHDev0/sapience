@@ -1,5 +1,9 @@
 # run artifacts (checkpoints, logs, tensorboard, replay memory) — large & run-specific
 runs/
+# ...but KEEP the reproducibility artifacts referenced by the paper (§15.17)
+!runs/*.py
+!runs/fidelity_capability_curve.md
+!runs/cortical_algorithm_research.md
 # python caches
 __pycache__/
 *.py[cod]
@@ -12,3 +16,4 @@ __pycache__/
 # os / editor
 .DS_Store
 *.swp
+paper/THE_LIVING_BRAIN.html
