@@ -54,6 +54,22 @@ CHART_KEYS = [                                   # (state field, label, lower_is
     ("spatial_decode_acc", "§17 spatial decode ↑", False, ""), ("pi_drift", "§17 PI drift ↓", True, ""),
     ("pred_err_out", "§PC output pred-error ↓", True, ""), ("pred_err_L0", "§PC L0 pred-error ↓", True, ""),
     ("pred_err_L1", "§PC L1 pred-error ↓", True, ""), ("mean_precision", "§PC precision", False, ""),
+    # §17 biophysical-tier observables (nested under netparams[<module>]; flattened into history below). Read
+    # 0 while the mechanism is OFF, then populate live once toggled — so you can watch each one earn its keep.
+    ("stdp_net", "§STDP net LTP−LTD", False, ""), ("stdp_mag", "§STDP |Δw| timing", False, ""),
+    ("ltp_ltd_balance", "§STDP LTP/LTD balance", False, ""),
+    ("mean_efficacy", "§STP synaptic efficacy", False, ""), ("mean_u", "§STP release prob u", False, ""),
+    ("mean_x", "§STP resources x", False, ""), ("plateau_rate", "§plateau NMDA-spike frac", False, ""),
+    ("rate_pv", "§IN PV rate (E/I brake)", False, ""), ("rate_som", "§IN SOM rate (apical)", False, ""),
+    ("rate_vip", "§IN VIP rate (disinhib)", False, ""), ("astro_activation", "§glia astro activation", False, ""),
+    ("astro_overactive_frac", "§glia astro overactive ↓", True, ""), ("glia_global_gain", "§glia global gain", False, ""),
+    ("oxytocin", "§peptide oxytocin", False, ""), ("orexin", "§peptide orexin (arousal)", False, ""),
+    ("crh", "§peptide CRH (stress)", False, ""), ("plasticity_bias", "§peptide plasticity bias", False, ""),
+    ("ne_bias", "§peptide NE bias", False, ""), ("cortisol_relief", "§peptide cortisol relief", False, ""),
+    ("rate_L4", "§laminar L4 rate", False, ""), ("input_to_l23", "§laminar L2/3 drive", False, ""),
+    ("place_active_frac", "§grid place-cell active frac", False, ""), ("place_novelty", "§grid place novelty", False, ""),
+    ("nav_return", "§grid nav return ↑", False, ""), ("replay_fwd", "§theta forward replays", False, ""),
+    ("replay_rev", "§theta reverse replays", False, ""), ("ripple_gate", "§theta ripple gate", False, ""),
     # cortex learning-health leading indicators (nested under net.weights; flattened into history below). These
     # diagnose WHY the net does/doesn't learn: head_w_std collapsing to init + head_update_mag≈0 = starved readout;
     # fb_align_cos≈0 = feedback not aligning; mem_mag climbing = representation runaway; update_mag = recurrent Δw.
@@ -358,8 +374,13 @@ class Controller:
                 self.status = "awake" if st.get("awake") else "sleeping"
                 x = st.get("lived_seconds", int(time.time()))
                 wt = (st.get("net") or {}).get("weights") or {}      # cortex leading-indicator diagnostics live here
+                npf = {}                                             # flatten §17 per-mechanism state() metrics (nested under netparams)
+                for _mod, _mv in (st.get("netparams") or {}).items():
+                    if isinstance(_mv, dict):
+                        for _mk, _mvv in _mv.items():
+                            npf.setdefault(_mk, _mvv)               # metric names are unique across modules; first-wins is a no-op guard
                 for k, *_ in CHART_KEYS:
-                    val = st[k] if k in st else wt.get(k)            # top-level field, else a nested weight diagnostic
+                    val = st[k] if k in st else wt[k] if k in wt else npf.get(k)   # top-level field, else weight diag, else §17 mechanism metric
                     if isinstance(val, (int, float)):
                         self.history[k].append([x, round(float(val), 4)])
 
