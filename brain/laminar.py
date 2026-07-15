@@ -194,22 +194,31 @@ class LaminarMicrocircuit:
     # ---- metric ----------------------------------------------------- #
     @torch.no_grad()
     def measure(self, brain, text):
-        """Run the cortex on `text` and bucket the TOP-layer spikes by lamina → per-lamina firing
-        rates (the functional-differentiation indicator). O(hid), off the hot loop."""
+        """Run the cortex on `text` and bucket spikes by lamina ACROSS ALL LAYERS → per-lamina firing
+        rates (the functional-differentiation indicator). O(hid), off the hot loop. Aggregating over every
+        layer (not just the top one, which is the sparsest-firing — near-silent at depth, so sampling it
+        alone pinned rate_L23/rate_L56 at 0.0) captures the active shallow laminae."""
         ids = brain.to_bytes(text)[:512]
         if len(ids) < 2:
             return self.state()
         inp = brain.E(torch.tensor([ids], device=brain.device))
         states = [c.init_state(1, brain.device) for c in brain.cells]
-        spikes = None
+        acc = {L4: [0.0, 0], L23: [0.0, 0], L56: [0.0, 0]}     # per-lamina [spike_sum, cell·time count]
+        any_lam = False
         for i, c in enumerate(brain.cells):
             spikes, _, states[i] = c.run_seq(inp, states[i]); inp = spikes
-        c = brain.cells[-1]
-        lam = getattr(c, "lamina", None)
-        if lam is None:
+            lam = getattr(c, "lamina", None)
+            if lam is None:
+                continue
+            any_lam = True
+            s = spikes[0]; T = s.shape[0]                      # (T, hid)
+            for lab in (L4, L23, L56):
+                m = (lam == lab)
+                if bool(m.any()):
+                    acc[lab][0] += float(s[:, m].sum()); acc[lab][1] += int(m.sum()) * T
+        if not any_lam:
             return self.state()
-        s = spikes[0]                                          # (T, hid)
         for lab, attr in ((L4, "_rate_L4"), (L23, "_rate_L23"), (L56, "_rate_L56")):
-            m = (lam == lab)
-            setattr(self, attr, float(s[:, m].mean()) if bool(m.any()) else 0.0)
+            tot, n = acc[lab]
+            setattr(self, attr, (tot / n) if n > 0 else 0.0)
         return self.state()

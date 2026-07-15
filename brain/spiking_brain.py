@@ -629,15 +629,19 @@ class SpikingBrain(nn.Module):
             w.add_((scale * (g / (denom * d))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
         hpow = float(getattr(self, "head_fanin_pow", 0.5))     # gentler fan-in norm for the wide readout head
         if do_stdp:                                            # §15.18 blend the timing term into the grad BEFORE _upd:
-            _lastsp = None                                     #   −Δw because _upd subtracts (so +Δw potentiates);
+            _lastsp = None; _mag_sum = 0.0; _mag_n = 0          #   −Δw because _upd subtracts (so +Δw potentiates);
             for l, c in enumerate(cells):                      #   masked so silent/pruned synapses stay silent
                 if not sp(c): continue
                 g_rec[l] = g_rec[l] - sd.mix * stdp_rec[l] * c.rec_mask
                 if c.sparse_in:
                     g_in[l] = g_in[l] - sd.mix * stdp_in[l] * c.in_mask
+                _t = (sd.mix * stdp_rec[l]).abs()              # blended timing magnitude on THIS layer's edges
+                _mag_sum += float(_t.sum()); _mag_n += int((_t > 0).sum())   # active (paired) edges only
                 _lastsp = l
             sd._ltp = ltp_acc; sd._ltd = ltd_acc
-            sd._mag = float((sd.mix * stdp_rec[_lastsp]).abs().mean()) if _lastsp is not None else 0.0
+            # mean over ACTIVE edges across ALL sparse layers (the old code sampled only the top layer, which is
+            # the sparsest-firing one — near-silent at depth — so stdp_mag read a flat 0.0 while STDP was healthy).
+            sd._mag = (_mag_sum / _mag_n) if _mag_n > 0 else 0.0
         if astro_pg is not None:                               # §17 glia: slow per-POSTsynaptic-neuron metaplastic gain on
             for l, c in enumerate(cells):                      #   the APPLIED update (a 4th factor on Δw, NOT the eligibility)
                 pg = astro_pg[l].to(g_rec[l].dtype)

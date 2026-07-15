@@ -60,6 +60,24 @@ def test_rates_dynamic_range():
     assert 0.0 < st["rate_pv"] < 1.0 and 0.0 < st["rate_vip"] < 1.0, st   # genuine partial firing w/ heterogeneity
 
 
+# ---- (3b) SPARSE-REGIME firing: all THREE pools graded at the real cortex operating rate ----------------
+def test_sparse_regime_all_pools_fire():
+    # regression guard for the flat-graph bug: at the ACTUAL sparse spike_rate (~0.05) the default calibration
+    # must drive PV *and SOM* (not just VIP) into a graded band — the old k_pv=1 / no-k_som defaults pinned PV
+    # weak and SOM dead-at-0, so rate_pv/rate_som were flat lines that couldn't be observed or debugged.
+    it = SpikingInterneurons(); it.set_params(on=True)   # DEFAULT knobs — this asserts the shipped calibration
+    B = 8; it.begin(B, _ref())
+    pop = torch.full((B, 1), 0.05)                        # spike_rate ~0.05 population activity
+    for _ in range(12):
+        it.pv(0, pop, pv_g=0.3); it.apical(0, pop, gate=1.0, som_b=0.5)
+    st = it.state()
+    assert 0.0 < st["rate_pv"] < 1.0, ("PV silent/saturated at sparse drive", st["rate_pv"])
+    assert 0.0 < st["rate_som"] < 1.0, ("SOM silent at sparse drive — the flat-graph bug", st["rate_som"])
+    assert 0.0 < st["rate_vip"] < 1.0, ("VIP silent/saturated", st["rate_vip"])
+    for k in ("k_pv", "k_som", "k_vip", "w_vip_som", "thr_pv"):    # calibration knobs are OBSERVABLE in state()
+        assert k in st, ("calibration knob not surfaced for live debugging", k)
+
+
 # ---- (4) device/dtype propagation from ref --------------------------------------------------------------
 def test_dtype_propagation():
     # loop internally (not @parametrize) so BOTH pytest and the canonical run_tests.py runner exercise it

@@ -42,7 +42,7 @@ _SEED_OFF = {"pv": 0, "som": 1, "vip": 2}
 
 class SpikingInterneurons:
     _KEYS = ("on", "n_pv", "n_som", "n_vip", "beta_i", "thr_pv", "thr_som", "thr_vip",
-             "k_pv", "k_vip", "w_vip_som", "het")
+             "k_pv", "k_som", "k_vip", "w_vip_som", "het")
 
     def __init__(self, device=None, dtype=None, seed=4242):
         self.device = device
@@ -55,11 +55,16 @@ class SpikingInterneurons:
         # has a real-but-short interneuron time constant, not a stale one.
         self.beta_i = 0.8
         self.thr_pv = 0.5; self.thr_som = 0.5; self.thr_vip = 0.5
-        # feedforward drive gains onto PV / VIP. With leak beta_i=0.8 the steady-state membrane is I/(1-beta_i)=5·I,
-        # so a raw gate≈1.0 would saturate VIP (r=1); k_vip=0.1 puts the drive in the threshold band → GRADED firing
-        # (calibrated so the pool sits in a live dynamic range, not pinned at r=1 — the reviewer's saturation flag).
-        self.k_pv = 1.0; self.k_vip = 0.1
-        self.w_vip_som = 0.1                    # VIP⊣SOM disinhibitory synapse (scaled to the graded VIP rate)
+        # feedforward drive gains onto PV / SOM / VIP. With leak beta_i=0.8 the steady-state membrane is
+        # I/(1-beta_i)=5·I. The cortex operates SPARSE (spike_rate≈0.04-0.08), so the pop_act driving PV/SOM is
+        # ~0.05, NOT the ~0.5 the pools were first tuned for — at k_pv=1 that put v_ss≈0.25<thr and SOM's drive
+        # som_b·pop≈0.02 far below thr, pinning PV weak and SOM at 0 (dead metric). CALIBRATED to the real regime:
+        # k_pv=2 → v_ss≈0.5 at pop 0.05 (graded), and SOM gets its OWN gain k_som (the bare som_b·pop the mean-field
+        # used is negligible when sparse) so I_som=k_som·som_b·pop lands in the threshold band → SOM actually fires.
+        # k_vip=0.1 keeps VIP graded (driven by the ACh gate≈1, not pop_act). Verified: all three land in 0.12-0.5
+        # across pop 0.037-0.08 (scratchpad/intern_probe.py), the live dynamic range the saturation flag wants.
+        self.k_pv = 2.0; self.k_som = 4.0; self.k_vip = 0.1
+        self.w_vip_som = 0.05                   # VIP⊣SOM disinhibitory synapse (scaled to the graded VIP rate)
         self.het = 0.2                          # per-neuron heterogeneity magnitude (widened → graded, desync pool)
         # transient per-step state (rebuilt in begin())
         self._m = {}                            # (kind,l) -> (v,z) membrane+spike, shape (B,K)
@@ -123,7 +128,7 @@ class SpikingInterneurons:
             gate = torch.as_tensor(float(gate), device=self.device, dtype=self.dtype).reshape(1, 1)
         I_vip = self.k_vip * gate                              # (B,1) or (1,1) → broadcasts
         r_vip = self._lif("vip", l, I_vip, self.thr_vip, self.n_vip)     # (B,1)
-        I_som = float(som_b) * z_pop - self.w_vip_som * r_vip  # SOM driven by pop activity, disinhibited by VIP
+        I_som = self.k_som * float(som_b) * z_pop - self.w_vip_som * r_vip  # k_som scales the sparse-weak som_b·pop
         r_som = self._lif("som", l, I_som, self.thr_som, self.n_som)     # (B,1)
         self._r_vip = float(r_vip.mean()); self._r_som = float(r_som.mean())
         return (r_vip - r_som).clamp(min=0.0)                  # (B,1)
@@ -148,5 +153,9 @@ class SpikingInterneurons:
         return applied
 
     def state(self):
+        # rates are the LIVE observables (chartable); the k_/thr_/w_ knobs are surfaced too so the calibration
+        # that makes the pools fire is inspectable/debuggable live (not a hidden constant behind a flat graph).
         return dict(on=self.on, rate_pv=round(self._r_pv, 4), rate_som=round(self._r_som, 4),
-                    rate_vip=round(self._r_vip, 4), n_pv=self.n_pv, n_som=self.n_som, n_vip=self.n_vip)
+                    rate_vip=round(self._r_vip, 4), n_pv=self.n_pv, n_som=self.n_som, n_vip=self.n_vip,
+                    k_pv=self.k_pv, k_som=self.k_som, k_vip=self.k_vip, w_vip_som=self.w_vip_som,
+                    thr_pv=self.thr_pv, thr_som=self.thr_som, thr_vip=self.thr_vip, beta_i=self.beta_i)

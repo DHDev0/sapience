@@ -711,3 +711,100 @@ overstatement in principle: e-prop, predictive coding and target-prop are *rival
 learning (you cannot have all three be true at once — they are offered as selectable `learn_rule`s), and the
 biophysical tier is unbounded. What is true is: **most of the major systems-level hypotheses are now present,
 wired, interconnected, honestly measured-or-labelled, and independently switchable.**
+
+# §18 · The boundary — what is deliberately *not* simulated, and why
+
+§17 closed the list of missing *learning* mechanisms. This section draws the complementary line: the
+mechanisms the model deliberately does **not** implement, the principled reason, and why crossing that line
+would make the system worse **at its own goal**. It belongs in the honest ledger because a model must state
+its exclusions as plainly as its inclusions — one that never says what it leaves out invites the reader to
+assume it does everything, and "everything" is precisely the overstatement §17's caveat began to correct.
+
+## 18.1 Two different fidelities
+
+"Brain model" names two research programmes that are routinely conflated, and this system belongs to exactly
+one of them.
+
+- **Fidelity-of-substrate** — reproduce the *physical* brain as accurately as the instruments allow, and read
+  cognition out of that physics. This is the biophysical-simulation tradition. **Blue Brain** (EPFL) reconstructs
+  a rat neocortical microcircuit of ~31,000 neurons in which each cell is a morphologically detailed
+  multi-compartment cable with **Hodgkin–Huxley ion channels**, wired by ~37 M synapses with measured receptor
+  kinetics; the **Allen Institute** fits biophysically detailed single-neuron and network models to a cell-type
+  atlas and electrophysiology; **connectome-constrained** simulations run on *measured wiring* — the full adult
+  *Drosophila* connectome (~140k neurons, FlyWire/FlyEM) and *C. elegans* (302 neurons). The tools are **NEURON**
+  and **Arbor** (multi-compartment), **NEST** (point neurons at supercomputer scale), **Brian2**, and neuromorphic
+  silicon (**SpiNNaker**, **BrainScaleS**). On raw biophysical accuracy these are — and will remain — orders of
+  magnitude ahead of anything here. That is their entire purpose.
+- **Fidelity-of-learning** — reproduce *how the brain learns and behaves*, at whatever level of substrate
+  abstraction makes that tractable, and judge the model by whether it **learns and acts** the way a brain does.
+  This is the programme of this paper (§15–§17).
+
+The decisive fact separating them: **the fidelity-of-substrate models do not learn or behave.** Blue Brain does
+not acquire language or navigate; the fly connectome is a wiring diagram, not an agent; even **Spaun**
+(Eliasmith), the largest *functional* spiking model at 2.5 M neurons, is largely hand-compiled with limited
+plasticity. High-precision simulations *replay* biophysics; they do not *live*. So the two programmes are not
+rivals on one scale — they optimise different objectives. "The most precise brain simulation" is a title in the
+*other* programme, held by Blue Brain and its kin; it is not a target of this one, and not a yardstick this one
+is short of.
+
+## 18.2 The inclusion rule
+
+Every mechanism §15–§17 added passes one test, and every biophysical-tier mechanism fails it:
+
+> **Include a mechanism iff it changes what the network can *learn or do* — not merely how physically accurate
+> its substrate is.**
+
+e-prop, STDP, predictive coding, the dendritic-error microcircuit, embodiment — each alters the *computation or
+the credit assignment*, i.e. the learnable function or the behaviour. Ion channels, dendritic morphology, and
+receptor kinetics alter the *accuracy of the substrate* while leaving the learnable function unchanged: the LIF
+abstraction already captures the computable integrate→threshold→reset dynamics (§15.2); the two-compartment
+split already captures the one dendritic distinction that is computationally load-bearing — the apical top-down
+error path (§15.17); the NMDA-plateau abstraction (§17) already captures the one regenerative nonlinearity that
+matters for delayed credit. Their full biophysical form buys precision on an axis the goal does not score.
+
+| biophysical mechanism | changes *learning / behaviour*? | verdict |
+|---|---|---|
+| **Hodgkin–Huxley ion channels** | no — LIF already captures the computable dynamics; HH only adds stiff Na/K/Ca ODEs at a sub-ms timestep | **exclude** (and it would *break e-prop*, which is derived for LIF/ALIF, not an HH cable) |
+| **Full multi-compartment morphology** | no — the load-bearing soma/apical distinction is already two-compartment; the NMDA plateau is already added | **exclude** |
+| **Receptor kinetics (AMPA/NMDA/GABA time constants)** | no — STP + plateau + surrogate dynamics already approximate the fast/slow/inhibitory functional split | **exclude** |
+| **Extracellular field / ephaptic coupling** | no — a negligible, speculative effect on credit assignment | **exclude** |
+| **Detailed neurovascular / metabolic coupling** | no — the *functional* abstraction (metabolic spike penalty + glial slow brake, §17) is already present | **exclude** |
+| **A measured connectome (as an initialisation prior)** | *maybe* — connectivity structure (motifs, E/I ratio, laminar/modular graph) can shape the learnable function | **the one exception — worth a single A/B** |
+
+## 18.3 Why crossing the line would make it worse
+
+The exclusion is not merely "unnecessary"; integrating the biophysical tier would actively **regress** the system
+on its own metric:
+
+- **Scale collapse.** Biophysical detail costs ~10–100× per neuron and forces sub-millisecond integration; the
+  trainable-in-real-time regime would fall from the 10⁵–10⁶-neuron sparse-CSR range (§15.11) to ~10³–10⁴ — the
+  scale at which biophysical simulators already operate, and *below* the scale at which learning here is
+  interesting.
+- **A different simulator.** Multi-compartment HH belongs to NEURON/Arbor, not the vectorised PyTorch e-prop loop;
+  the entire substrate — the forward dynamics of §15.2, the O(nnz) sparse ops of §15.11, the local `_upd` of
+  §15.17 — would have to be discarded to host it.
+- **The learning rule breaks.** e-prop's eligibility trace and pseudo-derivative are *defined on the LIF/ALIF
+  membrane*; there is no drop-in e-prop for a full Hodgkin–Huxley cable. The plausible, online, forward-in-time
+  learning that is the entire point (§15.17) does not survive the substrate swap.
+
+The trade, stated plainly, is: surrender a functional, scalable, *learning* agent to obtain a slower, smaller,
+*non-learning* replica of a substrate whose detail the goal does not use — a strictly worse instrument for the
+question being asked.
+
+## 18.4 The honest positioning, and the one experiment worth importing
+
+Stated precisely: this is **not** the most precise brain *simulation* — that title is Blue Brain's and the
+connectome sims', in a programme this model does not enter. It is, as far as we are aware, the most complete
+*integration of systems-level learning-and-cognition mechanisms into one continuously-learning, behaving agent* —
+a claim in the fidelity-of-learning programme, where the biophysical simulators do not compete because they do
+not learn. The mechanisms it "lacks" are not gaps in its own programme (§17 closed those); they are the
+constitutive detail of the *other* one.
+
+The single biophysical idea that lives on *this* model's axis — because it plausibly changes the *learnable
+function* rather than only the substrate — is **connectome-as-initialisation**: seed the sparse recurrent
+connectome from realistic connectivity *statistics* (or a real graph) instead of random fan-in, and run one
+earns-keep A/B under §17's contract against the learned-sparse baseline — does structured initial wiring learn
+faster, or reach a lower bits/byte? That is the one experiment worth importing from the biophysical world.
+Everything else on that tier is admired in Blue Brain and left there: not because more realism is unwelcome, but
+because on the axis this model is graded it would not move the score, and it would cost the very properties —
+scale, plausible online learning, a living loop — that define the work.

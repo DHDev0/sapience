@@ -47,7 +47,7 @@ import torch
 
 
 class SpikingGlia:
-    _KEYS = ("on", "tau_a", "k_p", "k_g", "k_m", "rho_clear", "target_rate")
+    _KEYS = ("on", "tau_a", "k_p", "k_g", "k_m", "rho_clear", "target_rate", "auto_target")
 
     def __init__(self, device=None, dtype=None):
         self.device = device
@@ -63,7 +63,16 @@ class SpikingGlia:
         self.k_g = 0.5                          # region-wide gliotransmission brake strength
         self.k_m = 1.0                          # metabolic-scarcity multiplier strength
         self.rho_clear = 0.05                   # glymphatic clearance fraction per _sleep_tick
-        self.target_rate = 0.08                 # homeostatic target firing rate (matches cortex default)
+        # The astrocyte "over-activity" reference. A HARD-CODED 0.08 left global_gain/astro_pgain pinned at 1.0
+        # forever whenever the net fires below it (measured mean ≈0.02-0.04 ⇒ mean_a≈0.27<1 ⇒ relu(·)=0 always) —
+        # a dead metric. auto_target SELF-CALIBRATES the reference to a slow EMA of the population's OWN mean rate
+        # (rate_ema_beta slower than tau_a), so the field hovers near 1.0 in whatever regime the cortex occupies
+        # and relu(a−1) catches genuine excursions ABOVE that baseline. Scale/regime-invariant. Fixed target still
+        # available via auto_target=False (uses target_rate).
+        self.target_rate = 0.04                 # fixed-mode homeostatic reference (used only when auto_target=False)
+        self.auto_target = True                 # self-calibrate the reference to the observed rate EMA
+        self.rate_ema_beta = 0.002              # baseline EMA rate (τ≈500 ticks, slower than tau_a so a can excurse)
+        self._rate_ema = None                   # running population mean-rate baseline (built on first sense)
 
     # ---- field maintenance ------------------------------------------- #
     def ensure_width(self, hids):
@@ -89,7 +98,17 @@ class SpikingGlia:
             return
         hids = [int(r.numel()) for r in rate_vec]
         self.ensure_width(hids)
-        tr = max(float(self.target_rate), 1e-6)
+        # self-calibrating reference: slow EMA of the observed population mean firing rate
+        tot = sum(float(r.detach().sum()) for r in rate_vec); cnt = sum(int(r.numel()) for r in rate_vec)
+        mrate = tot / max(cnt, 1)
+        self._rate_ema = mrate if self._rate_ema is None \
+            else (1.0 - self.rate_ema_beta) * self._rate_ema + self.rate_ema_beta * mrate
+        ref = self._rate_ema if self.auto_target else float(self.target_rate)
+        # bound the self-calibrating reference to a band anchored on target_rate: it tracks the normal regime
+        # (fixing the flat-at-1.0 gain) but CANNOT normalise away a genuine runaway (>4× target always registers
+        # as over-activity, however sustained) — keeps both regime-robustness AND absolute over-firing detection.
+        tr = min(max(ref, 0.25 * float(self.target_rate)), 4.0 * float(self.target_rate))
+        tr = max(tr, 1e-6)
         inv = 1.0 / max(float(self.tau_a), 1.0)
         for l, r in enumerate(rate_vec):
             ratio = (r.detach().to(self.a[l].device, self.a[l].dtype)) / tr   # dimensionless activity ratio
@@ -176,4 +195,7 @@ class SpikingGlia:
                     astro_overactive_frac=round(self._overactive_frac(), 4),
                     astro_pgain=round(1.0 / (1.0 + float(self.k_p) * max(0.0, self._mean_a() - 1.0)), 4),
                     astro_metab_mult=round(self.metab_mult(), 4),
-                    glia_global_gain=round(self.global_gain(), 4))
+                    glia_global_gain=round(self.global_gain(), 4),
+                    auto_target=self.auto_target,                    # calibration mode (observable)
+                    glia_ref_rate=round(float(self._rate_ema), 5) if self._rate_ema is not None else None,
+                    k_g=self.k_g, k_p=self.k_p, target_rate=self.target_rate)
