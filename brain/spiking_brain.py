@@ -358,6 +358,14 @@ class SpikingBrain(nn.Module):
         ht = float(tone.get("ht", 0.5)) if diffnm else 0.5     # 5-HT → patience (apical + eligibility timescale)
         ht_pat = (0.85 + 0.3 * ht) if diffnm else 1.0          # stretches the eligibility window (works w/o twocomp)
         if diffnm: beta_ap = min(0.99, beta_ap * (0.7 + 0.6 * ht))        # 5-HT → apical patience (twocomp)
+        pl = getattr(self, "_plateau", None)                   # §17 NMDA apical plateau controller (live handle)
+        plateau = twocomp and pl is not None and pl.on         # gated: needs the two-compartment apical circuit
+        if plateau:
+            p_thr, p_gain, rho_p, pcpl = float(pl.p_thr), float(pl.p_gain), float(pl.rho_p), float(pl.btsp_couple)
+            pdur = max(1.0, float(pl.dur) * (0.7 + 0.6 * ht)) if diffnm else float(pl.dur)   # 5-HT patience → longer plateau
+            plat = [torch.zeros(B, c.hid, device=dev, dtype=v[0].dtype) for c in cells]      # per-neuron plateau (rides on ap[l])
+            pclk = [torch.zeros_like(p) for p in plat]          # all-or-none refractory window countdown
+            plat_rate = 0.0; apd_top_mag = 0.0
         stoch = getattr(self, "stochastic", False)             # probabilistic (noisy) spiking?
         snoise = float(getattr(self, "spike_noise", 0.1))
         metab = getattr(self, "metabolic", False)              # spike-rate energy penalty on the update?
@@ -414,7 +422,8 @@ class SpikingBrain(nn.Module):
                     rec = c.Wrec(z_eff); pre = c.Win(layer_in)
                 drive = pre + rec
                 if twocomp:                                    # PV fast divisive gain control + apical→soma feedback
-                    drive = drive / (1.0 + pv_g * z_prev.mean(1, keepdim=True)) + g_ap * ap[l]
+                    apd_fwd = (ap[l] + plat[l]) if plateau else ap[l]   # §17 sustained plateau feeds forward across ticks
+                    drive = drive / (1.0 + pv_g * z_prev.mean(1, keepdim=True)) + g_ap * apd_fwd
                 if diffnm: drive = drive * ne_gain             # NE sets somatic gain (surprise/attention)
                 v[l] = c.beta * v[l] * (1.0 - z_prev) + drive
                 if al[l]:
@@ -431,6 +440,8 @@ class SpikingBrain(nn.Module):
                 dyn_eb = getattr(self, "_dyn_elig_beta", None)  # §16 P2: attention→FREQUENCY sets the window
                 if dyn_eb is not None: eb = float(dyn_eb)       #   (gamma-short when focused, alpha-long when not)
                 if diffnm: eb = min(0.995, eb * ht_pat)        # 5-HT stretches the eligibility window (patience)
+                if plateau:                                    # §17 BTSP: a live plateau population stretches eligibility → btsp_beta
+                    eb = min(0.9999, eb + pcpl * plat_rate * (float(getattr(self, "btsp_beta", 0.98)) - eb))
                 eps_rec[l] = eb * eps_rec[l] + z_eff           # §17: eligibility carries the TRANSMITTED spike z⊙g (resource-aware)
                 eps_in[l] = eb * eps_in[l] + layer_in
                 if do_stdp and sp(c):                          # STDP rides the sparse cortex (edge-wise, O(nnz·B))
@@ -472,9 +483,20 @@ class SpikingBrain(nn.Module):
                     som = som_b * z[l].mean(1, keepdim=True)    #  SOM inhibition ∝ population activity, and
                     agate = (vip - som).clamp(min=0.0)         #  VIP (neuromod "learn-now" tone) DISINHIBITS it
                     ap[l] = beta_ap * ap[l] + agate * Lsig     #  → the apical compartment integrates the gated error
-                    thr_b = burst_thr * (ap[l].abs().mean(1, keepdim=True) + 1e-9)
-                    brst = (ap[l].abs() > thr_b).float() * z[l]  # apical BURST rides a somatic spike (plateau)
-                    Lsig = ap[l] * brst
+                    if plateau:                                #  §17 NMDA plateau: all-or-none, regenerative, latched
+                        thr_p = p_thr * (ap[l].abs().mean(1, keepdim=True) + 1e-9)          # RELATIVE (width-invariant)
+                        trig = (ap[l].abs() > thr_p).float() * z[l] * (pclk[l] <= 0).float()  # BAC coincidence + refractory
+                        pclk[l] = torch.where(trig > 0, torch.full_like(pclk[l], pdur), pclk[l])  # ignite window
+                        plat[l] = plat[l] + trig * p_gain * ap[l]                            # supralinear regenerative seed
+                        act = (pclk[l] > 0).float(); plat[l] = rho_p * plat[l] * act         # sustain (slow tau_p) then clear
+                        pclk[l] = (pclk[l] - 1.0).clamp(min=0.0)
+                        apd = ap[l] + plat[l]
+                        if l == len(cells) - 1: plat_rate = float(act.mean()); apd_top_mag = float(apd.abs().mean())
+                    else:
+                        apd = ap[l]
+                    thr_b = burst_thr * (apd.abs().mean(1, keepdim=True) + 1e-9)
+                    brst = (apd.abs() > thr_b).float() * z[l]  # apical BURST rides a somatic spike (plateau-sustained)
+                    Lsig = apd * brst
                     if l == len(cells) - 1: burst_frac = float(brst.mean())
                 elif dendritic:                                # standalone apical burst code (Naud/Richards),
                     thr = burst_thr * (Lsig.abs().mean(1, keepdim=True) + 1e-9)   # not yet routed through a
@@ -596,6 +618,9 @@ class SpikingBrain(nn.Module):
         if astro_on:                                           # §17 per-neuron rate r_l=(Σ_{b,t}z)/(B·T) for glia.sense()
             self._spk_rate_vec = [astro_zsum[l] / float(B * T) for l in range(len(cells))]
         if twocomp: self._apical_mag = float(ap[-1].abs().mean())   # apical-dendrite drive magnitude
+        if plateau:                                                 # §17 write back plateau metrics (apical_mag on apd)
+            self._plateau_rate = plat_rate; pl._last_rate = plat_rate
+            self._apical_mag = apd_top_mag
         # DIAGNOSTIC METRICS — the leading indicators the root-cause read needed (bpb alone lagged):
         #  mem_mag = top-layer membrane |v| = the REPRESENTATION magnitude; a runaway here (the actual
         #  collapse mechanism) climbs BEFORE bpb blows up. update_mag = per-step head Δw; grad_mag = raw
@@ -803,6 +828,8 @@ class SpikingBrain(nn.Module):
             out["burst_frac"] = float(getattr(self, "_burst_frac", 0.0))       # apical error bandwidth
         if getattr(self, "two_compartment", False):
             out["apical_mag"] = float(getattr(self, "_apical_mag", 0.0))       # apical-dendrite drive
+            if getattr(self, "_plateau", None) is not None and self._plateau.on:
+                out["plateau_rate"] = float(getattr(self, "_plateau_rate", 0.0))   # §17 NMDA plateau active fraction
         if getattr(self, "homeostasis", False) and getattr(self, "_thr_adapt", None):
             out["homeo_thr_mean"] = float(torch.cat(self._thr_adapt).mean())   # homeostatic threshold drift
         if getattr(self, "bounded_synapses", False):                          # fraction of synapses saturated

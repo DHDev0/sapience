@@ -31,6 +31,7 @@ from .endocrine import SpikingEndocrine
 from .dynamics import SpikingDynamics
 from .neuropeptides import SpikingNeuropeptides
 from .glia import SpikingGlia
+from .plateau import DendriticPlateau
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -172,6 +173,7 @@ class BrainLife:
             self.dynamics = SpikingDynamics(self.dev)                                  # §16 dynamic states + rhythm (P2)
             self.peptides = SpikingNeuropeptides(self.dev)                             # §16 slow neuropeptide layer, companion to endocrine
             self.glia = SpikingGlia(self.dev, dtype=next(self.brain.parameters()).dtype)  # §17 astrocyte activation field
+            self.plateau = DendriticPlateau(self.dev, dtype=next(self.brain.parameters()).dtype)  # §17 NMDA apical plateau
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
                                           alpha_v=0.1, alpha_pi=0.3, seed=seed, syn_density=syn_density)  # §2
@@ -337,6 +339,8 @@ class BrainLife:
                     self.brain.stp._ne_gain = float(endo.ne_gain())
                 else:
                     self.brain.stp._ne_gain = 1.0                   # default-neutral
+            pl = getattr(self, "plateau", None)                     # §17 NMDA apical plateau: live handle, no restart
+            self.brain._plateau = pl if (pl is not None and pl.on) else None
             eprop = getattr(self.brain, "learn_rule", "bptt") == "eprop"
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr * gate
@@ -629,6 +633,7 @@ class BrainLife:
             if hasattr(self, "glia"): p["glia"] = self.glia.state()                  # §17 astrocyte field metrics
             if hasattr(self.brain, "stdp"): p["stdp"] = self.brain.stdp.state()      # §15.18 STDP timing metrics
             if hasattr(self.brain, "stp"): p["stp"] = self.brain.stp.state()         # §17 STP efficacy metrics
+            if hasattr(self, "plateau"): p["plateau"] = self.plateau.state()         # §17 NMDA apical plateau metrics
             p["cerebellum"] = {"eta": self.cereb_eta, "sparsity": self.cerebellum.sparsity,
                                "g_golgi": self.cerebellum.g_golgi, "thr0": self.cerebellum.thr0,
                                "syn_density": getattr(self.cerebellum, "syn_density", 1.0)}
@@ -700,6 +705,8 @@ class BrainLife:
                 applied.update(self.brain.stdp.set_params(**p))      # §15.18 STDP live-tune + toggle `on` (no restart)
             elif target == "stp" and hasattr(self.brain, "stp"):
                 applied.update(self.brain.stp.set_params(**p))       # §17 STP live-tune + toggle `on` (cortex mechanism)
+            elif target == "plateau" and self.modules_on and hasattr(self, "plateau"):
+                applied.update(self.plateau.set_params(**p))         # §17 NMDA apical plateau live-tune + toggle `on`
             elif target == "cerebellum" and self.modules_on:
                 if "eta" in p: self.cereb_eta = float(p["eta"]); applied["eta"] = self.cereb_eta
                 if "sparsity" in p: self.cerebellum.sparsity = float(p["sparsity"]); applied["sparsity"] = self.cerebellum.sparsity
@@ -1753,6 +1760,8 @@ class BrainLife:
                     life["modules"]["stdp"] = {k: getattr(self.brain.stdp, k) for k in self.brain.stdp._KEYS}
                 if hasattr(self.brain, "stp"):               # §17 STP: 5 replicated scalar params (u,x transient, not saved)
                     life["modules"]["stp"] = {k: getattr(self.brain.stp, k) for k in self.brain.stp._KEYS}
+                if hasattr(self, "plateau"):                 # §17 NMDA apical plateau: all tunable params
+                    life["modules"]["plateau"] = {k: getattr(self.plateau, k) for k in self.plateau._KEYS}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1828,6 +1837,8 @@ class BrainLife:
                     self.brain.stdp.set_params(**m["stdp"])
                 if hasattr(self.brain, "stp") and m.get("stp"):         # §17 restore STP params
                     self.brain.stp.set_params(**m["stp"])
+                if hasattr(self, "plateau") and m.get("plateau"):       # §17 restore NMDA apical plateau params
+                    for k, v in m["plateau"].items(): setattr(self.plateau, k, v)
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)

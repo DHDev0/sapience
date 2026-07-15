@@ -622,7 +622,7 @@ main{display:grid;grid-template-columns:340px 1fr;gap:10px;padding:10px}
   <div class=card style=margin-top:10px><h3>💾 resources — usage vs limit</h3><div id=resources></div></div>
   <div class=card style=margin-top:10px><h3>🎚 tune a module (live)</h3>
    <div style=display:flex;gap:4px>
-    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option><option>endocrine</option><option>dynamics</option><option>peptides</option><option>glia</option><option>stdp</option><option>stp</option></select>
+    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option><option>endocrine</option><option>dynamics</option><option>peptides</option><option>glia</option><option>stdp</option><option>stp</option><option>plateau</option></select>
     <input id=nt_key placeholder="param (lr, beta, da…)" style=flex:1><input id=nt_val placeholder="value" style=width:70px>
     <button class=b-go onclick=setNet()>set</button>
    </div>
@@ -874,7 +874,8 @@ API_HELP = {
                      "peptides {on,tau_p,k_op,k_cp,k_on,k_ov,k_ov2,k_cv,k_ct,k_oc,k_os,social_gain} (§16 slow neuropeptide layer), "
                      "glia {on,tau_a,k_p,k_g,k_m,rho_clear,target_rate} (§17 astrocyte field), "
                      "stdp {on,a_plus,a_minus,tau_plus,tau_minus,mix,w_ceiling} (§15.18 spike-timing plasticity; on also via cortex{stdp:true}), "
-                     "stp {on,tau_rec,tau_facil,U,modulate_input} (§17 short-term synaptic plasticity). "
+                     "stp {on,tau_rec,tau_facil,U,modulate_input} (§17 short-term synaptic plasticity), "
+                     "plateau {on,p_thr,p_gain,rho_p,dur,btsp_couple} (§17 NMDA apical plateau; needs two_compartment). "
                      "Every region has its own live synapse grow rate (grow_syn_frac).",
     "POST /api/arch": "LIVE per-region OR global neuron/synapse surgery: {target: cortex|cerebellum|bg|hippocampus|all, op, amount?, density?}. "
                       "ops: grow_neurons, set_neurons (grow to a TARGET count), grow_synapses (amount<1 = fraction), "
