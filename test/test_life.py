@@ -73,7 +73,7 @@ def test_set_net_per_module():
     assert L.set_net("neuromod", {"da": 0.9})["applied"]["da"] == 0.9
     assert L.set_net("cerebellum", {"eta": 0.5})["applied"]["eta"] == 0.5
     assert L.set_net("endocrine", {"on": True, "C_star": 0.4})["applied"]["C_star"] == 0.4   # §16 P1
-    assert set(L._net_params().keys()) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum", "endocrine", "dynamics", "peptides"}
+    assert set(L._net_params().keys()) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum", "endocrine", "dynamics", "peptides", "glia"}
 
 
 def test_freezes():
@@ -177,3 +177,18 @@ def test_neuropeptides_integrated_and_persist():
     d = os.path.join(BASE, "pep"); L.save_life()
     L2 = BrainLife(d, core="spiking", use_teacher=False, use_visual=False, emb=16, hidden=48, layers=1, device="cpu", resume=True)
     assert L2.peptides.on is True and abs(L2.peptides.CRH - 0.55) < 1e-9 and abs(L2.peptides.OXT - 0.61) < 1e-9  # pools persist
+
+
+def test_glia_integrated_and_byte_identical_off():
+    L = _life("glia")
+    assert hasattr(L, "glia") and L.glia.on is False           # instantiated, default OFF
+    # OFF is the default; learning proceeds unchanged (core-edit off-path fully gated)
+    L._learn_text("the cat sat on the mat and the dog ran fast by the river. " * 20, steps=4)
+    assert "glia" in L._net_params() and "astro_activation" in L._net_params()["glia"]  # metric surfaced
+    # live ON (no restart), field integrates, persists with the per-neuron field
+    assert L.set_net("glia", {"on": True, "k_g": 0.6})["applied"]["on"] is True
+    L._learn_text("water flows to the sea and rain falls from the grey clouds. " * 20, steps=4)
+    assert len(L.glia.a) >= 1 and L.glia.a[0].numel() == L.brain.cells[0].hid  # per-neuron field built to layer width
+    d = os.path.join(BASE, "glia"); L.save_life()
+    L2 = BrainLife(d, core="spiking", use_teacher=False, use_visual=False, emb=16, hidden=48, layers=1, device="cpu", resume=True)
+    assert L2.glia.on is True and len(L2.glia.a) == len(L.glia.a)  # field restored (growth-guarded)

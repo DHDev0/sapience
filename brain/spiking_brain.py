@@ -352,6 +352,10 @@ class SpikingBrain(nn.Module):
         snoise = float(getattr(self, "spike_noise", 0.1))
         metab = getattr(self, "metabolic", False)              # spike-rate energy penalty on the update?
         mlam = float(getattr(self, "metabolic_lambda", 0.01))
+        astro_pg = getattr(self, "_astro_pgain", None)         # §17 glia: per-post-neuron metaplastic gain (list[H_l] or None)
+        astro_mm = float(getattr(self, "_astro_metab_mult", 1.0) or 1.0)   # glia metabolic-scarcity multiplier on mlam
+        astro_on = bool(getattr(self, "_astro_on", False))     # accumulate per-neuron rate for glia.sense() (off-cost-free)
+        if astro_on: astro_zsum = [torch.zeros(c.hid, device=dev) for c in cells]
         if homeo:
             self._ensure_homeo(); spk_sum = [torch.zeros(c.hid, device=dev) for c in cells]
         lr = self.lr * getattr(self, "eprop_lr_scale", 2000.0)
@@ -400,6 +404,7 @@ class SpikingBrain(nn.Module):
                 vfire = v[l] + snoise * torch.randn_like(v[l]) if stoch else v[l]   # stochastic (noisy) firing
                 psi_l = self._psi(vfire - thr); z[l] = (vfire >= thr).float()
                 if homeo: spk_sum[l] = spk_sum[l] + z[l].sum(0)
+                if astro_on: astro_zsum[l] = astro_zsum[l] + z[l].sum(0)   # §17 per-neuron firing accumulator for glia
                 eb = ebeta if btsp else c.beta                 # BTSP: eligibility outlives the membrane
                 dyn_eb = getattr(self, "_dyn_elig_beta", None)  # §16 P2: attention→FREQUENCY sets the window
                 if dyn_eb is not None: eb = float(dyn_eb)       #   (gamma-short when focused, alpha-long when not)
@@ -445,7 +450,7 @@ class SpikingBrain(nn.Module):
                     brst = (Lsig.abs() > thr).float() * z[l]   # two-compartment neuron — low-bandwidth, noisy
                     Lsig = Lsig * brst
                     if l == len(cells) - 1: burst_frac = float(brst.mean())
-                if metab: Lsig = Lsig + mlam * z[l]            # metabolic cost: a spike-rate loss (mlam·Σz)
+                if metab: Lsig = Lsig + (mlam * astro_mm) * z[l]   # metabolic cost (mlam·Σz); §17 glia scales the energy price
                 #   has dLoss/dz=+mlam → ADDS to the per-neuron error, pushing incoming weights DOWN (less firing)
                 g = (Lsig * psi[l]).float()                    # g_j = L_j · ψ_j
                 if l == 0 and getattr(c, "Win", None) is not None:   # the byte-embedding learns too: project the
@@ -503,6 +508,18 @@ class SpikingBrain(nn.Module):
         def _upd(w, g, fin, pw=p):
             w.add_((scale * (g / (denom * float(fin) ** pw))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
         hpow = float(getattr(self, "head_fanin_pow", 0.5))     # gentler fan-in norm for the wide readout head
+        if astro_pg is not None:                               # §17 glia: slow per-POSTsynaptic-neuron metaplastic gain on
+            for l, c in enumerate(cells):                      #   the APPLIED update (a 4th factor on Δw, NOT the eligibility)
+                pg = astro_pg[l].to(g_rec[l].dtype)
+                if sp(c):
+                    g_rec[l] = g_rec[l] * pg[c.rec_row]        # sparse: scale each edge by its POSTsynaptic neuron's gain
+                    if c.sparse_in:
+                        g_in[l] = g_in[l] * pg[c.in_row]; g_in_b[l] = g_in_b[l] * pg
+                    else:
+                        g_in[l] = g_in[l] * pg.unsqueeze(1); g_in_b[l] = g_in_b[l] * pg
+                else:
+                    g_rec[l] = g_rec[l] * pg.unsqueeze(1)      # dense: rows = postsynaptic neurons
+                    g_in[l] = g_in[l] * pg.unsqueeze(1); g_in_b[l] = g_in_b[l] * pg
         for l, c in enumerate(cells):
             if sp(c):
                 _upd(c.rec_val, g_rec[l] * c.rec_mask, c.rec_fanin)   # silent synapses get no update
@@ -535,6 +552,8 @@ class SpikingBrain(nn.Module):
         if getattr(self, "dale", False):
             self._project_dale()                               # re-impose E/I sign law after the update
         self._burst_frac = burst_frac
+        if astro_on:                                           # §17 per-neuron rate r_l=(Σ_{b,t}z)/(B·T) for glia.sense()
+            self._spk_rate_vec = [astro_zsum[l] / float(B * T) for l in range(len(cells))]
         if twocomp: self._apical_mag = float(ap[-1].abs().mean())   # apical-dendrite drive magnitude
         # DIAGNOSTIC METRICS — the leading indicators the root-cause read needed (bpb alone lagged):
         #  mem_mag = top-layer membrane |v| = the REPRESENTATION magnitude; a runaway here (the actual

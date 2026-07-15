@@ -30,6 +30,7 @@ from .spiking_modules import SpikingCerebellum, SpikingBasalGanglia, SpikingHipp
 from .endocrine import SpikingEndocrine
 from .dynamics import SpikingDynamics
 from .neuropeptides import SpikingNeuropeptides
+from .glia import SpikingGlia
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -170,6 +171,7 @@ class BrainLife:
             self.endocrine = SpikingEndocrine(self.dev)                                # §16 slow drive/stress layer (P1)
             self.dynamics = SpikingDynamics(self.dev)                                  # §16 dynamic states + rhythm (P2)
             self.peptides = SpikingNeuropeptides(self.dev)                             # §16 slow neuropeptide layer, companion to endocrine
+            self.glia = SpikingGlia(self.dev, dtype=next(self.brain.parameters()).dtype)  # §17 astrocyte activation field
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
                                           alpha_v=0.1, alpha_pi=0.3, seed=seed, syn_density=syn_density)  # §2
@@ -322,6 +324,14 @@ class BrainLife:
                 self.brain._dyn_elig_beta = dyn.eligibility_beta(float(getattr(self.brain, "attention", 1.0)))
             elif hasattr(self.brain, "_dyn_elig_beta"):
                 self.brain._dyn_elig_beta = None                    # off → the native eligibility timescale
+            glia = getattr(self, "glia", None)                      # §17 astrocyte field: slow per-neuron metaplasticity
+            if glia is not None and glia.on:
+                gate = gate * glia.global_gain()                    # region-wide slow gliotransmission brake (× endo gate)
+                self.brain._astro_on = True                         # cortex accumulates the per-neuron rate for glia.sense()
+                self.brain._astro_pgain = glia.pgain_per_layer([c.hid for c in self.brain.cells])  # per-post metaplastic gain
+                self.brain._astro_metab_mult = glia.metab_mult()    # scales metabolic_lambda (lactate/ATP scarcity)
+            elif hasattr(self.brain, "_astro_on"):                  # OFF → leave nothing stale (mirror _dyn_elig_beta reset)
+                self.brain._astro_on = False; self.brain._astro_pgain = None; self.brain._astro_metab_mult = 1.0
             eprop = getattr(self.brain, "learn_rule", "bptt") == "eprop"
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr * gate
@@ -337,6 +347,8 @@ class BrainLife:
             r = self.brain.learn_text(text, epochs=1, max_steps=steps, gate=gate, tone=tone)
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr
+            if glia is not None and glia.on:            # §17 slow-integrate this step's per-neuron firing rate
+                glia.sense(getattr(self.brain, "_spk_rate_vec", None))
             if isinstance(r, tuple):                    # (first_loss, last_loss): free progress
                 progress = max(0.0, r[0] - r[1])
             if (endo is not None and endo.on) or (pep is not None and pep.on):
@@ -609,6 +621,7 @@ class BrainLife:
             if hasattr(self, "endocrine"): p["endocrine"] = self.endocrine.state()   # §16 drive/cortisol metrics
             if hasattr(self, "dynamics"): p["dynamics"] = self.dynamics.state()      # §16 P2 entropy/ignition metrics
             if hasattr(self, "peptides"): p["peptides"] = self.peptides.state()      # §16 peptide-level metrics → /api/state
+            if hasattr(self, "glia"): p["glia"] = self.glia.state()                  # §17 astrocyte field metrics
             p["cerebellum"] = {"eta": self.cereb_eta, "sparsity": self.cerebellum.sparsity,
                                "g_golgi": self.cerebellum.g_golgi, "thr0": self.cerebellum.thr0,
                                "syn_density": getattr(self.cerebellum, "syn_density", 1.0)}
@@ -674,6 +687,8 @@ class BrainLife:
                 applied.update(self.dynamics.set_params(**p))        # §16 P2 entropy/ignition/frequency live-tune
             elif target == "peptides" and self.modules_on and hasattr(self, "peptides"):
                 applied.update(self.peptides.set_params(**p))        # §16 slow neuropeptide layer live-tune + toggle `on`
+            elif target == "glia" and self.modules_on and hasattr(self, "glia"):
+                applied.update(self.glia.set_params(**p))            # §17 astrocyte field live-tune + toggle `on`
             elif target == "cerebellum" and self.modules_on:
                 if "eta" in p: self.cereb_eta = float(p["eta"]); applied["eta"] = self.cereb_eta
                 if "sparsity" in p: self.cerebellum.sparsity = float(p["sparsity"]); applied["sparsity"] = self.cerebellum.sparsity
@@ -1012,6 +1027,8 @@ class BrainLife:
             if endo is not None and endo.on: endo.sleep_tick()  # §16 sleep RELIEVES cortisol + allostatic load
             pep = getattr(self, "peptides", None)
             if pep is not None and pep.on: pep.sleep_tick()      # §16 orexin falls, oxytocin recovers, CRH clears
+            glia = getattr(self, "glia", None)
+            if glia is not None and glia.on: glia.sleep_tick()  # §17 glymphatic clearance relaxes the astrocyte field
         # §4 novelty-gated replay (CLS): a life full of NOVEL experience replays harder;
         # a familiar one consolidates lightly (the hippocampal salience signal sets the load).
         # replay load = novelty-gated chunk count × per-chunk BPTT steps. Both are live-tunable
@@ -1718,6 +1735,9 @@ class BrainLife:
                 if hasattr(self, "peptides"):                # §16 neuropeptides: tunable params + the three pools
                     life["modules"]["peptides"] = {**{k: getattr(self.peptides, k) for k in self.peptides._KEYS},
                                                    **{k: getattr(self.peptides, k) for k in ("OXT", "ORX", "CRH")}}
+                if hasattr(self, "glia"):                    # §17 astrocyte field: tunable params + per-neuron field
+                    life["modules"]["glia"] = {**{k: getattr(self.glia, k) for k in self.glia._KEYS},
+                                               "a": [t.detach().cpu() for t in self.glia.a]}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1784,6 +1804,11 @@ class BrainLife:
                     for k, v in m["dynamics"].items(): setattr(self.dynamics, k, v)
                 if hasattr(self, "peptides") and m.get("peptides"):     # §16 restore peptide params + pools
                     for k, v in m["peptides"].items(): setattr(self.peptides, k, v)
+                if hasattr(self, "glia") and m.get("glia"):             # §17 restore astrocyte params + field (growth-guarded)
+                    gm = m["glia"]
+                    for k in self.glia._KEYS:
+                        if k in gm: setattr(self.glia, k, gm[k])
+                    self.glia.load_field(gm.get("a"), [c.hid for c in self.brain.cells])
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)
