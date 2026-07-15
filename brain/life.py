@@ -35,6 +35,7 @@ from .plateau import DendriticPlateau
 from .interneurons import SpikingInterneurons
 from .laminar import LaminarMicrocircuit
 from .ripple import SharpWaveRipple
+from .theta_seq import ThetaSequenceMemory
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -182,6 +183,7 @@ class BrainLife:
             self.laminar = LaminarMicrocircuit(self.dev, dtype=self.brain.head.weight.dtype)  # §17 laminar microcircuit (default OFF)
             self.ripple = SharpWaveRipple(self.dev, seed=seed)                          # §16 SWR-gated consolidation (default OFF)
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
+            self.theta = ThetaSequenceMemory(self.hippo, self.dev)                      # §17 temporal-order memory (rides the hippo DG)
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
                                           alpha_v=0.1, alpha_pi=0.3, seed=seed, syn_density=syn_density)  # §2
             self.cerebellum = SpikingCerebellum(256, 256, self.dev, n_granule=n_gran, seed=seed,
@@ -644,6 +646,7 @@ class BrainLife:
             if getattr(self.brain, "interneurons", None) is not None:
                 p["interneurons"] = self.brain.interneurons.state()                 # §17 PV/SOM/VIP pool rates
             if hasattr(self, "ripple"): p["ripple"] = self.ripple.state()           # §16 SWR ripple-rate/gated-commit metrics
+            if hasattr(self, "theta"): p["theta"] = self.theta.state()              # §17 sequence-memory metrics
             if hasattr(self, "laminar"):                                            # §17 per-lamina rate + config → /api/state
                 if self.laminar.on:
                     try:
@@ -729,6 +732,8 @@ class BrainLife:
                 applied.update(self.brain.interneurons.set_params(**p))   # §17 PV/SOM/VIP spiking pools live-tune + toggle
             elif target == "ripple" and self.modules_on and hasattr(self, "ripple"):
                 applied.update(self.ripple.set_params(**p))          # §16 SWR-gated consolidation live-tune + toggle
+            elif target == "theta" and self.modules_on and hasattr(self, "theta"):
+                applied.update(self.theta.set_params(**p))           # §17 sequence-memory live-tune + toggle `on`
             elif target == "laminar" and self.modules_on and hasattr(self, "laminar"):
                 was_on = self.laminar.on
                 applied.update(self.laminar.set_params(**p))         # §17 canonical microcircuit live-tune + toggle
@@ -1038,6 +1043,8 @@ class BrainLife:
             # overwriting). Gate is live-tunable via /api/net (cortex? no — a life attr).
             if self.hippo.keys.shape[0] < 32 or self._novelty >= self.novelty_gate:
                 self.hippo.store(fp)
+            if hasattr(self, "theta"):
+                self.theta.observe_item(fp, text=text)       # §17 feed the SAME fingerprint in stream order (no-op when off)
         except Exception:
             pass
 
@@ -1091,6 +1098,24 @@ class BrainLife:
             else min(getattr(self, "sleep_chunks", 10), 5)
         steps = int(getattr(self, "sleep_steps", 14))
         sseq = int(getattr(self, "sleep_seq", 96)) if self.core == "spiking" else None
+        # §17 SWR-gated ordered sequence replay: theta trajectories consolidate only on ripple-coincident ticks
+        # (Girardeau 2009); OFF ⇒ no-op (theta_chunks empty). Uses the real SharpWaveRipple.event() API.
+        theta = getattr(self, "theta", None); _rip2 = getattr(self, "ripple", None); theta_chunks = []
+        if theta is not None and theta.on and theta.traj and not self.freeze_learning:
+            _tphase = "rem" if (getattr(self, "_sleep_phase_t", 0) % 5 == 0) else "nrem"
+            _tendo = getattr(self, "endocrine", None)
+            _tpress = _tendo.sleep_pressure() if (_tendo is not None and _tendo.on) else 1.0
+            if _rip2 is not None and _rip2.on:
+                n_ev = sum(_rip2.event(_tphase, _tpress, self.debt) for _ in range(int(theta.ripple_k)))  # ripple-coincident count
+                theta.ripple_gate = min(1.0, n_ev / max(1, int(theta.ripple_k)))
+            else:
+                theta.ripple_gate = 1.0                                               # SWR gate off ⇒ ungated
+            for _ in range(max(0, int(theta.ripple_k * theta.ripple_gate))):
+                rev = bool(torch.rand(1).item() >= theta.fwd_frac)                    # fwd (Diba-Buzsaki) vs reverse (Foster-Wilson)
+                s = theta.replay_text(reverse=rev)
+                if s and len(s) > 8: theta_chunks.append(s)
+            try: theta._acc = theta.sequence_recall_accuracy()                        # refresh order-memory metric once/night
+            except Exception: pass
         mode = getattr(self, "sleep_mode", "buffer")
         # §16 SWR gate context: pressure from endocrine (only when on), phase from the NREM/REM ultradian clock.
         _endo = getattr(self, "endocrine", None)
@@ -1102,6 +1127,7 @@ class BrainLife:
             # §16 GENERATIVE self-replay: DREAM from the net (buffer-free); the raw buffer is demoted to
             # sparse CUES + a small veridical ANCHOR (the safeguard), never the training data itself.
             cues = [self.memory.sample(6) or "" for _ in range(max(1, base))]
+            cues += theta_chunks                                         # §17 ordered trajectories seed buffer-free CLS dreams
             probe = self.memory.sample(400)                              # held-out acceptance monitor (metric)
             anchor = self.memory.sample(600) if getattr(self, "gr_anchor_frac", 0.15) > 0 else None
             _n_intended = int(getattr(self, "gr_dreams", base * 2))
@@ -1124,6 +1150,9 @@ class BrainLife:
                         and (not _rip_on or _rip.event(_phase, _pressure, self.debt)):  # §16 SWR-gated commit
                     self.brain.learn_text(chunk, epochs=1, max_steps=steps, **({"seq": sseq} if sseq else {}))
                     self._replay_count = getattr(self, "_replay_count", 0) + 1   # replay-consolidation counter
+            for s in theta_chunks:                                   # §17 ORDERED trajectory streams (temporal next-byte training)
+                self.brain.learn_text(s, epochs=1, max_steps=steps, **({"seq": sseq} if sseq else {}))
+                self._replay_count = getattr(self, "_replay_count", 0) + 1
         if not self.freeze_learning:
             with torch.no_grad():
                 for p in self.brain.parameters():
@@ -1152,6 +1181,9 @@ class BrainLife:
                     self.log(f"§16 neurogenesis: +{added} DG granule cells → {self.hippo.M} (separation of new memories)")
                 except Exception as e:
                     self.log(f"neurogenesis skipped: {str(e)[:50]}")
+        if hasattr(self, "theta"):
+            try: self.theta._reseparate()                    # §17 hippo DG separator may have changed (grow/prune/neurogenesis) → re-derive keys, else sequence recall silently breaks
+            except Exception: pass
         self.save_life()                                     # checkpoint on the night boundary
         self.log(f"woke (night {self.slept_count}) {d['phase']} age {d['age']} · "
                  f"{d.get('neurons', d['n_granule'])} neurons (fixed) · "
@@ -1269,6 +1301,9 @@ class BrainLife:
                     d["cerebellum_mse"] = round(self.cereb_mse, 4)     # §1 forward-model error
                     d["bg_spike_rate"] = round(self.bg.spike_rate, 4)  # §2 medium-spiny firing
                     d["hippo_spike_rate"] = round(self.hippo.spike_rate, 4)  # §4 CA3 firing
+                    if hasattr(self, "theta"):
+                        d["seq_recall_acc"] = round(float(self.theta._acc), 3)      # §17 order-memory headline
+                        d["n_trajectories"] = len(self.theta.traj)                  # §17 committed trajectories
                 except Exception: pass
             self._nd = d; self._nd_t = now
         return self._nd
@@ -1481,6 +1516,7 @@ class BrainLife:
                             st[k] = v.to(dev)
             elif target in ("cerebellum", "bg", "hippocampus") and self.modules_on:
                 {"cerebellum": self.cerebellum, "bg": self.bg, "hippocampus": self.hippo}[target].move_to(dev)
+                if target == "hippocampus" and hasattr(self, "theta"): self.theta.move_to(dev)   # §17 seq pool follows hippo
             elif target == "neuromod":
                 pass                                         # scalar tone — device-agnostic
             else:
@@ -1817,6 +1853,10 @@ class BrainLife:
                     life["modules"]["laminar"] = {k: getattr(self.laminar, k) for k in self.laminar._KEYS}
                 if hasattr(self, "ripple"):                  # §16 SWR: params only (per-night counters are transient)
                     life["modules"]["ripple"] = {k: getattr(self.ripple, k) for k in self.ripple._KEYS}
+                if hasattr(self, "theta"):                   # §17 sequence memory: params + committed trajectories
+                    life["modules"]["theta"] = {**{k: getattr(self.theta, k) for k in self.theta._KEYS},
+                                                "seq_vals": self.theta.seq_vals, "seq_texts": self.theta.seq_texts,
+                                                "traj": self.theta.traj}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1902,6 +1942,14 @@ class BrainLife:
                         self.laminar.rebuild(self.brain)                # masks derived from lamina+A → deterministic
                 if hasattr(self, "ripple") and m.get("ripple"):        # §16 SWR restore params (reseeds RNG on `seed`)
                     self.ripple.set_params(**{k: v for k, v in m["ripple"].items() if k in self.ripple._KEYS})
+                if hasattr(self, "theta") and m.get("theta"):          # §17 restore sequence memory (keys rebuilt in current DG)
+                    td = m["theta"]
+                    self.theta.set_params(**{k: td[k] for k in self.theta._KEYS if k in td})
+                    if td.get("seq_vals") is not None:
+                        self.theta.seq_vals = td["seq_vals"].to(device=self.hippo.device, dtype=self.theta.dtype)
+                    self.theta.seq_texts = list(td.get("seq_texts", [])); self.theta.traj = [list(x) for x in td.get("traj", [])]
+                    self.theta._open = []
+                    self.theta._reseparate(); self.theta._rebuild_links()
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)
