@@ -488,7 +488,9 @@ class SpikingBrain(nn.Module):
             over = min(3.0, max(0.0, rate / max(float(getattr(self, "target_rate", 0.08)), 1e-3) - 2.0))
         rate_sens = float(getattr(self, "attn_rate_sens", 0.25))
         attn_t = min(1.3, max(0.2, 1.0 - sens * surprise - rate_sens * over))   # loss-shock OR over-firing → less plasticity
-        self.attention = 0.9 * float(getattr(self, "attention", 1.0)) + 0.1 * attn_t
+        cur_at = float(getattr(self, "attention", 1.0))
+        aw = 0.3 if attn_t < cur_at else 0.1        # ASYMMETRIC: brake FAST (safety-biased), release SLOW — so an
+        self.attention = (1.0 - aw) * cur_at + aw * attn_t   # over-firing/loss signal pulls the rate down promptly, not over ~10 steps
         self.loss_ema = 0.98 * self.loss_ema + 0.02 * L             # slow learning-health baseline
         scale = float(gate) * lr * self.attention * ((0.5 + da) if diffnm else 1.0)   # ACh gates; ATTENTION self-adapts; DA reward-modulates
         def _upd(w, g, fin):
