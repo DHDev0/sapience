@@ -105,6 +105,19 @@ class SpikingBrain(nn.Module):
         # width N and sparsity ρ (‖v‖²≈ρN⟨v²⟩ auto-discounts the ~96% silent membranes). ONE head_lr_scale then
         # transfers from hidden=256 to 256000. Update-only (no forward change), e-prop-local, byte-identical when off.
         self.head_fanin_pow = 0.7
+        # OPTIMIZER on the (correct, faithful) local e-prop gradient. The gradient dE/dw=Σ_t L_t·e_t is verified
+        # correct (eligibility trace + learning signal + routing audited faithful); the BUG was the apply-tail —
+        # ÷(denom·fan_in^p)+±0.02 clamp+fixed-lr, a crude per-tensor mis-scaling that froze the embedding (÷denom·÷emb
+        # ≈÷5e4), froze the head WEIGHTS (÷hidden^0.7) while the head BIAS (÷denom only) raced to the byte-marginal
+        # ⇒ logits collapse to the prior ⇒ bpb stuck at ~4.5. Correct e-prop (Bellec 2020) feeds the LOCAL gradient
+        # to ADAM (per-weight moment normalization) — which reads ONLY each synapse's own gradient history, so it is
+        # fully LOCAL/faithful (no backprop, no weight-transport). learn_opt="adam" gives every weight a ~adam_lr
+        # step regardless of its raw-gradient magnitude, unfreezing E/head/recurrent together (a single global lr
+        # cannot — it just explodes, measured). gate·attention·DA still multiplies the step (mechanisms modulate).
+        self.learn_opt = "legacy"             # "legacy"=÷fan_in+clamp+fixed-lr (byte-identical); "adam"=per-weight Adam
+        self.adam_lr = 1e-3                    #   Adam step size on the local e-prop gradient
+        self._adam_state = {}                  #   id(param) -> [m, u] fp32 first/second-moment EMAs (per-weight, local)
+        self._adam_t = 0                       #   Adam bias-correction step counter
         self.head_norm = "power"              # "power"=÷hidden^head_fanin_pow (current, byte-identical); "energy"=NLMS ÷‖top_v‖²
         self.head_lr_scale = 1.0              # NLMS μ (energy mode): μ_eff=μ·gate·attn·(0.5+da)≤~1.3<2 (mean-square stable).
         #   A/B (hidden 256..4096): μ=0.3 bpb~5.5 (too slow), μ=1.0→4.75, μ=2.0→3.9 (below the 4.5 byte floor). Δz_rms
@@ -691,7 +704,22 @@ class SpikingBrain(nn.Module):
         self.attention = (1.0 - aw) * cur_at + aw * attn_t   # over-firing/loss signal pulls the rate down promptly, not over ~10 steps
         self.loss_ema = 0.98 * self.loss_ema + 0.02 * L             # slow learning-health baseline
         scale = float(gate) * lr * self.attention * ((0.5 + da) if diffnm else 1.0)   # ACh gates; ATTENTION self-adapts; DA reward-modulates
+        _adam = getattr(self, "learn_opt", "legacy") == "adam"                # per-weight optimizer on the LOCAL e-prop grad
+        if _adam:                                                            # (faithful: reads only each synapse's own g-history)
+            self._adam_t = int(getattr(self, "_adam_t", 0)) + 1
+            if not hasattr(self, "_adam_state"): self._adam_state = {}
+            _b1, _b2, _aeps = 0.9, 0.999, 1e-8; _alr = float(getattr(self, "adam_lr", 1e-3))
+            _amult = float(gate) * self.attention * ((0.5 + da) if diffnm else 1.0)   # gate·attn·DA (mechanisms modulate); NO base lr
+            _abc1 = 1.0 - _b1 ** self._adam_t; _abc2 = 1.0 - _b2 ** self._adam_t      # bias correction
         def _upd(w, g, fin, pw=p):
+            if _adam:                                                        # ADAM: per-weight m/û normalization, no ÷fanin, no clamp
+                k = id(w); st = self._adam_state.get(k)
+                if st is None or st[0].shape != w.shape:
+                    st = [torch.zeros_like(w, dtype=torch.float32), torch.zeros_like(w, dtype=torch.float32)]; self._adam_state[k] = st
+                m, u = st; gf = g.float()
+                m.mul_(_b1).add_(gf, alpha=1.0 - _b1); u.mul_(_b2).addcmul_(gf, gf, value=1.0 - _b2)
+                w.add_(((_amult * _alr) * (m / _abc1) / ((u / _abc2).sqrt() + _aeps)).to(w.dtype), alpha=-1.0)
+                return
             d = (fin ** pw) if torch.is_tensor(fin) else float(fin) ** pw     # §17 per-neuron eff-fanin (tensor) or scalar
             w.add_((scale * (g / (denom * d))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
         hpow = float(getattr(self, "head_fanin_pow", 0.5))     # gentler fan-in norm for the wide readout head
@@ -737,7 +765,7 @@ class SpikingBrain(nn.Module):
                 _upd(c.Wrec.weight, g_rec[l] if _lrw is None else g_rec[l] * _lrw, c.Wrec.weight.shape[1])
                 _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
         mu = meanE = epsE = None
-        if he_on:                                              # §NLMS energy-normalized readout (width+sparsity-invariant)
+        if he_on and not _adam:                                # §NLMS energy-normalized readout (width+sparsity-invariant)
             last = len(cells) - 1
             # μ drops the cortex's 2000× base (self.lr·eprop_lr_scale) — NLMS μ is O(0.3) — but KEEPS gate·attention·DA
             # so the over-excitation brake / ACh gate / reward still modulate the head.
@@ -758,8 +786,8 @@ class SpikingBrain(nn.Module):
             fb_dec = float(getattr(self, "fb_decay", 1e-4)); last = len(cells) - 1   # B, then weight-decay → B aligns with W
             for l in range(len(cells)):                         # B must move at the SAME rate as the head, else it can't align
                 G = gHead if l == last else gFB[l]
-                if he_on: _updh(self._fb[l], G, float(v_energy[l]) / denom)   # B_l gets v[l]'s OWN energy → stays aligned
-                else:     _upd(self._fb[l], G, self._fb[l].shape[1], pw=hpow)
+                if he_on and not _adam: _updh(self._fb[l], G, float(v_energy[l]) / denom)   # B_l gets v[l]'s OWN energy → aligns
+                else:                   _upd(self._fb[l], G, self._fb[l].shape[1], pw=hpow)
                 self._fb[l].mul_(1.0 - fb_dec)
         if bounded:                                            # Fusi bounded synapses: clamp the MEMBRANE-FEEDING
             for c in cells:                                    # weights so the recurrent map can't pump |v| unbounded.
@@ -1082,7 +1110,8 @@ class SpikingBrain(nn.Module):
                    "homeostasis", "target_rate", "homeo_lr", "mem_homeostasis", "mem_homeo_target", "mem_homeo_lr", "homeo_lr_drift",
                    "btsp", "btsp_beta", "two_compartment", "g_ap",
                    "beta_ap", "som_baseline", "pv_gain", "diff_neuromod", "stochastic", "spike_noise", "metabolic",
-                   "metabolic_lambda", "stdp", "head_norm", "head_lr_scale", "head_energy_eps")
+                   "metabolic_lambda", "stdp", "head_norm", "head_lr_scale", "head_energy_eps",
+                   "learn_opt", "adam_lr")
 
     @torch.no_grad()
     def set_faith(self, **kw):
@@ -1099,6 +1128,8 @@ class SpikingBrain(nn.Module):
                 if v not in ("learned", "random"): continue
             elif k == "head_norm":                         # invalid values must NOT silently change the rule
                 if v not in ("power", "energy"): continue
+            elif k == "learn_opt":                         # per-weight optimizer on the local e-prop gradient
+                if v not in ("legacy", "adam"): continue
             elif k == "stdp":                              # single source of truth = self.stdp.on
                 self.stdp.set_params(on=v); applied[k] = self.stdp.on; continue
             else:
@@ -1112,7 +1143,7 @@ class SpikingBrain(nn.Module):
                 elif k in ("target_rate", "homeo_lr", "pv_gain", "g_ap", "fb_decay", "burst_thr", "head_fanin_pow",
                            "som_baseline", "spike_noise", "metabolic_lambda", "attn_sensitivity", "attn_rate_sens",
                            "attn_mem_sens", "mem_homeo_lr", "homeo_lr_drift",
-                           "head_lr_scale", "head_energy_eps"):
+                           "head_lr_scale", "head_energy_eps", "adam_lr"):
                     v = max(0.0, v)
                 elif k in ("btsp_beta", "beta_ap"):
                     v = min(0.9999, max(0.0, v))
