@@ -52,6 +52,8 @@ CHART_KEYS = [                                   # (state field, label, lower_is
     ("advantage", "§17 advantage ↑", False, ""), ("world_success_rate", "§17 goal reached ↑", False, ""),
     ("world_steps_to_goal", "§17 steps to goal ↓", True, ""), ("world_surprise", "§17 world surprise ↓", True, ""),
     ("spatial_decode_acc", "§17 spatial decode ↑", False, ""), ("pi_drift", "§17 PI drift ↓", True, ""),
+    ("pred_err_out", "§PC output pred-error ↓", True, ""), ("pred_err_L0", "§PC L0 pred-error ↓", True, ""),
+    ("pred_err_L1", "§PC L1 pred-error ↓", True, ""), ("mean_precision", "§PC precision", False, ""),
     # cortex learning-health leading indicators (nested under net.weights; flattened into history below). These
     # diagnose WHY the net does/doesn't learn: head_w_std collapsing to init + head_update_mag≈0 = starved readout;
     # fb_align_cos≈0 = feedback not aligning; mem_mag climbing = representation runaway; update_mag = recurrent Δw.
@@ -628,7 +630,7 @@ main{display:grid;grid-template-columns:340px 1fr;gap:10px;padding:10px}
   <div class=card style=margin-top:10px><h3>💾 resources — usage vs limit</h3><div id=resources></div></div>
   <div class=card style=margin-top:10px><h3>🎚 tune a module (live)</h3>
    <div style=display:flex;gap:4px>
-    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option><option>endocrine</option><option>dynamics</option><option>peptides</option><option>glia</option><option>stdp</option><option>stp</option><option>plateau</option><option>interneurons</option><option>laminar</option><option>ripple</option><option>theta</option><option>embodiment</option><option>spatial</option></select>
+    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option><option>endocrine</option><option>dynamics</option><option>peptides</option><option>glia</option><option>stdp</option><option>stp</option><option>plateau</option><option>interneurons</option><option>laminar</option><option>ripple</option><option>theta</option><option>embodiment</option><option>spatial</option><option>pc</option></select>
     <input id=nt_key placeholder="param (lr, beta, da…)" style=flex:1><input id=nt_val placeholder="value" style=width:70px>
     <button class=b-go onclick=setNet()>set</button>
    </div>
@@ -717,7 +719,7 @@ function renderNet(nd,np){const el=document.getElementById('netdiag');if(el){con
  renderFaith(np);}
 function setFaith(k,v){post('/api/net',{target:'cortex',[k]:v}).then(r=>flash('faith '+k+'='+v+': '+esc(JSON.stringify(r.applied||r.err||r))));}
 function renderFaith(np){const el=document.getElementById('faithbtns');if(!el||!np||!np.cortex)return;const c=np.cortex;let h='';
- h+='<button class=b-go onclick="setFaith(\'learn_rule\',\''+(c.learn_rule=='eprop'?'bptt':'eprop')+'\')">rule: '+esc(''+c.learn_rule)+'</button>';
+ h+='<button class=b-go onclick="setFaith(\'learn_rule\',\''+(c.learn_rule=='eprop'?'pc':(c.learn_rule=='pc'?'bptt':'eprop'))+'\')">rule: '+esc(''+c.learn_rule)+'</button>';
  h+='<button class=b-go onclick="setFaith(\'feedback_mode\',\''+(c.feedback_mode=='learned'?'random':'learned')+'\')">feedback: '+esc(''+c.feedback_mode)+'</button>';
  ['two_compartment','diff_neuromod','dale','dendritic','bounded_synapses','homeostasis','btsp','stochastic','metabolic'].forEach(k=>{const on=!!c[k];
   h+='<button class=b-go style="opacity:'+(on?1:.45)+'" onclick="setFaith(\''+k+'\','+(on?'false':'true')+')">'+k.replace('_synapses','')+': '+(on?'ON':'off')+'</button>';});
@@ -887,7 +889,8 @@ API_HELP = {
                      "ripple {on,f_so,dt,p0,up_thr,refractory,press_gain,debt_gain,debt_scale,rem_suppress,seed} (§16 SWR-gated consolidation), "
                      "theta {on,L,capacity,beta,g_inh,thr,fwd_frac,ripple_k,commit_on_boundary} (§17 hippocampal sequence memory), "
                      "embodiment {on,grid,max_steps,gamma,explore_temp,epistemic_w,step_cost,cadence} (§17 active-inference world loop), "
-                     "spatial {on,vel_gain,loop_close,path_integration,n_modules,place_n,grid_scale0,...} (§17 grid/place + path integration). "
+                     "spatial {on,vel_gain,loop_close,path_integration,n_modules,place_n,grid_scale0,...} (§17 grid/place + path integration), "
+                     "pc {on,precision,prec_tau,infer_gain,pc_lr_scale,phi,eps} (§PC predictive-coding rule; learn_rule now ∈ {eprop,bptt,pc}). "
                      "Every region has its own live synapse grow rate (grow_syn_frac).",
     "POST /api/arch": "LIVE per-region OR global neuron/synapse surgery: {target: cortex|cerebellum|bg|hippocampus|all, op, amount?, density?}. "
                       "ops: grow_neurons, set_neurons (grow to a TARGET count), grow_synapses (amount<1 = fraction), "

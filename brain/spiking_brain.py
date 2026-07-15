@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from .spiking import LIFCell, ALIFCell, SparseLIFCell, SparseALIFCell
 from . import synapse
 from .stdp import SpikingSTDP
+from .predictive_coding import PredictiveCoding
 
 
 class SpikingBrain(nn.Module):
@@ -164,6 +165,9 @@ class SpikingBrain(nn.Module):
         # §10: the NEURON count is fixed at birth; the SYNAPSE count is what develops. Seed a
         # sparse connectome (syn_density of connections active) that childhood then densifies.
         self.syn_density = syn_density
+        # §PC third learning rule (Rao-Ballard/Friston). DEFAULT OFF via learn_rule='eprop'; pc.on gates the
+        # PC EXTRAS (precision + inference). dtype passed through (stats stay fp32 like the e-prop grads).
+        self.pc = PredictiveCoding(device, dtype)
         self._init_synapse_mask(syn_density)
         from .synaptic_stp import SpikingSTP
         self.stp = SpikingSTP(self.device)     # §17 short-term synaptic plasticity controller (DEFAULT OFF)
@@ -216,7 +220,11 @@ class SpikingBrain(nn.Module):
     # ---- LEARN: surrogate-gradient BPTT (= PC at β→0, §3.5) ---------- #
     def learn_text(self, text, epochs=1, bs=16, max_steps=12, store=True,
                    replay_interleave=0, consolidate_rounds=0, seq=None, on_step=None, gate=1.0, tone=None):
-        if getattr(self, "learn_rule", "bptt") == "eprop":     # faithful forward-in-time route
+        _rule = getattr(self, "learn_rule", "bptt")
+        if _rule == "pc":                                      # §PC predictive-coding route (peer of e-prop)
+            return self.learn_pc(text, epochs=epochs, bs=bs, max_steps=max_steps, seq=seq,
+                                 on_step=on_step, gate=gate, tone=tone)
+        if _rule == "eprop":                                   # faithful forward-in-time route
             return self.learn_eprop(text, epochs=epochs, bs=bs, max_steps=max_steps, seq=seq,
                                     on_step=on_step, gate=gate, tone=tone)
         data = text if isinstance(text, list) else self.to_bytes(text)
@@ -301,10 +309,41 @@ class SpikingBrain(nn.Module):
         self.seen_bytes += n
         return (first if first is not None else 0.0, last if last is not None else 0.0)
 
+    @torch.no_grad()
+    def learn_pc(self, text, epochs=1, bs=16, max_steps=12, seq=None, on_step=None, gate=1.0, tone=None):
+        """§PC · train the cortex by hierarchical predictive coding (Rao-Ballard/Friston). Identical windowing
+        to learn_eprop; each window runs _pc_step (= _eprop_step with the trace off + precision weighting)."""
+        data = text if isinstance(text, list) else self.to_bytes(text)
+        seq = seq or self.seq
+        if len(data) <= seq + 1:
+            return None
+        self._ensure_feedback(); self.pc.ensure(self.cells)    # B_l = the PC generative weights; pad sig2/prec
+        t = torch.tensor(data, device=self.device); n = t.numel()
+        first = last = None
+        for _ in range(epochs):
+            steps = max(1, min(max_steps, (n - seq) // (bs * seq) + 1))
+            for _s in range(steps):
+                i = torch.randint(0, n - seq - 1, (bs,), device=self.device)
+                x = torch.stack([t[k:k + seq] for k in i])
+                y = torch.stack([t[k + 1:k + seq + 1] for k in i])
+                loss = self._pc_step(x, y, gate, tone=tone)
+                last = loss
+                if first is None: first = last
+                if on_step is not None: on_step(_s + 1, steps, last)
+        self.seen_bytes += n
+        return (first if first is not None else 0.0, last if last is not None else 0.0)
+
+    @torch.no_grad()
+    def _pc_step(self, x, y, gate=1.0, tone=None):
+        """§PC one predictive-coding step — routes through _eprop_step's shared spmm/sddmm/edge_reduce + the
+        width-invariant _upd tail with pc=True (eb→0 instantaneous ε, precision-weighted error, optional
+        inference relaxation). Single code path with e-prop ⇒ no drift; e-prop is untouched (pc=False)."""
+        return self._eprop_step(x, y, gate, tone=tone, pc=True)
+
     _EP_CHUNK = 1 << 26                                        # cap on any transient (chunk, nnz) buffer
 
     @torch.no_grad()
-    def _eprop_step(self, x, y, gate=1.0, tone=None):
+    def _eprop_step(self, x, y, gate=1.0, tone=None, pc=False):
         """One e-prop gradient step over a (B,T) window — pure PyTorch, NO O(H²) anywhere. Eligibility
         traces are per-neuron (O(H)); the recurrent grad is accumulated PER SYNAPSE by gather/scatter
         (O(nnz) for a sparse cortex, so it scales to hundreds of thousands of neurons). Timestep-outer
@@ -351,6 +390,9 @@ class SpikingBrain(nn.Module):
         g_ap = float(getattr(self, "g_ap", 0.15)); beta_ap = float(getattr(self, "beta_ap", 0.9))
         som_b = float(getattr(self, "som_baseline", 0.5)); pv_g = float(getattr(self, "pv_gain", 0.3))
         ap = [torch.zeros(B, c.hid, device=dev) for c in cells] if twocomp else None   # apical dendrite state
+        infer_g = float(self.pc.infer_gain) if pc else 0.0     # §PC inference-relaxation gain (0 = learning-only)
+        pc_prev = [torch.zeros(B, c.hid, device=dev) for c in cells] if (pc and infer_g > 0.0) else None
+        pc_err_out = 0.0                                        # §PC output prediction-error accumulator
         intern = getattr(self, "interneurons", None)           # §17 spiking PV/SOM/VIP pools (controller)
         use_intern = twocomp and intern is not None and getattr(intern, "on", False)
         if use_intern: intern.begin(B, ref=v[0])               # capture device/dtype, reset per-step membranes
@@ -379,7 +421,7 @@ class SpikingBrain(nn.Module):
         if astro_on: astro_zsum = [torch.zeros(c.hid, device=dev) for c in cells]
         if homeo:
             self._ensure_homeo(); spk_sum = [torch.zeros(c.hid, device=dev) for c in cells]
-        lr = self.lr * getattr(self, "eprop_lr_scale", 2000.0)
+        lr = self.lr * (float(self.pc.pc_lr_scale) if pc else getattr(self, "eprop_lr_scale", 2000.0))
         CH = self._EP_CHUNK
         def spmm(val, col, row, xin, out_dim):                 # y[b,row] += val · xin[b,col]  (O(nnz·B))
             cl = col.long(); ch = max(1, min(B, CH // max(1, cl.numel())))
@@ -438,6 +480,7 @@ class SpikingBrain(nn.Module):
                         else (1.0 + pv_g * z_prev.mean(1, keepdim=True))   # §17 spiking PV pool OR mean-field divisive gain
                     drive = drive / denom + g_ap * apd_fwd
                 if diffnm: drive = drive * ne_gain             # NE sets somatic gain (surprise/attention)
+                if pc_prev is not None: drive = drive + infer_g * pc_prev[l]   # §PC top-down error relaxes activity
                 v[l] = c.beta * v[l] * (1.0 - z_prev) + drive
                 if al[l]:
                     a[l] = c.rho * a[l] + z_prev               # adaptation from the previous spike
@@ -455,6 +498,7 @@ class SpikingBrain(nn.Module):
                 if diffnm: eb = min(0.995, eb * ht_pat)        # 5-HT stretches the eligibility window (patience)
                 if plateau:                                    # §17 BTSP: a live plateau population stretches eligibility → btsp_beta
                     eb = min(0.9999, eb + pcpl * plat_rate * (float(getattr(self, "btsp_beta", 0.98)) - eb))
+                if pc: eb = 0.0                                # §PC: NO temporal trace — instantaneous β→0 limit (ε=z_prev)
                 eps_rec[l] = eb * eps_rec[l] + z_eff           # §17: eligibility carries the TRANSMITTED spike z⊙g (resource-aware)
                 eps_in[l] = eb * eps_in[l] + layer_in
                 if do_stdp and sp(c):                          # STDP rides the sparse cortex (edge-wise, O(nnz·B))
@@ -485,12 +529,17 @@ class SpikingBrain(nn.Module):
             oh = torch.zeros_like(p); oh.scatter_(1, y[:, tt].long().unsqueeze(1), 1.0)
             err = p - oh                                        # CE gradient wrt logits
             tot_loss += float(-(oh * (p + 1e-9).log()).sum(1).mean())
+            if pc: pc_err_out += float(err.abs().mean())        # §PC output prediction error (free-energy proxy)
             gHead += err.t() @ top_v.float(); gHead_b += err.sum(0)   # head grad is LOCAL in time
             if learned_fb:                                     # Kolen-Pollack: B learns the head's grad (top
                 for l in range(len(cells) - 1):                # layer) / an error·activity correlation (lower)
                     gFB[l] += err.t() @ v[l].float()
             for l, c in enumerate(cells):
                 Lsig = err @ self._fb[l].float()               # top-down learning signal (random or learned B)
+                if pc:                                         # §PC local prediction error e_l = err@B_l
+                    self.pc.record(l, Lsig)                     #   raw per-layer pred-error (metric)
+                    Lsig = self.pc.precision_weight(l, Lsig) * Lsig   # precision-weight Π_l·e_l (mean-norm → width-invariant)
+                    if pc_prev is not None: pc_prev[l] = Lsig   #   carry to next-step inference relaxation
                 if twocomp:                                    # UNIFIED apical circuit — error runs THROUGH the
                     if use_intern:                             # §17 spiking PV/SOM/VIP pools replace the scalars
                         agate = intern.apical(l, z[l].mean(1, keepdim=True),
@@ -661,6 +710,10 @@ class SpikingBrain(nn.Module):
             surprise=float(surprise),
             rec_w_mag=float(_ct.rec_val.abs().mean() if sp(_ct) else _ct.Wrec.weight.abs().mean()),
         )
+        if pc:                                                 # §PC: surface prediction-error + precision metrics
+            self._diag["pred_err_out"] = pc_err_out / max(T, 1)
+            self.pc._pred_err_out = pc_err_out / max(T, 1)
+            self._pc_err = list(self.pc._err)
         self._apply_prune_mask()
         return tot_loss / T
 
@@ -848,6 +901,11 @@ class SpikingBrain(nn.Module):
                 out[k] = float(val)                                       # rate_L4/L23/L56 (filled live by laminar.measure)
         out["attention"] = float(getattr(self, "attention", 1.0))              # self-adapting plasticity gate
         out["eff_lr_scale"] = float(getattr(self, "eprop_lr_scale", 2000.0) * getattr(self, "attention", 1.0))
+        if getattr(self, "learn_rule", "eprop") == "pc" and hasattr(self, "pc"):   # §PC per-layer prediction error
+            out["pred_err_out"] = float((getattr(self, "_diag", {}) or {}).get("pred_err_out", 0.0))
+            for _l, _e in enumerate(getattr(self, "_pc_err", [])):
+                out[f"pred_err_L{_l}"] = float(_e)
+            out["mean_precision"] = float(self.pc.state()["mean_precision"])
         if getattr(self, "loss_ema", None) is not None:
             out["loss_ema"] = float(self.loss_ema)                             # the brain's learning-health baseline
         for k, v in (getattr(self, "_diag", None) or {}).items():             # leading-indicator diagnostics
@@ -911,7 +969,7 @@ class SpikingBrain(nn.Module):
             if k not in self._FAITH_KEYS:
                 continue
             if k == "learn_rule":                          # invalid values must NOT silently disable e-prop
-                if v not in ("eprop", "bptt"): continue
+                if v not in ("eprop", "bptt", "pc"): continue
             elif k == "feedback_mode":
                 if v not in ("learned", "random"): continue
             elif k == "stdp":                              # single source of truth = self.stdp.on
@@ -1171,6 +1229,8 @@ class SpikingBrain(nn.Module):
                         loss_ema=getattr(self, "loss_ema", None),
                         fb=(getattr(self, "_fb", None) if self.feedback_mode == "learned" else None),
                         ei=getattr(self, "_ei_sign", None),                # Dale E/I typing (learned state)
+                        pc=(dict(cfg={k: getattr(self.pc, k) for k in self.pc._KEYS},
+                                 sig2=[t.detach().cpu() for t in self.pc._sig2]) if hasattr(self, "pc") else None),  # §PC state
                         thr_adapt=getattr(self, "_thr_adapt", None),
                         stp=({k: getattr(self.stp, k) for k in self.stp._KEYS} if getattr(self, "stp", None) is not None else None)), path)  # §17 STP params (transient u,x NOT saved)
 
@@ -1228,6 +1288,12 @@ class SpikingBrain(nn.Module):
         if d.get("fb") is not None:   self._fb = [t.to(self.device) for t in d["fb"]]        # aligned feedback
         if d.get("ei") is not None:   self._ei_sign = [t.to(self.device) for t in d["ei"]]   # Dale E/I typing
         if d.get("thr_adapt") is not None: self._thr_adapt = [t.to(self.device) for t in d["thr_adapt"]]
+        if d.get("pc") is not None and hasattr(self, "pc"):                # §PC: restore cfg + per-neuron variance
+            self.pc.set_params(**(d["pc"].get("cfg") or {}))
+            self.pc._sig2 = [t.to(self.device).float() for t in (d["pc"].get("sig2") or [])]
+            _pr = [1.0 / (s + float(self.pc.eps)) for s in self.pc._sig2]
+            self.pc._prec = [(p / (p.mean() + 1e-12)) for p in _pr]
+            self.pc._err = [0.0 for _ in self.pc._sig2]
         if getattr(self, "dale", False): self._project_dale()
         return self
 

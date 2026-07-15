@@ -357,7 +357,7 @@ class BrainLife:
                     self.brain.stp._ne_gain = 1.0                   # default-neutral
             pl = getattr(self, "plateau", None)                     # §17 NMDA apical plateau: live handle, no restart
             self.brain._plateau = pl if (pl is not None and pl.on) else None
-            eprop = getattr(self.brain, "learn_rule", "bptt") == "eprop"
+            eprop = getattr(self.brain, "learn_rule", "bptt") in ("eprop", "pc")   # §PC is also a local no-opt rule
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr * gate
             tone = dict(self.nm.tone) if self.modules_on else None   # the 4 tones (diff_neuromod uses them per-pathway)
@@ -632,6 +632,8 @@ class BrainLife:
                         "syn_density": getattr(self.brain, "syn_density", 1.0)}}
         if hasattr(self.brain, "faith_config"):          # the full faithfulness stack (each an independent toggle)
             p["cortex"].update(self.brain.faith_config())
+        if hasattr(self.brain, "pc"):                    # §PC predictive-coding metrics (independent of modules_on)
+            p["pc"] = self.brain.pc.state()
         else:
             p["cortex"].update(learn_rule=getattr(self.brain, "learn_rule", "eprop"),
                                eprop_lr_scale=getattr(self.brain, "eprop_lr_scale", 2000.0))
@@ -700,7 +702,7 @@ class BrainLife:
                     self.brain.grow_syn_frac = max(0.0, min(1.0, float(p["grow_syn_frac"]))); applied["grow_syn_frac"] = self.brain.grow_syn_frac
                 if "eprop_lr_scale" in p:
                     self.brain.eprop_lr_scale = max(0.1, float(p["eprop_lr_scale"])); applied["eprop_lr_scale"] = self.brain.eprop_lr_scale
-                if "learn_rule" in p and p["learn_rule"] in ("eprop", "bptt"):
+                if "learn_rule" in p and p["learn_rule"] in ("eprop", "bptt", "pc"):
                     self.brain.learn_rule = p["learn_rule"]; applied["learn_rule"] = self.brain.learn_rule
                 # faithfulness stack — every biological constraint is an independent LIVE toggle
                 # (feedback_mode, dale, dendritic, bounded_synapses, homeostasis, btsp + their hyperparams).
@@ -733,6 +735,8 @@ class BrainLife:
                 applied.update(self.glia.set_params(**p))            # §17 astrocyte field live-tune + toggle `on`
             elif target == "stdp" and hasattr(self.brain, "stdp"):
                 applied.update(self.brain.stdp.set_params(**p))      # §15.18 STDP live-tune + toggle `on` (no restart)
+            elif target == "pc" and hasattr(self.brain, "pc"):
+                applied.update(self.brain.pc.set_params(**p))        # §PC predictive-coding extras live-tune + toggle `on`
             elif target == "stp" and hasattr(self.brain, "stp"):
                 applied.update(self.brain.stp.set_params(**p))       # §17 STP live-tune + toggle `on` (cortex mechanism)
             elif target == "plateau" and self.modules_on and hasattr(self, "plateau"):
