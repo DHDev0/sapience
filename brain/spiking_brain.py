@@ -94,7 +94,18 @@ class SpikingBrain(nn.Module):
         # fb_align_cos≈0, understanding≈0). The head is a simple readout, not a width-invariant recurrent map, so it
         # gets a gentler power — live-tunable; 0 = no fan-in norm (fastest, UNSTABLE). A/B (hidden=2000, 300 steps):
         # pow 1.0 → bpb 4.02 head frozen; pow 0.7 → bpb 2.95 acc 0.49 (WIN); pow ≤0.5 → explodes. 0.7 is the sweet spot.
+        # BUT the sweet spot DRIFTS with width (0.7@2000 works, freezes@128000; 0.45@128000 explodes) — a pure power
+        # law is the wrong model for a readout. head_norm="energy" (NLMS) replaces ÷hidden^pow with ÷‖top_v‖²: since
+        # Δlogit_i = μ·err_i·‖v‖²/(‖v‖²+ε) → μ·err_i, the ‖v‖² CANCELS ⇒ the per-step logit move is invariant to BOTH
+        # width N and sparsity ρ (‖v‖²≈ρN⟨v²⟩ auto-discounts the ~96% silent membranes). ONE head_lr_scale then
+        # transfers from hidden=256 to 256000. Update-only (no forward change), e-prop-local, byte-identical when off.
         self.head_fanin_pow = 0.7
+        self.head_norm = "power"              # "power"=÷hidden^head_fanin_pow (current, byte-identical); "energy"=NLMS ÷‖top_v‖²
+        self.head_lr_scale = 1.0              # NLMS μ (energy mode): μ_eff=μ·gate·attn·(0.5+da)≤~1.3<2 (mean-square stable).
+        #   A/B (hidden 256..4096): μ=0.3 bpb~5.5 (too slow), μ=1.0→4.75, μ=2.0→3.9 (below the 4.5 byte floor). Δz_rms
+        #   width-ratio 1.05-1.15 at all μ. Raise toward 2.0 live for faster descent (still <2 stable margin).
+        self.head_energy_eps = 1e-2           # ε as a fraction of EMA(mean readout energy) — silent-top-layer guard
+        self._head_e_ema = 0.0                # persistent EMA of mean readout energy (0 = uninitialised)
         # SELF-ADAPTING plasticity (§15.17): the learning rate is NOT a fixed dial to hand-tune — it is
         # gated by `attention`, which tracks the brain's OWN learning health (loss vs. its running
         # baseline). A loss spike above baseline (a shock / struggling) DROPS attention → the update
@@ -377,6 +388,8 @@ class SpikingBrain(nn.Module):
             else: g_in.append(torch.zeros_like(c.Win.weight)); g_in_b.append(torch.zeros_like(c.Win.bias))
         gHead = torch.zeros_like(self.head.weight); gHead_b = torch.zeros_like(self.head.bias)
         gE = torch.zeros_like(self.E.weight)                   # the sensory byte-embedding also learns (e-prop)
+        he_on = getattr(self, "head_norm", "power") == "energy"   # §NLMS width/sparsity-invariant readout
+        v_energy = [torch.zeros((), device=dev, dtype=torch.float32) for _ in cells] if he_on else None
         learned_fb = getattr(self, "feedback_mode", "learned") == "learned"
         gFB = [torch.zeros_like(self._fb[l]) for l in range(len(cells) - 1)] if learned_fb else None
         dendritic = getattr(self, "dendritic", False)          # apical burst-coded error delivery?
@@ -531,6 +544,9 @@ class SpikingBrain(nn.Module):
             tot_loss += float(-(oh * (p + 1e-9).log()).sum(1).mean())
             if pc: pc_err_out += float(err.abs().mean())        # §PC output prediction error (free-energy proxy)
             gHead += err.t() @ top_v.float(); gHead_b += err.sum(0)   # head grad is LOCAL in time
+            if he_on:                                          # §NLMS: realized membrane energy ‖v_l‖² per layer,
+                for l in range(len(cells)):                    #   fp32-accumulated (bf16 length-N sum-of-squares underflows)
+                    v_energy[l] += (v[l].float() ** 2).sum()
             if learned_fb:                                     # Kolen-Pollack: B learns the head's grad (top
                 for l in range(len(cells) - 1):                # layer) / an error·activity correlation (lower)
                     gFB[l] += err.t() @ v[l].float()
@@ -669,13 +685,30 @@ class SpikingBrain(nn.Module):
                 _lrw = getattr(c, "lam_rec_w", None)                     # §17 laminar dense adjacency (test nets)
                 _upd(c.Wrec.weight, g_rec[l] if _lrw is None else g_rec[l] * _lrw, c.Wrec.weight.shape[1])
                 _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
-        _upd(self.head.weight, gHead, self.head.weight.shape[1], pw=hpow)   # head: gentler norm so it isn't starved at width
-        _upd(self.head.bias, gHead_b, 1)
-        _upd(self.E.weight, gE, self.E.weight.shape[1])        # sensory byte-embedding update (no longer frozen)
+        mu = meanE = epsE = None
+        if he_on:                                              # §NLMS energy-normalized readout (width+sparsity-invariant)
+            last = len(cells) - 1
+            # μ drops the cortex's 2000× base (self.lr·eprop_lr_scale) — NLMS μ is O(0.3) — but KEEPS gate·attention·DA
+            # so the over-excitation brake / ACh gate / reward still modulate the head.
+            mu = float(gate) * self.attention * ((0.5 + da) if diffnm else 1.0) * float(getattr(self, "head_lr_scale", 0.3))
+            meanE = float(v_energy[last]) / denom              # realized top-layer membrane energy = ‖v‖² (per-sample mean)
+            prevE = float(getattr(self, "_head_e_ema", 0.0) or 0.0)
+            self._head_e_ema = meanE if prevE <= 0.0 else 0.98 * prevE + 0.02 * meanE
+            epsE = float(getattr(self, "head_energy_eps", 1e-2)) * max(self._head_e_ema, 1e-12)   # silent-layer floor
+            def _updh(w, g, mE):                               # ΔW = μ·g/(‖v‖²+ε) → Δlogit = μ·err (width/ρ-free)
+                w.add_((mu * (g / (denom * (mE + epsE)))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
+            _updh(self.head.weight, gHead, meanE)
+            self.head.bias.add_((mu * (gHead_b / denom)).clamp_(-dmax, dmax).to(self.head.bias.dtype), alpha=-1.0)
+        else:
+            _upd(self.head.weight, gHead, self.head.weight.shape[1], pw=hpow)   # head: gentler norm so it isn't starved at width
+            _upd(self.head.bias, gHead_b, 1)
+        _upd(self.E.weight, gE, self.E.weight.shape[1])        # sensory byte-embedding update (no longer frozen) — both paths
         if learned_fb:                                         # Kolen-Pollack: mirror the head/error grad into
-            fb_dec = float(getattr(self, "fb_decay", 1e-4))    # B, then weight-decay → B aligns with W, locally
-            for l in range(len(cells)):                         # B must move at the SAME rate as the head (hpow),
-                _upd(self._fb[l], gHead if l == len(cells) - 1 else gFB[l], self._fb[l].shape[1], pw=hpow)  # else it can't align
+            fb_dec = float(getattr(self, "fb_decay", 1e-4)); last = len(cells) - 1   # B, then weight-decay → B aligns with W
+            for l in range(len(cells)):                         # B must move at the SAME rate as the head, else it can't align
+                G = gHead if l == last else gFB[l]
+                if he_on: _updh(self._fb[l], G, float(v_energy[l]) / denom)   # B_l gets v[l]'s OWN energy → stays aligned
+                else:     _upd(self._fb[l], G, self._fb[l].shape[1], pw=hpow)
                 self._fb[l].mul_(1.0 - fb_dec)
         if bounded:                                            # Fusi bounded synapses: clamp to ±w_max
             wm = float(getattr(self, "w_max", 1.0))
@@ -710,10 +743,14 @@ class SpikingBrain(nn.Module):
             update_mag=float((scale * (_grt / (denom * float(_rf) ** p))).clamp(-dmax, dmax).abs().mean()),
             # head_update_mag = per-step readout Δw. If ~0 while grad_mag>0, the head is STARVED (fan-in norm too
             # strong at width) → it stays at random init and the net can't learn past the byte-frequency baseline.
-            head_update_mag=float((scale * (gHead / (denom * float(self.head.weight.shape[1]) ** hpow))).clamp(-dmax, dmax).abs().mean()),
+            head_update_mag=(float((mu * (gHead / (denom * (meanE + epsE)))).clamp(-dmax, dmax).abs().mean()) if he_on
+                             else float((scale * (gHead / (denom * float(self.head.weight.shape[1]) ** hpow))).clamp(-dmax, dmax).abs().mean())),
             surprise=float(surprise),
             rec_w_mag=float(_ct.rec_val.abs().mean() if sp(_ct) else _ct.Wrec.weight.abs().mean()),
         )
+        if he_on:                                              # §NLMS truthful head diagnostics: head_w_std stays ≈1/√N
+            self._diag["head_dlogit"] = float(mu * err.abs().mean())   # BY DESIGN (wrong health signal) — watch head_dlogit
+            self._diag["head_energy"] = float(meanE)                   # (~μ·err, width-free) + bpb + fb_align_cos instead
         if pc:                                                 # §PC: surface prediction-error + precision metrics
             self._diag["pred_err_out"] = pc_err_out / max(T, 1)
             self.pc._pred_err_out = pc_err_out / max(T, 1)
@@ -961,7 +998,7 @@ class SpikingBrain(nn.Module):
                    "feedback_mode", "fb_decay", "dale", "dendritic", "burst_thr", "bounded_synapses", "w_max",
                    "homeostasis", "target_rate", "homeo_lr", "btsp", "btsp_beta", "two_compartment", "g_ap",
                    "beta_ap", "som_baseline", "pv_gain", "diff_neuromod", "stochastic", "spike_noise", "metabolic",
-                   "metabolic_lambda", "stdp")
+                   "metabolic_lambda", "stdp", "head_norm", "head_lr_scale", "head_energy_eps")
 
     @torch.no_grad()
     def set_faith(self, **kw):
@@ -976,6 +1013,8 @@ class SpikingBrain(nn.Module):
                 if v not in ("eprop", "bptt", "pc"): continue
             elif k == "feedback_mode":
                 if v not in ("learned", "random"): continue
+            elif k == "head_norm":                         # invalid values must NOT silently change the rule
+                if v not in ("power", "energy"): continue
             elif k == "stdp":                              # single source of truth = self.stdp.on
                 self.stdp.set_params(on=v); applied[k] = self.stdp.on; continue
             else:
@@ -987,7 +1026,8 @@ class SpikingBrain(nn.Module):
                 elif k == "w_max":
                     v = max(1e-3, v)
                 elif k in ("target_rate", "homeo_lr", "pv_gain", "g_ap", "fb_decay", "burst_thr", "head_fanin_pow",
-                           "som_baseline", "spike_noise", "metabolic_lambda", "attn_sensitivity", "attn_rate_sens"):
+                           "som_baseline", "spike_noise", "metabolic_lambda", "attn_sensitivity", "attn_rate_sens",
+                           "head_lr_scale", "head_energy_eps"):
                     v = max(0.0, v)
                 elif k in ("btsp_beta", "beta_ap"):
                     v = min(0.9999, max(0.0, v))
@@ -1206,6 +1246,7 @@ class SpikingBrain(nn.Module):
             nhead.weight.zero_(); nhead.weight[:, :old] = self.head.weight; nhead.bias.copy_(self.head.bias)
         self.head = nhead
         self.hidden = new
+        self._head_e_ema = 0.0                                  # §NLMS: recalibrate the ε energy-floor to the new width
         self._mind = None
         self._resize_synapse_mask()            # keep the sparse connectome consistent, identity-safe
         self.opt = torch.optim.Adam(self.parameters(), lr=self.lr)

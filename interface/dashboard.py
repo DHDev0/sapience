@@ -76,6 +76,7 @@ CHART_KEYS = [                                   # (state field, label, lower_is
     # diagnose WHY the net does/doesn't learn: head_w_std collapsing to init + head_update_mag≈0 = starved readout;
     # fb_align_cos≈0 = feedback not aligning; mem_mag climbing = representation runaway; update_mag = recurrent Δw.
     ("head_w_std", "readout head weight std ↑", False, ""), ("head_update_mag", "head Δw/step ↑", False, ""),
+    ("head_dlogit", "§NLMS head Δlogit (width-free)", False, ""), ("head_energy", "§NLMS ‖top_v‖² energy", False, ""),
     ("fb_align_cos", "feedback↔head align ↑", False, ""), ("mem_mag", "representation |v|", False, ""),
     ("update_mag", "recurrent Δw/step", False, ""), ("grad_mag", "readout grad", False, ""),
     ("attention", "attention (self-lr)", False, ""), ("eff_lr_scale", "effective lr", False, ""),

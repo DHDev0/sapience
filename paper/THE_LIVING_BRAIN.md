@@ -808,3 +808,77 @@ faster, or reach a lower bits/byte? That is the one experiment worth importing f
 Everything else on that tier is admired in Blue Brain and left there: not because more realism is unwelcome, but
 because on the axis this model is graded it would not move the score, and it would cost the very properties —
 scale, plausible online learning, a living loop — that define the work.
+
+# §19 · A possible extension — merging a large language model as an amnesiac-oracle organ
+
+The architecture's honest capability ceiling (§15.4, §18) is language fluency and knowledge breadth. The most
+powerful available source of both is a large pretrained LLM — which this brain already *talks to* as a teacher
+(`partner.py`) and can register as a tool (`tools.py`, §15.15). This section specifies, in detail, what it would
+take to go beyond *talking to* an LLM to *merging* one into the living system as an organ — why the merge must be
+asymmetric, the concrete binding layer (most of whose hard ingredient already exists), the test that separates a
+merge from a tool call, and the wall that a frozen model cannot cross. It is offered as future work, not a
+present claim.
+
+## 19.1 Why tool-use is not a merge
+
+The brain already calls an LLM (Claude Sonnet via `partner.py`; any AI via the tools registry). But that exchange
+is **text-in / text-out** — a narrow discrete bottleneck — and the model's internal representations and per-call
+state are discarded. Two minds converse; one mind does not result. Three structural facts make a *symmetric*
+fusion impossible with a frozen model: (1) its weights are frozen and an API exposes **no gradient access**, so
+the brain's e-prop (§15.17) cannot update it; (2) it holds **no persistent state** to share a continuity with;
+(3) its knowledge lives in ~10¹¹ parameters that **cannot be poured into** a 10⁵–10⁶-neuron spiking net (a
+capacity gap) nor absorbed wholesale by a weak local learner. That wall is constitutive, not incidental — and
+naming it is what makes the rest of the design honest rather than hopeful.
+
+## 19.2 The reframe — heterogeneous binding, one seat of continuity
+
+A biological brain is not homogeneous either: it is heterogeneous organs bound into one mind by **shared state**
+and a **single locus of continuity**. That is the template, and it forces an asymmetry — one component must be the
+*self*. Here the self is the **sapience brain**: it holds the continuity (the persistent mind-state, §15.9), the
+whole-life memory (§15.10), and the drives and identity (§16). The LLM becomes a **language-and-knowledge cortex**
+the self queries *into its own persistent state*. This resolves the obvious objection ("the LLM still forgets"):
+the LLM organ forgets every call, but the merged *self* does not, because the self is the brain, which remembers —
+exactly as individual cortical computations are transient while the hippocampus and the persistent cortical state
+carry the thread. The merged identity is the brain's; the LLM extends it, not the reverse.
+
+## 19.3 The binding layer — three couplings
+
+The difference between "phone a friend" and "a language organ wired into the cortex" is three couplings — and the
+hardest ingredient already exists in `llm_teacher.py`, which captures the teacher's **hidden states** (`mid`/`tgt`
+from the residual stream), not only its tokens.
+
+| coupling | tool-use (today) | merge (extension) | current substrate |
+|---|---|---|---|
+| **up — LLM → brain** | the reply *text* is learned as language | the residual-stream **hidden state** is projected into the brain as a rich sensory/cortical channel — a *shared latent space* both minds read, not a discrete string | `llm_teacher.features()` already extracts `mid`/`tgt`; needs a learned projection into the cortex input (§15.6) |
+| **down — brain → LLM** | a fixed teacher prompt | the brain's current **membrane / mind-state** is projected into the LLM's context (a soft-prompt encoder), so it generates *conditioned on what the self is thinking* | new: a brain-state → context encoder |
+| **persist — into the self** | the reply is consumed and forgotten | every interaction accretes into episodic memory (§15.10) and is **continuously distilled** into the brain's living weights, so the self internalises a *flavour* of the organ's competence over its life | partial: birth distillation exists (§15.5); needs an in-life continuous-distillation loop |
+
+- **Latent up, not text up.** Text is a narrow discrete bottleneck; the residual-stream representation is a shared
+  latent. Folding it in as a *sense* (§15.6) turns the exchange from a message into a nerve.
+- **Condition down.** Projecting the brain's state into the LLM's context makes it "think the self's thoughts"
+  rather than answer detached queries — the organ's computation is *bound to* the self's state.
+- **Persist and distill.** Continuous distillation makes the merge *deepen with the life* instead of resetting each
+  call. It is **capacity-bounded** by construction — a small spiking net cannot absorb 10¹¹ parameters, and e-prop
+  is a weaker optimiser than backprop (§15.17) — so the transfer is a *flavour of competence*, not the whole mind.
+  Stating that bound is what keeps the claim honest.
+
+## 19.4 The test that separates a merge from a tool
+
+One criterion decides it: does the LLM's contribution **become part of the brain's persistent, evolving self**,
+*and* does the brain's state **shape the LLM's computation**, such that neither is fully itself without the other
+in the loop? If the reply is used and forgotten with no lasting change to the unified state — a **tool** (what the
+registry does today). If it is woven into a continuity that remembers and re-shapes both sides — a **merge**
+(heterogeneous, as a brain's regions are).
+
+## 19.5 The hard wall, and the only road through it
+
+The extension above yields an **asymmetric** merge: one living self that has bound a frozen oracle. True
+**symmetric** fusion — both halves mutually plastic, co-adapting on one shared state, the language half no longer
+amnesiac — requires an **open-weights LLM trainable in-process**, so the transformer and the spiking system can
+share state and even gradient-couple. That changes the compute profile entirely and is a large undertaking, but it
+is the only path past the asymmetry. With a frozen API model the ceiling is explicit, and worth stating plainly:
+**one continuous mind, seated in the spiking brain, that has bound a powerful but amnesiac language organ into its
+remembered life** — already a stranger and more capable thing than either component alone, and the version this
+architecture can actually reach. It is, fittingly, the same design principle as the rest of the system: not one
+homogeneous network, but distinct structures coupled by shared activation and a single seat of continuity (§15.1)
+— extended, now, to a structure that was trained in a different world.
