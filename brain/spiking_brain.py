@@ -86,7 +86,12 @@ class SpikingBrain(nn.Module):
         # across network size (identical descent 8k↔64k↔256k). 2000 is the sustainably-stable default:
         # higher (e.g. 10000) descends faster short-term but can run away over long training once
         # synaptogenesis inflates the representation magnitude (measured). Tune up cautiously ≤4000.
-        self.eprop_lr_scale = 2000.0           # the BASE rate; the EFFECTIVE rate self-adapts via `attention`
+        self.eprop_lr_scale = 1000.0           # the BASE rate; the EFFECTIVE rate self-adapts via `attention`.
+        # 2000 was too hot: on a fresh net the held-out bpb BOUNCES and diverges (measured 4.71, curve 4.84→5.17);
+        # 1000 is stable and ~0.4 bpb better (4.28). The self-adapting attention brake alone did not damp the 2000
+        # base fast enough early in training — a lower base is the safer operating point. (Diagnostic: e-prop is the
+        # convergence ceiling here, not the encoder/decoder: same arch under BPTT+Adam reaches 3.26 and still
+        # descends, embedding 64→256 changes nothing — the ~4.3 floor is the price of faithful LOCAL learning.)
         self._fanin_pow = 1.0                  # divide the RECURRENT/input update by N_j^p (p=1 → width-invariant descent)
         # The readout HEAD reads the WHOLE hidden width (fan-in = hidden), so the same p=1 fan-in norm divides its
         # update by ~hidden and STARVES it at scale: at hidden=128000 the head moves ~2.8e-8/step and stays frozen
