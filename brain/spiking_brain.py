@@ -418,14 +418,22 @@ class SpikingBrain(nn.Module):
                 z_prev = z[l]
                 z_eff = z_prev * self.stp.transmit(l, z_prev) if (getattr(self, "stp", None) is not None and self.stp.on) else z_prev  # §17
                 if sp(c):
-                    rec = spmm(c.rec_val * c.rec_mask, c.rec_col, c.rec_row, z_eff, c.hid)
-                    pre = (spmm(c.in_val * c.in_mask, c.in_col, c.in_row, layer_in, c.hid) + c.in_bias) \
-                        if c.sparse_in else c.Win(layer_in)
+                    rec = spmm(c.rec_val * c.eff_rec_mask(), c.rec_col, c.rec_row, z_eff, c.hid)   # §17 laminar-thinned
+                    if c.sparse_in:
+                        pre = spmm(c.in_val * c.eff_in_mask(), c.in_col, c.in_row, layer_in, c.hid) + c.in_bias
+                    else:
+                        _ir = getattr(c, "lam_in_row", None)
+                        pre = c.Win(layer_in) if _ir is None else c.Win(layer_in) * _ir
                 else:
-                    rec = c.Wrec(z_eff); pre = c.Win(layer_in)
+                    _rw = getattr(c, "lam_rec_w", None)
+                    rec = (z_eff @ (c.Wrec.weight * _rw).t()) if _rw is not None else c.Wrec(z_eff)
+                    _ir = getattr(c, "lam_in_row", None)
+                    pre = c.Win(layer_in) if _ir is None else c.Win(layer_in) * _ir
                 drive = pre + rec
                 if twocomp:                                    # PV fast divisive gain control + apical→soma feedback
                     apd_fwd = (ap[l] + plat[l]) if plateau else ap[l]   # §17 sustained plateau feeds forward across ticks
+                    _ag = getattr(c, "lam_apical_gain", None)           # §17 laminar: apical error → L2/3+L5 tufts, spare L4
+                    if _ag is not None: apd_fwd = apd_fwd * _ag
                     denom = intern.pv(l, z_prev.mean(1, keepdim=True), pv_g) if use_intern \
                         else (1.0 + pv_g * z_prev.mean(1, keepdim=True))   # §17 spiking PV pool OR mean-field divisive gain
                     drive = drive / denom + g_ap * apd_fwd
@@ -568,7 +576,8 @@ class SpikingBrain(nn.Module):
         self.loss_ema = 0.98 * self.loss_ema + 0.02 * L             # slow learning-health baseline
         scale = float(gate) * lr * self.attention * ((0.5 + da) if diffnm else 1.0)   # ACh gates; ATTENTION self-adapts; DA reward-modulates
         def _upd(w, g, fin, pw=p):
-            w.add_((scale * (g / (denom * float(fin) ** pw))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
+            d = (fin ** pw) if torch.is_tensor(fin) else float(fin) ** pw     # §17 per-neuron eff-fanin (tensor) or scalar
+            w.add_((scale * (g / (denom * d))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
         hpow = float(getattr(self, "head_fanin_pow", 0.5))     # gentler fan-in norm for the wide readout head
         if do_stdp:                                            # §15.18 blend the timing term into the grad BEFORE _upd:
             _lastsp = None                                     #   −Δw because _upd subtracts (so +Δw potentiates);
@@ -594,13 +603,18 @@ class SpikingBrain(nn.Module):
                     g_in[l] = g_in[l] * pg.unsqueeze(1); g_in_b[l] = g_in_b[l] * pg
         for l, c in enumerate(cells):
             if sp(c):
-                _upd(c.rec_val, g_rec[l] * c.rec_mask, c.rec_fanin)   # silent synapses get no update
+                _lrm = getattr(c, "lam_rec_mask", None)
+                if _lrm is not None:                                     # §17 laminar-thinned fan-in norm (width-invariant)
+                    _upd(c.rec_val, g_rec[l] * (c.rec_mask * _lrm), c.lam_rec_fanin[c.rec_row].to(g_rec[l].dtype))
+                else:
+                    _upd(c.rec_val, g_rec[l] * c.rec_mask, c.rec_fanin)   # silent synapses get no update
                 if c.sparse_in:
-                    _upd(c.in_val, g_in[l] * c.in_mask, c.in_fanin); _upd(c.in_bias, g_in_b[l], 1)
+                    _upd(c.in_val, g_in[l] * c.eff_in_mask(), c.in_fanin); _upd(c.in_bias, g_in_b[l], 1)
                 else:
                     _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
             else:
-                _upd(c.Wrec.weight, g_rec[l], c.Wrec.weight.shape[1])
+                _lrw = getattr(c, "lam_rec_w", None)                     # §17 laminar dense adjacency (test nets)
+                _upd(c.Wrec.weight, g_rec[l] if _lrw is None else g_rec[l] * _lrw, c.Wrec.weight.shape[1])
                 _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
         _upd(self.head.weight, gHead, self.head.weight.shape[1], pw=hpow)   # head: gentler norm so it isn't starved at width
         _upd(self.head.bias, gHead_b, 1)
@@ -823,6 +837,15 @@ class SpikingBrain(nn.Module):
             out[f"L{i}_w_absmean"] = float(w.abs().mean())
             out[f"L{i}_w_std"] = float(w.std())
         out["head_w_std"] = float(self.head.weight.detach().std())
+        if getattr(self.cells[-1], "lamina", None) is not None:            # §17 per-lamina rate + masked-edge fraction
+            tot = 0.0; masked = 0.0
+            for c in self.cells:
+                lm = getattr(c, "lam_rec_mask", None)
+                if lm is not None and hasattr(c, "rec_mask"):
+                    tot += float(c.rec_mask.sum()); masked += float((c.rec_mask & ~lm).sum())
+            out["lam_forbidden_frac"] = (masked / tot) if tot > 0 else 0.0
+            for k, val in (getattr(self, "_lam_rates", None) or {}).items():
+                out[k] = float(val)                                       # rate_L4/L23/L56 (filled live by laminar.measure)
         out["attention"] = float(getattr(self, "attention", 1.0))              # self-adapting plasticity gate
         out["eff_lr_scale"] = float(getattr(self, "eprop_lr_scale", 2000.0) * getattr(self, "attention", 1.0))
         if getattr(self, "loss_ema", None) is not None:

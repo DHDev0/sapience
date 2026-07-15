@@ -33,6 +33,7 @@ from .neuropeptides import SpikingNeuropeptides
 from .glia import SpikingGlia
 from .plateau import DendriticPlateau
 from .interneurons import SpikingInterneurons
+from .laminar import LaminarMicrocircuit
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -177,6 +178,7 @@ class BrainLife:
             self.plateau = DendriticPlateau(self.dev, dtype=next(self.brain.parameters()).dtype)  # §17 NMDA apical plateau
             if hasattr(self.brain, "_eprop_step"):                                     # §17 PV/SOM/VIP spiking pools
                 self.brain.interneurons = SpikingInterneurons(self.dev, dtype=next(self.brain.parameters()).dtype)
+            self.laminar = LaminarMicrocircuit(self.dev, dtype=self.brain.head.weight.dtype)  # §17 laminar microcircuit (default OFF)
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
                                           alpha_v=0.1, alpha_pi=0.3, seed=seed, syn_density=syn_density)  # §2
@@ -639,6 +641,14 @@ class BrainLife:
             if hasattr(self, "plateau"): p["plateau"] = self.plateau.state()         # §17 NMDA apical plateau metrics
             if getattr(self.brain, "interneurons", None) is not None:
                 p["interneurons"] = self.brain.interneurons.state()                 # §17 PV/SOM/VIP pool rates
+            if hasattr(self, "laminar"):                                            # §17 per-lamina rate + config → /api/state
+                if self.laminar.on:
+                    try:
+                        self.laminar.measure(self.brain, "".join(chr(x) for x in list(self.mind)[-256:]) or "the")
+                        self.brain._lam_rates = {k: self.laminar.state()[k] for k in ("rate_L4", "rate_L23", "rate_L56")
+                                                 if k in self.laminar.state()}
+                    except Exception: pass
+                p["laminar"] = self.laminar.state()
             p["cerebellum"] = {"eta": self.cereb_eta, "sparsity": self.cerebellum.sparsity,
                                "g_golgi": self.cerebellum.g_golgi, "thr0": self.cerebellum.thr0,
                                "syn_density": getattr(self.cerebellum, "syn_density", 1.0)}
@@ -714,6 +724,16 @@ class BrainLife:
                 applied.update(self.plateau.set_params(**p))         # §17 NMDA apical plateau live-tune + toggle `on`
             elif target == "interneurons" and self.modules_on and getattr(self.brain, "interneurons", None) is not None:
                 applied.update(self.brain.interneurons.set_params(**p))   # §17 PV/SOM/VIP spiking pools live-tune + toggle
+            elif target == "laminar" and self.modules_on and hasattr(self, "laminar"):
+                was_on = self.laminar.on
+                applied.update(self.laminar.set_params(**p))         # §17 canonical microcircuit live-tune + toggle
+                if self.laminar.on and not was_on:
+                    self.laminar.rebuild(self.brain)                 # ON: carve the flat pool into laminae
+                elif was_on and not self.laminar.on:
+                    self.laminar.clear(self.brain)                   # OFF: restore the flat pool (rec_val intact)
+                elif self.laminar.on and any(k in p for k in ("frac_L4", "frac_L23", "frac_L56", "allow_fb",
+                        "input_to_l23", "apical_l4_gain", "strict")):
+                    self.laminar.rebuild(self.brain)                 # retune: re-derive masks, no restart
             elif target == "cerebellum" and self.modules_on:
                 if "eta" in p: self.cereb_eta = float(p["eta"]); applied["eta"] = self.cereb_eta
                 if "sparsity" in p: self.cerebellum.sparsity = float(p["sparsity"]); applied["sparsity"] = self.cerebellum.sparsity
@@ -1390,6 +1410,8 @@ class BrainLife:
                     add = int(amount or (64 if is_cortex else 32))
                 if add > 0:
                     (h.grow_neurons if is_cortex else h.grow)(add)
+                    if is_cortex and getattr(self, "laminar", None) and self.laminar.on:
+                        self.laminar.rebuild(self.brain)             # §17 new neurons get laminae + masks (identity-safe)
                 applied["added_neurons"] = add
             elif op == "grow_synapses":
                 a = float(amount if amount is not None else getattr(h, "grow_syn_frac", 0.15))
@@ -1772,6 +1794,8 @@ class BrainLife:
                 if getattr(self.brain, "interneurons", None) is not None:   # §17 interneuron pool params
                     life["modules"]["interneurons"] = {k: getattr(self.brain.interneurons, k)
                                                        for k in self.brain.interneurons._KEYS}
+                if hasattr(self, "laminar"):                 # §17 laminar: config only (masks are DERIVED → rebuilt)
+                    life["modules"]["laminar"] = {k: getattr(self.laminar, k) for k in self.laminar._KEYS}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1851,6 +1875,10 @@ class BrainLife:
                     for k, v in m["plateau"].items(): setattr(self.plateau, k, v)
                 if getattr(self.brain, "interneurons", None) is not None and m.get("interneurons"):
                     self.brain.interneurons.set_params(**m["interneurons"])   # §17 restore interneuron pool params
+                if hasattr(self, "laminar") and m.get("laminar"):       # §17 restore config, then rebuild masks
+                    for k, v in m["laminar"].items(): setattr(self.laminar, k, v)
+                    if self.laminar.on:
+                        self.laminar.rebuild(self.brain)                # masks derived from lamina+A → deterministic
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)

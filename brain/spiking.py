@@ -149,8 +149,17 @@ class SparseLIFCell(nn.Module):
 
     def _rec(self, s):
         """Recurrent drive Wrec·s via the O(nnz·B)-backward custom op (no dense H² gradient)."""
-        return _SparseConnMM.apply(self.rec_val * self.rec_mask, self.rec_crow, self.rec_col,
+        return _SparseConnMM.apply(self.rec_val * self.eff_rec_mask(), self.rec_crow, self.rec_col,
                                    self.rec_row, s, self.hid)
+
+    def eff_rec_mask(self):
+        """§17 rec_mask AND the laminar adjacency mask when laminar is on (else just rec_mask → identical)."""
+        lm = getattr(self, "lam_rec_mask", None)
+        return (self.rec_mask * lm) if lm is not None else self.rec_mask
+
+    def eff_in_mask(self):
+        lm = getattr(self, "lam_in_mask", None)
+        return (self.in_mask * lm) if lm is not None else self.in_mask
 
     def _in_proj(self, x):
         """(B,T,in) → (B,T,hid). Dense Win for layer 0; a single sparse projection over all time else."""
@@ -158,7 +167,7 @@ class SparseLIFCell(nn.Module):
             return self.Win(x)
         B, T, _ = x.shape
         flat = x.reshape(-1, self.in_dim)                      # (B*T, in)
-        y = _SparseConnMM.apply(self.in_val * self.in_mask, self.in_crow, self.in_col,
+        y = _SparseConnMM.apply(self.in_val * self.eff_in_mask(), self.in_crow, self.in_col,
                                 self.in_row, flat, self.hid)
         return (y + self.in_bias).view(B, T, self.hid)
 
@@ -274,7 +283,9 @@ class LIFCell(nn.Module):
         spikes, mems = [], []
         for t in range(x.shape[1]):
             zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
-            v = self.beta * v * (1.0 - s) + pre[:, t] + self.Wrec(zt)
+            _rw = getattr(self, "lam_rec_w", None)                                       # §17 laminar dense adjacency (test nets)
+            _rec = (zt @ (self.Wrec.weight * _rw).t()) if _rw is not None else self.Wrec(zt)
+            v = self.beta * v * (1.0 - s) + pre[:, t] + _rec
             s = spike(v - self.thr)
             spikes.append(s); mems.append(v)
         return torch.stack(spikes, 1), torch.stack(mems, 1), (v, s)
@@ -326,7 +337,9 @@ class ALIFCell(nn.Module):
         spikes, mems = [], []
         for t in range(x.shape[1]):
             zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
-            v = self.beta * v * (1.0 - s) + pre[:, t] + self.Wrec(zt)
+            _rw = getattr(self, "lam_rec_w", None)                                       # §17 laminar dense adjacency (test nets)
+            _rec = (zt @ (self.Wrec.weight * _rw).t()) if _rw is not None else self.Wrec(zt)
+            v = self.beta * v * (1.0 - s) + pre[:, t] + _rec
             a = self.rho * a + s
             s = spike(v - (self.thr0 + self.beta_adapt * a))
             spikes.append(s); mems.append(v)
