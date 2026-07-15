@@ -212,8 +212,18 @@ win** — P1/P2 do no harm and have *measured non-loss* value; P0 and neurogenes
 - **Adult-DG neurogenesis** (`/api/set neurogenesis`) — built: the adult wake-phase adds DG granule cells
   (`SpikingHippocampus.grow()`, memory-preserving). A/B shows **no measured separation gain** (test saturated at
   1.00→1.00), so default OFF pending a harder regime.
-- **P3 (roadmap, NOT built):** ripple-gated sleep FSM, sequence-carrying hippocampal trace, typed PV/SOM/VIP
-  interneuron *populations* (today scalars), STDP kernel, embodiment/closed sensorimotor loop.
+**§17 gap-map (paper §17) — the missing fundamentals, now built + wired.** Twelve mechanisms a critique named as
+absent or nominal are now first-class, each **default OFF**, **live-tunable via `/api/net` (no restart)**,
+**persisted**, **metric'd**, **device/dtype/FSDP-aware**, **scale-verified at 256k**, **byte-identical when off**,
+**tested**, and **interconnected** with the existing systems (not bolted on): **embodiment** (a closed
+sensorimotor / active-inference loop in a GridWorld — the biggest gap; the world reward drives the same §5
+dopamine the cortex reads; already reaches 100 % goal-success), **predictive coding** (a third cortical rule
+`learn_rule='pc'`, Rao-Ballard/Friston — already learns, bpb 7.9→3.9), spiking **PV/SOM/VIP populations** (replace
+the mean-field scalars), hippocampal **theta sequences** (ordered replay), **STDP**, **ripple-gated
+consolidation**, **short-term plasticity**, dendritic **NMDA plateaus**, **glia/astrocytes**, **neuropeptides**
+(OXT/ORX/CRH), **laminar** L4/L2-3/L5-6 microcircuit, and **grid/place cells** + path integration. Each stays OFF
+until its earns-keep A/B shows it is load-bearing (present ≠ demonstrated); the honest per-mechanism ledger is in
+paper §17. `/api/net {target: peptides|glia|stdp|stp|plateau|interneurons|laminar|ripple|theta|embodiment|spatial|pc, on:true, ...}`.
 
 **Faithfulness stack via `/api/net`** `{target:'cortex', …}` (no restart, each independent): `learn_rule,
 feedback_mode, two_compartment, diff_neuromod, dale, dendritic, bounded_synapses, homeostasis, btsp,
