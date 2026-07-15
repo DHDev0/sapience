@@ -32,6 +32,7 @@ from .dynamics import SpikingDynamics
 from .neuropeptides import SpikingNeuropeptides
 from .glia import SpikingGlia
 from .plateau import DendriticPlateau
+from .interneurons import SpikingInterneurons
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -174,6 +175,8 @@ class BrainLife:
             self.peptides = SpikingNeuropeptides(self.dev)                             # §16 slow neuropeptide layer, companion to endocrine
             self.glia = SpikingGlia(self.dev, dtype=next(self.brain.parameters()).dtype)  # §17 astrocyte activation field
             self.plateau = DendriticPlateau(self.dev, dtype=next(self.brain.parameters()).dtype)  # §17 NMDA apical plateau
+            if hasattr(self.brain, "_eprop_step"):                                     # §17 PV/SOM/VIP spiking pools
+                self.brain.interneurons = SpikingInterneurons(self.dev, dtype=next(self.brain.parameters()).dtype)
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
                                           alpha_v=0.1, alpha_pi=0.3, seed=seed, syn_density=syn_density)  # §2
@@ -634,6 +637,8 @@ class BrainLife:
             if hasattr(self.brain, "stdp"): p["stdp"] = self.brain.stdp.state()      # §15.18 STDP timing metrics
             if hasattr(self.brain, "stp"): p["stp"] = self.brain.stp.state()         # §17 STP efficacy metrics
             if hasattr(self, "plateau"): p["plateau"] = self.plateau.state()         # §17 NMDA apical plateau metrics
+            if getattr(self.brain, "interneurons", None) is not None:
+                p["interneurons"] = self.brain.interneurons.state()                 # §17 PV/SOM/VIP pool rates
             p["cerebellum"] = {"eta": self.cereb_eta, "sparsity": self.cerebellum.sparsity,
                                "g_golgi": self.cerebellum.g_golgi, "thr0": self.cerebellum.thr0,
                                "syn_density": getattr(self.cerebellum, "syn_density", 1.0)}
@@ -707,6 +712,8 @@ class BrainLife:
                 applied.update(self.brain.stp.set_params(**p))       # §17 STP live-tune + toggle `on` (cortex mechanism)
             elif target == "plateau" and self.modules_on and hasattr(self, "plateau"):
                 applied.update(self.plateau.set_params(**p))         # §17 NMDA apical plateau live-tune + toggle `on`
+            elif target == "interneurons" and self.modules_on and getattr(self.brain, "interneurons", None) is not None:
+                applied.update(self.brain.interneurons.set_params(**p))   # §17 PV/SOM/VIP spiking pools live-tune + toggle
             elif target == "cerebellum" and self.modules_on:
                 if "eta" in p: self.cereb_eta = float(p["eta"]); applied["eta"] = self.cereb_eta
                 if "sparsity" in p: self.cerebellum.sparsity = float(p["sparsity"]); applied["sparsity"] = self.cerebellum.sparsity
@@ -1762,6 +1769,9 @@ class BrainLife:
                     life["modules"]["stp"] = {k: getattr(self.brain.stp, k) for k in self.brain.stp._KEYS}
                 if hasattr(self, "plateau"):                 # §17 NMDA apical plateau: all tunable params
                     life["modules"]["plateau"] = {k: getattr(self.plateau, k) for k in self.plateau._KEYS}
+                if getattr(self.brain, "interneurons", None) is not None:   # §17 interneuron pool params
+                    life["modules"]["interneurons"] = {k: getattr(self.brain.interneurons, k)
+                                                       for k in self.brain.interneurons._KEYS}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1839,6 +1849,8 @@ class BrainLife:
                     self.brain.stp.set_params(**m["stp"])
                 if hasattr(self, "plateau") and m.get("plateau"):       # §17 restore NMDA apical plateau params
                     for k, v in m["plateau"].items(): setattr(self.plateau, k, v)
+                if getattr(self.brain, "interneurons", None) is not None and m.get("interneurons"):
+                    self.brain.interneurons.set_params(**m["interneurons"])   # §17 restore interneuron pool params
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)

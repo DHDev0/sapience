@@ -52,7 +52,8 @@ def test_rates_dynamic_range():
     # exactly what the A/B health-check flags; see risk #1).
     for _ in range(6):
         it.pv(0, torch.full((B, 1), 0.1), pv_g=0.3)
-        it.apical(0, torch.full((B, 1), 0.1), gate=0.1, som_b=0.5)
+        it.apical(0, torch.full((B, 1), 0.1), gate=1.0, som_b=0.5)   # ACh 'learn-now' tone ≈1.0 (real regime);
+        #                                                              k_vip=0.1 puts I_vip≈0.1 in the graded band
     st = it.state()
     for k in ("rate_pv", "rate_som", "rate_vip"):
         assert 0.0 <= st[k] <= 1.0, (k, st[k])

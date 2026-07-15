@@ -351,6 +351,9 @@ class SpikingBrain(nn.Module):
         g_ap = float(getattr(self, "g_ap", 0.15)); beta_ap = float(getattr(self, "beta_ap", 0.9))
         som_b = float(getattr(self, "som_baseline", 0.5)); pv_g = float(getattr(self, "pv_gain", 0.3))
         ap = [torch.zeros(B, c.hid, device=dev) for c in cells] if twocomp else None   # apical dendrite state
+        intern = getattr(self, "interneurons", None)           # §17 spiking PV/SOM/VIP pools (controller)
+        use_intern = twocomp and intern is not None and getattr(intern, "on", False)
+        if use_intern: intern.begin(B, ref=v[0])               # capture device/dtype, reset per-step membranes
         # differentiated neuromodulation: the 4 tones gate 4 distinct pathways (else one scalar `gate`=ACh).
         diffnm = getattr(self, "diff_neuromod", False) and isinstance(tone, dict)
         da = float(tone.get("da", 0.5)) if diffnm else 0.5     # DA → reward-modulated plasticity magnitude
@@ -423,7 +426,9 @@ class SpikingBrain(nn.Module):
                 drive = pre + rec
                 if twocomp:                                    # PV fast divisive gain control + apical→soma feedback
                     apd_fwd = (ap[l] + plat[l]) if plateau else ap[l]   # §17 sustained plateau feeds forward across ticks
-                    drive = drive / (1.0 + pv_g * z_prev.mean(1, keepdim=True)) + g_ap * apd_fwd
+                    denom = intern.pv(l, z_prev.mean(1, keepdim=True), pv_g) if use_intern \
+                        else (1.0 + pv_g * z_prev.mean(1, keepdim=True))   # §17 spiking PV pool OR mean-field divisive gain
+                    drive = drive / denom + g_ap * apd_fwd
                 if diffnm: drive = drive * ne_gain             # NE sets somatic gain (surprise/attention)
                 v[l] = c.beta * v[l] * (1.0 - z_prev) + drive
                 if al[l]:
@@ -479,9 +484,13 @@ class SpikingBrain(nn.Module):
             for l, c in enumerate(cells):
                 Lsig = err @ self._fb[l].float()               # top-down learning signal (random or learned B)
                 if twocomp:                                    # UNIFIED apical circuit — error runs THROUGH the
-                    vip = float(gate)                          # apical dendrite, not alongside it:
-                    som = som_b * z[l].mean(1, keepdim=True)    #  SOM inhibition ∝ population activity, and
-                    agate = (vip - som).clamp(min=0.0)         #  VIP (neuromod "learn-now" tone) DISINHIBITS it
+                    if use_intern:                             # §17 spiking PV/SOM/VIP pools replace the scalars
+                        agate = intern.apical(l, z[l].mean(1, keepdim=True),
+                                              (tone.get("ach", gate) if diffnm else gate), som_b)
+                    else:
+                        vip = float(gate)                      # apical dendrite, not alongside it:
+                        som = som_b * z[l].mean(1, keepdim=True)   #  SOM inhibition ∝ population activity, and
+                        agate = (vip - som).clamp(min=0.0)     #  VIP (neuromod "learn-now" tone) DISINHIBITS it
                     ap[l] = beta_ap * ap[l] + agate * Lsig     #  → the apical compartment integrates the gated error
                     if plateau:                                #  §17 NMDA plateau: all-or-none, regenerative, latched
                         thr_p = p_thr * (ap[l].abs().mean(1, keepdim=True) + 1e-9)          # RELATIVE (width-invariant)
@@ -618,6 +627,7 @@ class SpikingBrain(nn.Module):
         if astro_on:                                           # §17 per-neuron rate r_l=(Σ_{b,t}z)/(B·T) for glia.sense()
             self._spk_rate_vec = [astro_zsum[l] / float(B * T) for l in range(len(cells))]
         if twocomp: self._apical_mag = float(ap[-1].abs().mean())   # apical-dendrite drive magnitude
+        if use_intern: self._intern_rates = intern.state()          # §17 cache per-type spiking rates for weight_stats
         if plateau:                                                 # §17 write back plateau metrics (apical_mag on apd)
             self._plateau_rate = plat_rate; pl._last_rate = plat_rate
             self._apical_mag = apd_top_mag
@@ -830,6 +840,10 @@ class SpikingBrain(nn.Module):
             out["apical_mag"] = float(getattr(self, "_apical_mag", 0.0))       # apical-dendrite drive
             if getattr(self, "_plateau", None) is not None and self._plateau.on:
                 out["plateau_rate"] = float(getattr(self, "_plateau_rate", 0.0))   # §17 NMDA plateau active fraction
+            if getattr(self, "interneurons", None) is not None and self.interneurons.on:
+                r = getattr(self, "_intern_rates", {})                        # §17 spiking PV/SOM/VIP population rates
+                out["intern_pv"] = r.get("rate_pv", 0.0); out["intern_som"] = r.get("rate_som", 0.0)
+                out["intern_vip"] = r.get("rate_vip", 0.0)
         if getattr(self, "homeostasis", False) and getattr(self, "_thr_adapt", None):
             out["homeo_thr_mean"] = float(torch.cat(self._thr_adapt).mean())   # homeostatic threshold drift
         if getattr(self, "bounded_synapses", False):                          # fraction of synapses saturated

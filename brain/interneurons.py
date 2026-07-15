@@ -55,9 +55,12 @@ class SpikingInterneurons:
         # has a real-but-short interneuron time constant, not a stale one.
         self.beta_i = 0.8
         self.thr_pv = 0.5; self.thr_som = 0.5; self.thr_vip = 0.5
-        self.k_pv = 1.0; self.k_vip = 1.0      # feedforward drive gains onto PV / VIP
-        self.w_vip_som = 1.0                    # VIP⊣SOM disinhibitory synapse (the biology the scalar faked)
-        self.het = 0.1                          # per-neuron heterogeneity magnitude (desynchronizes the pool)
+        # feedforward drive gains onto PV / VIP. With leak beta_i=0.8 the steady-state membrane is I/(1-beta_i)=5·I,
+        # so a raw gate≈1.0 would saturate VIP (r=1); k_vip=0.1 puts the drive in the threshold band → GRADED firing
+        # (calibrated so the pool sits in a live dynamic range, not pinned at r=1 — the reviewer's saturation flag).
+        self.k_pv = 1.0; self.k_vip = 0.1
+        self.w_vip_som = 0.1                    # VIP⊣SOM disinhibitory synapse (scaled to the graded VIP rate)
+        self.het = 0.2                          # per-neuron heterogeneity magnitude (widened → graded, desync pool)
         # transient per-step state (rebuilt in begin())
         self._m = {}                            # (kind,l) -> (v,z) membrane+spike, shape (B,K)
         self._h = {}                            # (kind,K,device,dtype) -> heterogeneity bias (K,)  [cached]
