@@ -61,16 +61,17 @@ def test_rates_dynamic_range():
 
 
 # ---- (4) device/dtype propagation from ref --------------------------------------------------------------
-@pytest.mark.parametrize("dt", [torch.float32, torch.float64, torch.bfloat16])
-def test_dtype_propagation(dt):
-    it = SpikingInterneurons(); it.set_params(on=True)
-    B = 4; ref = _ref(dt); it.begin(B, ref)
-    denom = it.pv(0, torch.rand(B, 1, dtype=dt), pv_g=0.3)
-    agate = it.apical(0, torch.rand(B, 1, dtype=dt), gate=1.0, som_b=0.5)
-    assert denom.dtype == dt and agate.dtype == dt
-    assert denom.device == ref.device and agate.device == ref.device
-    h = it._het("pv", it.n_pv)                      # heterogeneity materialized on ref device/dtype
-    assert h.dtype == dt and h.device == ref.device
+def test_dtype_propagation():
+    # loop internally (not @parametrize) so BOTH pytest and the canonical run_tests.py runner exercise it
+    for dt in (torch.float32, torch.float64, torch.bfloat16):
+        it = SpikingInterneurons(); it.set_params(on=True)
+        B = 4; ref = _ref(dt); it.begin(B, ref)
+        denom = it.pv(0, torch.rand(B, 1, dtype=dt), pv_g=0.3)
+        agate = it.apical(0, torch.rand(B, 1, dtype=dt), gate=1.0, som_b=0.5)
+        assert denom.dtype == dt and agate.dtype == dt
+        assert denom.device == ref.device and agate.device == ref.device
+        h = it._het("pv", it.n_pv)                      # heterogeneity materialized on ref device/dtype
+        assert h.dtype == dt and h.device == ref.device
 
 
 # ---- (5) width-invariance: pool tensors identical across cortex hidden width -----------------------------

@@ -41,8 +41,15 @@ def main():
             if not callable(fn):
                 continue
             try:
+                import inspect
+                sig = inspect.signature(fn)
+                if any(p.default is inspect._empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                       for p in sig.parameters.values()):
+                    print(f"  \033[33m·\033[0m {name} (parametrized — run under pytest)"); continue   # needs args → pytest
                 fn(); print(f"  \033[32m✓\033[0m {name}"); passed += 1
             except Exception as e:
+                if type(e).__name__ in ("Skipped", "OutcomeException"):   # a pytest.skip → not a failure
+                    print(f"  \033[33m·\033[0m {name} (skipped)"); continue
                 print(f"  \033[31m✗ {name}\033[0m — {e}")
                 traceback.print_exc()
                 failed += 1; fails.append(f"{f}::{name}")
