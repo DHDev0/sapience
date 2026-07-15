@@ -374,6 +374,7 @@ class BrainLife:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr
             if glia is not None and glia.on:            # §17 slow-integrate this step's per-neuron firing rate
                 glia.sense(getattr(self.brain, "_spk_rate_vec", None))
+                glia.sense_mem(getattr(self.brain, "_mem_mag_vec", None))   # §17 + ABSOLUTE membrane-|v| runaway channel
             if isinstance(r, tuple):                    # (first_loss, last_loss): free progress
                 progress = max(0.0, r[0] - r[1])
             if (endo is not None and endo.on) or (pep is not None and pep.on):

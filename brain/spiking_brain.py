@@ -125,6 +125,13 @@ class SpikingBrain(nn.Module):
         self.attn_sensitivity = 0.8            # how sharply attention drops with above-baseline loss
         self.attn_rate_sens = 0.25             # how sharply attention drops when firing runs > 2× the homeostatic
                                                # target (the over-excitation brake; loss-blind drift protection)
+        self.attn_mem_sens = 0.5               # how sharply attention drops when the TOP-layer membrane magnitude
+                                               # |v| runs above mem_target — a REPRESENTATION runaway that the
+                                               # rate/loss brakes are blind to (mem_mag inflates while firing sits
+                                               # on the homeostatic target). 0 disables (byte-identical to before).
+        self.mem_target = 1.0                  # absolute |v| anchor: healthy top-membrane mem_mag < 1; bpb explodes
+                                               #   past ~1.5. FIXED (not a self-following EMA) so a slow drift cannot
+                                               #   escape it the way glia.auto_target normalises its rate reference.
         # e-prop's top-down error path (§15.16). "learned" (DEFAULT) = Kolen-Pollack: the feedback
         # matrix B gets the SAME local gradient as the readout head (+ tiny decay), so it LEARNS to
         # align with the forward weights — no weight transport, strictly more faithful than fixed random.
@@ -144,11 +151,33 @@ class SpikingBrain(nn.Module):
         self.burst_thr = 0.5                   # apical-burst threshold (fraction of mean |L|) when dendritic
         # More faithfulness constraints (§15.16, each INDEPENDENTLY toggleable + measured; all cost some
         # capability — that is the point of the fidelity↔capability curve). See set_faith()/faith_config().
-        self.bounded_synapses = False          # Fusi bounded synapses: weights clamped to ±w_max (real
-        self.w_max = 1.0                       #   synapses are bounded + low-precision → stability/forgetting)
+        self.bounded_synapses = False          # Fusi bounded synapses: weights clamped so they can't PUMP the
+        self.w_max = 3.0                       #   membrane. Fan-in-RELATIVE by default (bound = w_max/√fanin): the
+        self.w_max_relative = True             #   clamp scales like the init (1/√fanin), holding the recurrent map
+        #   near its STABLE init spectral radius at ANY width. A fixed ±1 is ~32× the dense init (≈0.031) and ~8× the
+        #   sparse init (≈0.125) → NON-binding, so under Dale/coherent learning the recurrence v←β·v·(1−z)+W·z can
+        #   reach ρ(W)≫1/β and go unstable, inflating |v| (the everything-on mem_mag runaway) while every weight sits
+        #   legally inside ±1. 3× init = ample learning headroom yet bounded; lower toward ~2 for a hard ρ<1/β
+        #   guarantee, raise if descent stalls. Absolute ±w_max when w_max_relative=False (byte-identical legacy).
         self.homeostasis = False               # intrinsic firing-rate homeostasis (metaplasticity): each
         self.target_rate = 0.08                #   neuron's threshold drifts to hold a target spike rate
         self.homeo_lr = 0.02                   #   (Turrigiano) — keeps a continual net off silence/saturation
+        # MEMBRANE-MAGNITUDE intrinsic homeostasis (§HARM). Threshold homeostasis regulates the spike RATE, but the
+        # everything-on collapse is a |v| runaway with the rate pinned ON target, so the rate channel is blind to it;
+        # worse, RAISING thr to hold the rate INFLATES the membrane (mem_mag≈0.57·thr) — thr_adapt climbing is a
+        # co-symptom, not a brake. This adds a second homeostatic term on the SAME threshold: when a neuron's mean
+        # |v| exceeds mem_homeo_target it LOWERS the threshold so the neuron fires and RESETS, discharging v through
+        # its own reset (the membrane's natural clamp) — the correct-sign actuator that needs NO change to the leak
+        # β / integration τ (a substrate change de-calibrates the readout, measured to break learning). The RATE
+        # channel is the restoring force (more firing → it raises thr back), so the two settle at a slightly-above-
+        # target rate that pins |v|≈mem_homeo_target. relu(|v|/target−1) ⇒ 0 while |v|≤target ⇒ byte-identical when
+        # quiescent; the default target 3.0 sits ABOVE the healthy high-|v| operating band (homeostasis-alone runs
+        # stably at |v|≈2–2.5 and still learns) so it engages only on a genuine runaway, not on a stably-elevated
+        # membrane. Complements the attention membrane-brake above (that throttles dW; this discharges v).
+        self.mem_homeostasis = True            #   membrane-magnitude channel of intrinsic homeostasis (threshold actuator)
+        self.mem_homeo_target = 3.0            #   |v| setpoint for the magnitude channel; ABOVE the healthy band (byte-id below it)
+        self.mem_homeo_lr = 0.05               #   integral gain of the magnitude→threshold term (drift-coupled via `excess`)
+        self.homeo_lr_drift = 0.0              #   optional: scale the RATE homeo gain by |rate−target| (0=off, byte-id)
         self.btsp = False                      # behavioral-timescale plasticity (Bittner–Magee): the
         self.btsp_beta = 0.98                  #   eligibility trace outlives the membrane (seconds-long
         #   credit window) — decouples the eligibility decay from the membrane decay c.beta.
@@ -403,6 +432,7 @@ class SpikingBrain(nn.Module):
         btsp = getattr(self, "btsp", False)                    # long (behavioral-timescale) eligibility?
         ebeta = float(getattr(self, "btsp_beta", 0.98))
         homeo = getattr(self, "homeostasis", False)            # intrinsic firing-rate homeostasis?
+        mem_homeo = homeo and bool(getattr(self, "mem_homeostasis", True))   # §HARM membrane-magnitude threshold channel
         bounded = getattr(self, "bounded_synapses", False)     # Fusi bounded weights?
         twocomp = getattr(self, "two_compartment", False)      # UNIFIED apical/interneuron/neuromod circuit?
         g_ap = float(getattr(self, "g_ap", 0.15)); beta_ap = float(getattr(self, "beta_ap", 0.9))
@@ -436,7 +466,9 @@ class SpikingBrain(nn.Module):
         astro_pg = getattr(self, "_astro_pgain", None)         # §17 glia: per-post-neuron metaplastic gain (list[H_l] or None)
         astro_mm = float(getattr(self, "_astro_metab_mult", 1.0) or 1.0)   # glia metabolic-scarcity multiplier on mlam
         astro_on = bool(getattr(self, "_astro_on", False))     # accumulate per-neuron rate for glia.sense() (off-cost-free)
-        if astro_on: astro_zsum = [torch.zeros(c.hid, device=dev) for c in cells]
+        if astro_on:                                           # §17 per-neuron accumulators for glia.sense()/sense_mem()
+            astro_zsum = [torch.zeros(c.hid, device=dev) for c in cells]   # firing (rate channel)
+            astro_vsum = [torch.zeros(c.hid, device=dev) for c in cells]   # |v| (ABSOLUTE membrane-runaway channel)
         if homeo:
             self._ensure_homeo(); spk_sum = [torch.zeros(c.hid, device=dev) for c in cells]
         lr = self.lr * (float(self.pc.pc_lr_scale) if pc else getattr(self, "eprop_lr_scale", 2000.0))
@@ -509,7 +541,9 @@ class SpikingBrain(nn.Module):
                 vfire = v[l] + snoise * torch.randn_like(v[l]) if stoch else v[l]   # stochastic (noisy) firing
                 psi_l = self._psi(vfire - thr); z[l] = (vfire >= thr).float()
                 if homeo: spk_sum[l] = spk_sum[l] + z[l].sum(0)
-                if astro_on: astro_zsum[l] = astro_zsum[l] + z[l].sum(0)   # §17 per-neuron firing accumulator for glia
+                if astro_on:                                   # §17 per-neuron accumulators for glia
+                    astro_zsum[l] = astro_zsum[l] + z[l].sum(0)               # firing (rate channel)
+                    astro_vsum[l] = astro_vsum[l] + v[l].abs().sum(0)         # |v| membrane magnitude (runaway channel)
                 eb = ebeta if btsp else c.beta                 # BTSP: eligibility outlives the membrane
                 dyn_eb = getattr(self, "_dyn_elig_beta", None)  # §16 P2: attention→FREQUENCY sets the window
                 if dyn_eb is not None: eb = float(dyn_eb)       #   (gamma-short when focused, alpha-long when not)
@@ -639,7 +673,19 @@ class SpikingBrain(nn.Module):
             rate = float(spk_sum[-1].sum()) / (float(B * T) * float(cells[-1].hid))   # top-layer mean firing rate
             over = min(3.0, max(0.0, rate / max(float(getattr(self, "target_rate", 0.08)), 1e-3) - 2.0))
         rate_sens = float(getattr(self, "attn_rate_sens", 0.25))
-        attn_t = min(1.3, max(0.2, 1.0 - sens * surprise - rate_sens * over))   # loss-shock OR over-firing → less plasticity
+        # MEMBRANE-MAGNITUDE brake: the over-firing and loss-surprise terms both watch SPIKE statistics, but the
+        # everything-on collapse is a REPRESENTATION-magnitude runaway — |v| (the head's input at line 545, and the
+        # `mem_mag` diagnostic below) inflates ~10× while the mean firing rate is pinned on the homeostatic target,
+        # so `over`≈0 and `surprise`≈0 stay mute until AFTER bpb detonates. mem_mag = mean |v| of the TOP membrane is
+        # the leading indicator (climbs before bpb), so fold it into the brake against a FIXED absolute anchor
+        # mem_target — NOT a self-following EMA, which would calibrate the runaway away exactly as glia.auto_target
+        # does. This pulls plasticity down the moment the representation runs away, throttling the
+        # weight→drive→|v|→BTSP-eligibility→weight pump at its growth source. Membrane-magnitude, so it engages even
+        # when firing stays on target; live-tunable via attn_mem_sens (0 disables → byte-identical to the old brake).
+        mem_mag = float(v[-1].abs().mean())    # top-layer representation magnitude (same as the _diag mem_mag below)
+        mem_sens = float(getattr(self, "attn_mem_sens", 0.5))
+        over_mem = min(3.0, max(0.0, mem_mag / max(float(getattr(self, "mem_target", 1.0)), 1e-3) - 1.0))
+        attn_t = min(1.3, max(0.2, 1.0 - sens * surprise - rate_sens * over - mem_sens * over_mem))   # loss-shock OR over-firing OR membrane-runaway → less plasticity
         cur_at = float(getattr(self, "attention", 1.0))
         aw = 0.3 if attn_t < cur_at else 0.1        # ASYMMETRIC: brake FAST (safety-biased), release SLOW — so an
         self.attention = (1.0 - aw) * cur_at + aw * attn_t   # over-firing/loss signal pulls the rate down promptly, not over ~10 steps
@@ -715,22 +761,50 @@ class SpikingBrain(nn.Module):
                 if he_on: _updh(self._fb[l], G, float(v_energy[l]) / denom)   # B_l gets v[l]'s OWN energy → stays aligned
                 else:     _upd(self._fb[l], G, self._fb[l].shape[1], pw=hpow)
                 self._fb[l].mul_(1.0 - fb_dec)
-        if bounded:                                            # Fusi bounded synapses: clamp to ±w_max
-            wm = float(getattr(self, "w_max", 1.0))
-            for c in cells:
-                if sp(c):
-                    c.rec_val.data.clamp_(-wm, wm)
-                    if c.sparse_in: c.in_val.data.clamp_(-wm, wm)
+        if bounded:                                            # Fusi bounded synapses: clamp the MEMBRANE-FEEDING
+            for c in cells:                                    # weights so the recurrent map can't pump |v| unbounded.
+                if sp(c):                                      # Bound is fan-in-RELATIVE (÷√fanin) → width-invariant,
+                    rb = self._syn_bound(c.rec_fanin); c.rec_val.data.clamp_(-rb, rb)          # near the stable init.
+                    if c.sparse_in:
+                        ib = self._syn_bound(c.in_fanin); c.in_val.data.clamp_(-ib, ib)
                 else:
-                    c.Wrec.weight.data.clamp_(-wm, wm); c.Win.weight.data.clamp_(-wm, wm)
-        if homeo:                                              # intrinsic homeostasis: threshold → target rate
+                    rb = self._syn_bound(c.Wrec.weight.shape[1]); c.Wrec.weight.data.clamp_(-rb, rb)   # fanin = hidden
+                    ib = self._syn_bound(c.Win.weight.shape[1]); c.Win.weight.data.clamp_(-ib, ib)
+            if twocomp and getattr(self, "_fb", None) is not None:   # APICAL COUPLING: bound the learned error-
+                for B_l in self._fb:                                 # projection B that drives ap[l] — under two_
+                    fb_b = self._syn_bound(B_l.shape[0]); B_l.clamp_(-fb_b, fb_b)   # compartment Kolen-Pollack grows
+                    #   B unbounded (only 1e-4 decay) → apical-loop gain g_ap·apd runaway; B is (V,hid), init 1/√V.
+        if homeo:                                              # intrinsic homeostasis: RATE→threshold(+) + MAGNITUDE→threshold(−)
+            _mdrift = float(getattr(self, "homeo_lr_drift", 0.0))
+            _mtgt = max(float(getattr(self, "mem_homeo_target", 3.0)), 1e-3)
+            _mlr = float(getattr(self, "mem_homeo_lr", 0.05))
             for l in range(len(cells)):
-                self._thr_adapt[l] += self.homeo_lr * (spk_sum[l] / float(B * T) - float(self.target_rate))
+                rerr = spk_sum[l] / float(B * T) - float(self.target_rate)          # per-neuron rate error
+                elr = self.homeo_lr                                                 # RATE channel → threshold (existing)
+                if _mdrift > 0.0:                                                   # drift-adaptive gain: raise thr FASTER when the
+                    elr = self.homeo_lr * (1.0 + _mdrift * float(rerr.abs().mean()) / max(float(self.target_rate), 1e-3))
+                self._thr_adapt[l] += elr * rerr                                    #   rate is far from target (catch a fast runaway)
+                if mem_homeo:
+                    # MAGNITUDE channel: the everything-on collapse is a REPRESENTATION-WIDE |v| runaway (the LAYER-
+                    # MEAN mem_mag inflates) that the rate channel is blind to (|v| grows with rate on target); worse,
+                    # raising thr to hold rate INFLATES |v|. Key on the LAYER MEAN (= the mem_mag runaway metric), NOT
+                    # per-neuron: a healthy sparse code has a high-|v| TAIL but a low mean, so per-neuron triggering
+                    # would brake healthy neurons — the layer mean fires only when the whole representation runs away.
+                    # When it does, LOWER the threshold (uniformly across the layer) so over-driven neurons fire and
+                    # RESET, discharging v through its OWN reset (the membrane's natural clamp) — the correct-sign
+                    # actuator that needs NO change to the leak β / integration τ (a substrate change de-calibrates
+                    # the readout, measured to break learning). The RATE channel is the restoring force (more firing →
+                    # it raises thr back), so the two settle at a slightly-above-target rate that pins the mean
+                    # |v|≈mem_homeo_target. relu ⇒ 0 while mean|v|≤target ⇒ byte-identical when quiescent; the default
+                    # target 3.0 sits ABOVE the healthy high-|v| operating band so it fires only on a genuine runaway.
+                    excess = max(0.0, float(v[l].abs().mean()) / _mtgt - 1.0)
+                    if excess > 0.0: self._thr_adapt[l] -= _mlr * excess
         if getattr(self, "dale", False):
             self._project_dale()                               # re-impose E/I sign law after the update
         self._burst_frac = burst_frac
         if astro_on:                                           # §17 per-neuron rate r_l=(Σ_{b,t}z)/(B·T) for glia.sense()
             self._spk_rate_vec = [astro_zsum[l] / float(B * T) for l in range(len(cells))]
+            self._mem_mag_vec = [astro_vsum[l] / float(B * T) for l in range(len(cells))]   # per-neuron |v| for glia.sense_mem()
         if twocomp: self._apical_mag = float(ap[-1].abs().mean())   # apical-dendrite drive magnitude
         if use_intern: self._intern_rates = intern.state()          # §17 cache per-type spiking rates for weight_stats
         if plateau:                                                 # §17 write back plateau metrics (apical_mag on apd)
@@ -753,6 +827,8 @@ class SpikingBrain(nn.Module):
             surprise=float(surprise),
             rec_w_mag=float(_ct.rec_val.abs().mean() if sp(_ct) else _ct.Wrec.weight.abs().mean()),
         )
+        if mem_homeo:                                          # §HARM magnitude-channel engagement: mean thr offset (≤0 = discharging)
+            self._diag["mem_thr"] = float(self._thr_adapt[-1].mean())
         if he_on:                                              # §NLMS truthful head diagnostics: head_w_std stays ≈1/√N
             self._diag["head_dlogit"] = float(mu * err.abs().mean())   # BY DESIGN (wrong health signal) — watch head_dlogit
             self._diag["head_energy"] = float(meanE)                   # (~μ·err, width-free) + bpb + fb_align_cos instead
@@ -974,9 +1050,10 @@ class SpikingBrain(nn.Module):
         if getattr(self, "homeostasis", False) and getattr(self, "_thr_adapt", None):
             out["homeo_thr_mean"] = float(torch.cat(self._thr_adapt).mean())   # homeostatic threshold drift
         if getattr(self, "bounded_synapses", False):                          # fraction of synapses saturated
-            wm = float(getattr(self, "w_max", 1.0)); c0 = self.cells[0]
-            w0 = (c0.rec_val if self._is_sparse(c0) else c0.Wrec.weight).detach().abs()
-            out["synapse_sat_frac"] = float((w0 >= 0.999 * wm).float().mean())
+            c0 = self.cells[0]                                                 # (vs the EFFECTIVE fan-in-relative bound)
+            if self._is_sparse(c0): w0 = c0.rec_val.detach().abs(); bnd = self._syn_bound(c0.rec_fanin)
+            else:                   w0 = c0.Wrec.weight.detach().abs(); bnd = self._syn_bound(c0.Wrec.weight.shape[1])
+            out["synapse_sat_frac"] = float((w0 >= 0.999 * bnd).float().mean())
         if getattr(self, "stp", None) is not None and self.stp.on:
             out["stp_efficacy"] = float(self.stp.mean_efficacy)   # §17 headline metric (≈1 rest, <1 depress, >1 facil)
         return out
@@ -1000,8 +1077,10 @@ class SpikingBrain(nn.Module):
     # The faithfulness stack (§15.16): each biological constraint is an INDEPENDENT toggle (extends the
     # learn_rule switch), so its capability cost can be measured on the fidelity↔capability curve.
     _FAITH_KEYS = ("learn_rule", "eprop_lr_scale", "head_fanin_pow", "attn_sensitivity", "attn_rate_sens",
-                   "feedback_mode", "fb_decay", "dale", "dendritic", "burst_thr", "bounded_synapses", "w_max",
-                   "homeostasis", "target_rate", "homeo_lr", "btsp", "btsp_beta", "two_compartment", "g_ap",
+                   "attn_mem_sens", "mem_target",
+                   "feedback_mode", "fb_decay", "dale", "dendritic", "burst_thr", "bounded_synapses", "w_max", "w_max_relative",
+                   "homeostasis", "target_rate", "homeo_lr", "mem_homeostasis", "mem_homeo_target", "mem_homeo_lr", "homeo_lr_drift",
+                   "btsp", "btsp_beta", "two_compartment", "g_ap",
                    "beta_ap", "som_baseline", "pv_gain", "diff_neuromod", "stochastic", "spike_noise", "metabolic",
                    "metabolic_lambda", "stdp", "head_norm", "head_lr_scale", "head_energy_eps")
 
@@ -1028,10 +1107,11 @@ class SpikingBrain(nn.Module):
                 elif isinstance(cur, float): v = float(v)
                 if k == "eprop_lr_scale":                  # clamp numeric hyperparams to sane ranges
                     v = max(0.1, v)
-                elif k == "w_max":
+                elif k in ("w_max", "mem_target", "mem_homeo_target"):   # strictly positive (these divide in a brake)
                     v = max(1e-3, v)
                 elif k in ("target_rate", "homeo_lr", "pv_gain", "g_ap", "fb_decay", "burst_thr", "head_fanin_pow",
                            "som_baseline", "spike_noise", "metabolic_lambda", "attn_sensitivity", "attn_rate_sens",
+                           "attn_mem_sens", "mem_homeo_lr", "homeo_lr_drift",
                            "head_lr_scale", "head_energy_eps"):
                     v = max(0.0, v)
                 elif k in ("btsp_beta", "beta_ap"):
@@ -1044,6 +1124,17 @@ class SpikingBrain(nn.Module):
     def faith_config(self):
         """The current state of every faithfulness toggle/hyperparameter — the fidelity axis settings."""
         return {k: (self.stdp.on if k == "stdp" else getattr(self, k, None)) for k in self._FAITH_KEYS}
+
+    def _syn_bound(self, fanin):
+        """Fusi bounded-synapse clamp bound for a weight tensor with the given post-neuron fan-in.
+        Fan-in-RELATIVE by default: w_max × (1/√fanin) — the clamp then scales like the init (1/√fanin),
+        so the SUMMED recurrent drive Σ_i W_ji·z_i (hence the membrane fixed point v*≈drive/(1−β)) and the
+        recurrent operator's spectral radius stay O(1) at ANY width, held near the stable init regime rather
+        than the ~32×-init headroom a fixed ±1 permits. Absolute ±w_max when w_max_relative=False."""
+        wm = float(getattr(self, "w_max", 3.0))
+        if bool(getattr(self, "w_max_relative", True)):
+            return wm / max(1.0, float(fanin)) ** 0.5
+        return wm
 
     def _ensure_homeo(self):
         """Per-neuron intrinsic-threshold offset for firing-rate homeostasis (metaplasticity). Grows

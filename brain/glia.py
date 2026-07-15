@@ -47,7 +47,8 @@ import torch
 
 
 class SpikingGlia:
-    _KEYS = ("on", "tau_a", "k_p", "k_g", "k_m", "rho_clear", "target_rate", "auto_target")
+    _KEYS = ("on", "tau_a", "k_p", "k_g", "k_m", "rho_clear", "target_rate", "auto_target",
+             "v_ref", "k_v", "tau_v")
 
     def __init__(self, device=None, dtype=None):
         self.device = device
@@ -73,6 +74,20 @@ class SpikingGlia:
         self.auto_target = True                 # self-calibrate the reference to the observed rate EMA
         self.rate_ema_beta = 0.002              # baseline EMA rate (τ≈500 ticks, slower than tau_a so a can excurse)
         self._rate_ema = None                   # running population mean-rate baseline (built on first sense)
+        # --- ABSOLUTE membrane-magnitude channel (the runaway the rate field is BLIND to) -----------------
+        # The everything-on collapse is a REPRESENTATION-magnitude (|v|) runaway: a neuron can inflate its
+        # membrane 10× while still emitting a binary spike ≤1, so the rate field `a` (and thus all three rate
+        # outputs) never sees it. Worse, `a`'s reference self-calibrates (auto_target), which would normalise a
+        # runaway away. So we add a SECOND per-neuron field av_l = EMA(|v|_l / v_ref) with an ABSOLUTE, NON-
+        # self-calibrated reference v_ref: healthy training runs at |v|<1 (av<1 ⇒ relu(av−1)=0 ⇒ every gain
+        # neutral — normal learning is untouched), and only a true runaway (|v|≳v_ref) drives av>1, which brakes
+        # global_gain<1, pushes per-neuron pgain down, and raises the metabolic price. Faster timescale tau_v so
+        # the brake TRACKS the ~hundreds-of-ticks-per-doubling runaway instead of lagging it like tau_a. The rate
+        # channel keeps auto_target for normal-regime drift; this channel is the absolute runaway backstop.
+        self.av = []                            # list[Tensor(H_l)] membrane-magnitude field (baseline 0.0 = neutral)
+        self.v_ref = 1.0                        # ABSOLUTE healthy-|v| anchor (NOT self-calibrated); >1 ⇒ runaway
+        self.k_v = 1.0                          # membrane-channel master gain (0 ⇒ whole channel off; into global_gain/pgain/metab)
+        self.tau_v = 40.0                       # membrane-field timescale (~10× faster than tau_a → tracks the runaway)
 
     # ---- field maintenance ------------------------------------------- #
     def ensure_width(self, hids):
@@ -114,6 +129,37 @@ class SpikingGlia:
             ratio = (r.detach().to(self.a[l].device, self.a[l].dtype)) / tr   # dimensionless activity ratio
             self.a[l] = (1.0 - inv) * self.a[l] + inv * ratio
 
+    def _ensure_av(self):
+        """Keep the membrane field av on the SAME per-neuron partition as a (pad new/grown neurons with the
+        neutral baseline 0.0, trim on shrink). Covers first-build, grow(), and checkpoints that predate the
+        membrane channel — an older field restores with a neutral av (no brake until |v| actually excurses)."""
+        while len(self.av) < len(self.a):
+            l = len(self.av)
+            self.av.append(torch.zeros(self.a[l].numel(), device=self.a[l].device, dtype=self.a[l].dtype))
+        for l in range(len(self.a)):
+            n = self.a[l].numel()
+            if self.av[l].numel() < n:
+                pad = torch.zeros(n - self.av[l].numel(), device=self.a[l].device, dtype=self.a[l].dtype)
+                self.av[l] = torch.cat([self.av[l].to(self.a[l].device, self.a[l].dtype), pad])
+            elif self.av[l].numel() > n:
+                self.av[l] = self.av[l][:n]
+
+    def sense_mem(self, mem_vec):
+        """Slow-integrate this step's per-neuron membrane magnitude |v|_l (length H_l, on the cortex
+        device/dtype). ABSOLUTE-referenced (÷ v_ref, NOT self-calibrated) so a representation runaway ALWAYS
+        registers as av>1 however sustained — the membrane channel the binary-spike rate field cannot see (a
+        hot-but-quiet neuron spikes ≤1 yet |v|≫1). Faster tau_v so the brake tracks, not lags, the runaway.
+        No-op if off / None / empty."""
+        if not self.on or mem_vec is None:
+            return
+        self.ensure_width([int(m.numel()) for m in mem_vec])
+        self._ensure_av()
+        vref = max(float(self.v_ref), 1e-6)
+        inv = 1.0 / max(float(self.tau_v), 1.0)
+        for l, m in enumerate(mem_vec):
+            ratio = (m.detach().to(self.av[l].device, self.av[l].dtype)).abs() / vref
+            self.av[l] = (1.0 - inv) * self.av[l] + inv * ratio
+
     def sleep_tick(self):
         """Glymphatic clearance: relax the field toward baseline, clearing accumulated metabolic debt."""
         if not self.on:
@@ -121,6 +167,8 @@ class SpikingGlia:
         keep = 1.0 - max(0.0, min(1.0, float(self.rho_clear)))
         for l in range(len(self.a)):
             self.a[l] = self.a[l] * keep
+        for l in range(len(self.av)):                          # membrane debt clears toward its 0.0 baseline too
+            self.av[l] = self.av[l] * keep
 
     # ---- the three one-sided outputs --------------------------------- #
     def pgain_per_layer(self, hids=None):
@@ -133,28 +181,41 @@ class SpikingGlia:
             self.ensure_width(hids)
         if not self.a:
             return None
-        return [1.0 / (1.0 + float(self.k_p) * (a - 1.0).clamp(min=0.0)) for a in self.a]
+        self._ensure_av()                                      # per-neuron RATE brake × per-neuron MEMBRANE brake
+        return [1.0 / (1.0 + float(self.k_p) * (a - 1.0).clamp(min=0.0)
+                           + float(self.k_v) * (av - 1.0).clamp(min=0.0))
+                for a, av in zip(self.a, self.av)]
 
     def global_gain(self):
-        """Region-wide gliotransmission companion G = 1 − k_g·relu(mean(a)−1) ∈ (0,1] (floored). One-sided:
-        calm activity leaves it at 1.0; only over-activity brakes. Multiplied into the life.py plasticity
-        gate next to endocrine.plasticity_gain()."""
+        """Region-wide gliotransmission companion G = (1 − k_g·relu(mean(a)−1))·(1 − k_v·relu(mean(av)−1)) ∈
+        (0,1] (floored). One-sided: calm activity AND healthy |v| leave it at 1.0; only rate over-activity
+        (self-calibrated) OR a membrane runaway (absolute v_ref) brakes. Multiplied into the life.py
+        plasticity gate next to endocrine.plasticity_gain()."""
         if not self.on or not self.a:
             return 1.0
-        over = max(0.0, self._mean_a() - 1.0)
-        return max(0.05, 1.0 - float(self.k_g) * over)
+        self._ensure_av()
+        over_r = max(0.0, self._mean_a() - 1.0)                # rate channel (self-calibrated regime drift)
+        over_v = max(0.0, self._mean_av() - 1.0)               # membrane channel (ABSOLUTE runaway backstop)
+        return max(0.05, (1.0 - float(self.k_g) * over_r) * (1.0 - float(self.k_v) * over_v))
 
     def metab_mult(self):
-        """Metabolic multiplier m = 1 + k_m·mean(relu(a−1)) ≥ 1 that scales the cortex metabolic_lambda.
-        Sustained astrocyte activation signals energy scarcity → a larger spike-rate penalty."""
+        """Metabolic multiplier m = 1 + k_m·(mean(relu(a−1)) + mean(relu(av−1))) ≥ 1 that scales the cortex
+        metabolic_lambda. Sustained astrocyte activation OR membrane over-drive signals energy scarcity → a
+        larger spike-rate penalty that pushes incoming weights DOWN (actively discharging v, not just freezing
+        growth)."""
         if not self.on or not self.a:
             return 1.0
-        excess = torch.cat([(a - 1.0).clamp(min=0.0).float() for a in self.a]).mean()
-        return min(10.0, 1.0 + float(self.k_m) * float(excess))
+        self._ensure_av()
+        exc_r = torch.cat([(a - 1.0).clamp(min=0.0).float() for a in self.a]).mean()   # rate over-activity → k_m
+        exc_v = torch.cat([(av - 1.0).clamp(min=0.0).float() for av in self.av]).mean() # membrane runaway → k_v
+        return min(10.0, 1.0 + float(self.k_m) * float(exc_r) + float(self.k_v) * float(exc_v))
 
     # ---- helpers ----------------------------------------------------- #
     def _mean_a(self):
         return float(torch.cat([a.float() for a in self.a]).mean()) if self.a else 1.0
+
+    def _mean_av(self):
+        return float(torch.cat([a.float() for a in self.av]).mean()) if self.av else 0.0
 
     def _overactive_frac(self):
         if not self.a:
@@ -198,4 +259,5 @@ class SpikingGlia:
                     glia_global_gain=round(self.global_gain(), 4),
                     auto_target=self.auto_target,                    # calibration mode (observable)
                     glia_ref_rate=round(float(self._rate_ema), 5) if self._rate_ema is not None else None,
-                    k_g=self.k_g, k_p=self.k_p, target_rate=self.target_rate)
+                    astro_mem_activation=round(self._mean_av(), 4),  # §17 membrane field mean(av) — ABSOLUTE runaway sensor
+                    k_g=self.k_g, k_p=self.k_p, k_v=self.k_v, v_ref=self.v_ref, target_rate=self.target_rate)
