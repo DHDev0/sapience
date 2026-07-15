@@ -34,6 +34,7 @@ from .glia import SpikingGlia
 from .plateau import DendriticPlateau
 from .interneurons import SpikingInterneurons
 from .laminar import LaminarMicrocircuit
+from .ripple import SharpWaveRipple
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -179,6 +180,7 @@ class BrainLife:
             if hasattr(self.brain, "_eprop_step"):                                     # §17 PV/SOM/VIP spiking pools
                 self.brain.interneurons = SpikingInterneurons(self.dev, dtype=next(self.brain.parameters()).dtype)
             self.laminar = LaminarMicrocircuit(self.dev, dtype=self.brain.head.weight.dtype)  # §17 laminar microcircuit (default OFF)
+            self.ripple = SharpWaveRipple(self.dev, seed=seed)                          # §16 SWR-gated consolidation (default OFF)
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
                                           alpha_v=0.1, alpha_pi=0.3, seed=seed, syn_density=syn_density)  # §2
@@ -641,6 +643,7 @@ class BrainLife:
             if hasattr(self, "plateau"): p["plateau"] = self.plateau.state()         # §17 NMDA apical plateau metrics
             if getattr(self.brain, "interneurons", None) is not None:
                 p["interneurons"] = self.brain.interneurons.state()                 # §17 PV/SOM/VIP pool rates
+            if hasattr(self, "ripple"): p["ripple"] = self.ripple.state()           # §16 SWR ripple-rate/gated-commit metrics
             if hasattr(self, "laminar"):                                            # §17 per-lamina rate + config → /api/state
                 if self.laminar.on:
                     try:
@@ -724,6 +727,8 @@ class BrainLife:
                 applied.update(self.plateau.set_params(**p))         # §17 NMDA apical plateau live-tune + toggle `on`
             elif target == "interneurons" and self.modules_on and getattr(self.brain, "interneurons", None) is not None:
                 applied.update(self.brain.interneurons.set_params(**p))   # §17 PV/SOM/VIP spiking pools live-tune + toggle
+            elif target == "ripple" and self.modules_on and hasattr(self, "ripple"):
+                applied.update(self.ripple.set_params(**p))          # §16 SWR-gated consolidation live-tune + toggle
             elif target == "laminar" and self.modules_on and hasattr(self, "laminar"):
                 was_on = self.laminar.on
                 applied.update(self.laminar.set_params(**p))         # §17 canonical microcircuit live-tune + toggle
@@ -1057,6 +1062,8 @@ class BrainLife:
         if self.modules_on: self.nm.set_phase("nrem")     # §5 NREM tone: low ACh/NE → consolidate
         self.log(f"sleepy (awake {self._awake_seconds():.0f}s, debt {self.debt:.0f}) — sleeping "
                  f"{self.sleep_remaining:.0f}s")
+        if getattr(self, "ripple", None) is not None:
+            self.ripple.reset_night()                        # §16 fresh ripple-rate + gated-commit counters per night
 
     def _sleep_tick(self):
         """§8-9 sleep: the deep-learning phase. Sleep replays many chunks of the WHOLE life
@@ -1085,6 +1092,11 @@ class BrainLife:
         steps = int(getattr(self, "sleep_steps", 14))
         sseq = int(getattr(self, "sleep_seq", 96)) if self.core == "spiking" else None
         mode = getattr(self, "sleep_mode", "buffer")
+        # §16 SWR gate context: pressure from endocrine (only when on), phase from the NREM/REM ultradian clock.
+        _endo = getattr(self, "endocrine", None)
+        _pressure = _endo.sleep_pressure() if (_endo is not None and _endo.on) else 1.0
+        _phase = "rem" if (getattr(self, "_sleep_phase_t", 0) % 5 == 0) else "nrem"
+        _rip = getattr(self, "ripple", None); _rip_on = _rip is not None and _rip.on
         if mode == "generative" and self.core == "spiking" and not self.freeze_learning \
                 and hasattr(self.brain, "generative_replay"):
             # §16 GENERATIVE self-replay: DREAM from the net (buffer-free); the raw buffer is demoted to
@@ -1092,19 +1104,24 @@ class BrainLife:
             cues = [self.memory.sample(6) or "" for _ in range(max(1, base))]
             probe = self.memory.sample(400)                              # held-out acceptance monitor (metric)
             anchor = self.memory.sample(600) if getattr(self, "gr_anchor_frac", 0.15) > 0 else None
-            r = self.brain.generative_replay(n=int(getattr(self, "gr_dreams", base * 2)),
-                                             dream_len=int(getattr(self, "gr_dream_len", 200)),
-                                             temperature=float(getattr(self, "gr_temperature", 1.1)),
-                                             cues=cues, probe=probe, anchor=anchor,
-                                             anchor_frac=float(getattr(self, "gr_anchor_frac", 0.15)))
-            self._replay_count = getattr(self, "_replay_count", 0) + r["dreamed"]
-            self._gr_drift = r["probe_drift"]                            # metric: >0 = replay hurt the held-out probe
-            try: self._gr_entropy = float(self.brain.generate_diag(n=120).get("entropy_bits", 0.0))
-            except Exception: self._gr_entropy = 0.0                     # metric: dream diversity (low = degenerate)
+            _n_intended = int(getattr(self, "gr_dreams", base * 2))
+            # §16 SWR gate: only ripple-coincident dreams are generated-and-committed (k==0 → skip).
+            _n = sum(_rip.event(_phase, _pressure, self.debt) for _ in range(_n_intended)) if _rip_on else _n_intended
+            if _n > 0:
+                r = self.brain.generative_replay(n=_n,
+                                                 dream_len=int(getattr(self, "gr_dream_len", 200)),
+                                                 temperature=float(getattr(self, "gr_temperature", 1.1)),
+                                                 cues=cues, probe=probe, anchor=anchor,
+                                                 anchor_frac=float(getattr(self, "gr_anchor_frac", 0.15)))
+                self._replay_count = getattr(self, "_replay_count", 0) + r["dreamed"]
+                self._gr_drift = r["probe_drift"]                        # metric: >0 = replay hurt the held-out probe
+                try: self._gr_entropy = float(self.brain.generate_diag(n=120).get("entropy_bits", 0.0))
+                except Exception: self._gr_entropy = 0.0                 # metric: dream diversity (low = degenerate)
         else:
             for _ in range(base):
                 chunk = self.memory.sample(1400)
-                if chunk and len(chunk) > 32 and not self.freeze_learning:
+                if chunk and len(chunk) > 32 and not self.freeze_learning \
+                        and (not _rip_on or _rip.event(_phase, _pressure, self.debt)):  # §16 SWR-gated commit
                     self.brain.learn_text(chunk, epochs=1, max_steps=steps, **({"seq": sseq} if sseq else {}))
                     self._replay_count = getattr(self, "_replay_count", 0) + 1   # replay-consolidation counter
         if not self.freeze_learning:
@@ -1702,6 +1719,8 @@ class BrainLife:
                   hippo_spike_rate=nd.get("hippo_spike_rate"), hippo_fidelity=nd.get("hippo_fidelity"),
                   bg_policy_entropy=nd.get("bg_policy_entropy"),
                   replay_total=getattr(self, "_replay_count", 0),
+                  ripple_rate=self.ripple.state()["ripple_rate"] if hasattr(self, "ripple") else 0.0,                        # §16 SWR density
+                  gated_commit_fraction=self.ripple.state()["gated_commit_fraction"] if hasattr(self, "ripple") else 1.0,   # §16 selective-commit
                   sleep_mode=getattr(self, "sleep_mode", "buffer"),          # §16 consolidation mode
                   gr_probe_drift=round(float(getattr(self, "_gr_drift", 0.0)), 4),   # generative-replay metrics
                   gr_dream_entropy=round(float(getattr(self, "_gr_entropy", 0.0)), 3),
@@ -1796,6 +1815,8 @@ class BrainLife:
                                                        for k in self.brain.interneurons._KEYS}
                 if hasattr(self, "laminar"):                 # §17 laminar: config only (masks are DERIVED → rebuilt)
                     life["modules"]["laminar"] = {k: getattr(self.laminar, k) for k in self.laminar._KEYS}
+                if hasattr(self, "ripple"):                  # §16 SWR: params only (per-night counters are transient)
+                    life["modules"]["ripple"] = {k: getattr(self.ripple, k) for k in self.ripple._KEYS}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1879,6 +1900,8 @@ class BrainLife:
                     for k, v in m["laminar"].items(): setattr(self.laminar, k, v)
                     if self.laminar.on:
                         self.laminar.rebuild(self.brain)                # masks derived from lamina+A → deterministic
+                if hasattr(self, "ripple") and m.get("ripple"):        # §16 SWR restore params (reseeds RNG on `seed`)
+                    self.ripple.set_params(**{k: v for k, v in m["ripple"].items() if k in self.ripple._KEYS})
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)

@@ -63,7 +63,7 @@ def test_snapshot_shape():
     snap = c.snapshot()
     for key in ("status", "state", "hp", "net", "netparams", "arch", "tools", "observations", "history", "feed", "logs", "compute"):
         assert key in snap, f"snapshot missing {key}"
-    assert set(snap["netparams"]) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum", "endocrine", "dynamics", "peptides", "glia", "stdp", "stp", "plateau", "interneurons", "laminar"}
+    assert set(snap["netparams"]) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum", "endocrine", "dynamics", "peptides", "glia", "stdp", "stp", "plateau", "interneurons", "laminar", "ripple"}
 
 
 def test_arch_diag_reports_per_part_neurons_and_synapses():
