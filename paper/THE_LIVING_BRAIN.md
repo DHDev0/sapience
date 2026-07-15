@@ -966,7 +966,40 @@ Reading it honestly:
   Kolen-Pollack loop is actively *destabilising* at this learning rate (final bpb diverges to 5.68); it is a
   candidate for a lower feedback learning rate, not for the default-on set.
 
-<!-- ABLATION_RESULTS -->
+### 20.2.2 Combinations — the mechanisms do *not* compose
+
+Stacking the ten single-toggle winners together does **not** stack their gains. It is the single most important
+result in this section:
+
+| configuration | min-bpb | Δ vs baseline |
+|---|---|---|
+| baseline | 4.118 | — |
+| **dale alone** (best single) | **3.941** | **+0.176** |
+| full stack (all 10 winners) | 4.169 | −0.051 |
+| **everything on (all 19 toggles)** | **4.488** | **−0.370** |
+
+The full winner-stack is *worse than the baseline*, and the naive "everything on" config is the **worst of all** —
+worse than most single mechanisms. The gains are not additive; the mechanisms interfere. Leave-one-out from the
+full stack localises it (positive = removing it *hurt* the stack, i.e. load-bearing; negative = removing it
+*helped*, i.e. it was interfering):
+
+| removed from stack | resulting min-bpb | effect | reading |
+|---|---|---|---|
+| dale | 4.216 | **+0.048** | load-bearing — the one robust winner |
+| interneurons | 4.046 | −0.123 | **interferes** — helps alone, hurts stacked |
+| stp | 4.070 | −0.099 | **interferes** |
+| pc | 4.160 | −0.009 | mildly interferes |
+| stochastic | 4.163 | −0.006 | ~neutral |
+| stdp | 4.167 | −0.001 | neutral |
+| dendritic / diff_neuromod / bounded / peptides | ≈4.169 | ~0 | neutral in combination |
+
+Two mechanisms that each *help in isolation* — the interneuron pools (+0.149 alone) and short-term plasticity
+(+0.049 alone) — **hurt inside the stack**; removing them recovers ≈0.10–0.12 bpb each. **Dale's law is the only
+mechanism that both helps alone and is load-bearing in combination**, and *dale alone (3.941) beats every
+combination measured*. The practical consequence is decisive and matches the design of the live system: the
+right operating point is **not** "turn everything on" — that is measurably the worst choice — but a small,
+measured subset (here: Dale plus a neutral tail), and the value of a *live orchestrator* that searches the
+active-set online is precisely that it can find this subset, which no static "enable all mechanisms" ever would.
 
 ## 20.3 Scope — what this matrix does and does not measure
 
@@ -986,7 +1019,22 @@ distance rule) small-world topology with log-normal synaptic weights (mean-|w| m
 only the *distribution* and *topology* differ) — versus the flat uniform-random fan-in, same seed and data, and
 compare the learning curve and best bits/byte.
 
-<!-- CONNECTOME_RESULTS -->
+The result is a clean **negative** (three seeds, same budget as the matrix):
+
+| wiring | best bpb | learning curve (held-out bpb every 100 steps) |
+|---|---|---|
+| random sparse (baseline) | **4.081** | 4.43 → 4.32 → 4.27 → 4.23 → 4.22 → **4.13** (steady descent) |
+| connectome (EDR + log-normal) | 4.149 | 4.43 → 4.33 → 4.30 → 4.20 → 4.32 → **4.49** (descends, then diverges) |
+
+Structured initial wiring did **not** learn faster or reach a lower bits/byte — it reached a slightly *higher*
+best (Δ −0.068) and, unlike the random baseline, *destabilised* in the second half of training (the mean curve
+turns back up past step 400 where random keeps descending). At this scale and on this task, the flat uniform-
+random fan-in that the learned-sparse development starts from is the better initialisation; the extra clustering
+and heavy-tailed weights of the connectome prior buy nothing the online synaptogenesis (§10) cannot find, and
+cost stability. This is one topology (exponential-distance small-world with log-normal weights) at one width, so
+it does not close the question for all connectome statistics or all scales — but it is the honest answer to the
+one biophysical A/B §18.4 singled out: **on this model's own axis, connectome-as-initialisation did not move the
+score.** It is, fittingly, the same verdict the boundary section predicted for the rest of the biophysical tier.
 
 ## 20.5 Replication
 
