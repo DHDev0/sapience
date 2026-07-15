@@ -28,10 +28,14 @@ TUNE = "/home/dander/workspace/zk/sapience/runs/tuning_log.md"
 CYCLE = 1200                 # 20 min per A/B step — long enough for a bpb change to show at 256k
 SETTLE = 180                 # let a change settle before we start averaging its bpb
 POLL = 30
+# Anchors chosen from the HORIZON sweep (runs/horizon_results.json), not the 600-step matrix: dale is the
+# compounding long-horizon winner (3.99, advantage grows with age); homeostasis was REMOVED — it is a monotonic
+# long-horizon DESTABILISER (homeostasis-alone 4.59→5.21; it poisons dale: dale+homeostasis diverges). Runaway
+# protection is the always-on over-excitation attention brake + the watchdog, not the homeostasis threshold toggle.
 ANCHORS = [("cortex", {"head_norm": "energy", "head_lr_scale": 2.0}),
-           ("cortex", {"dale": True}),
-           ("cortex", {"homeostasis": True})]
-CANDIDATES = ["glia", "dendritic", "stdp", "bounded_synapses", "diff_neuromod",
+           ("cortex", {"dale": True})]
+# metabolic FIRST — the horizon sweep's clean late-bloomer (600-step loser → long-horizon #2 at 4.09 < baseline)
+CANDIDATES = ["metabolic", "glia", "dendritic", "stdp", "bounded_synapses", "diff_neuromod",
               "stochastic", "pc", "stp", "interneurons", "peptides"]
 # map candidate -> (target, payload) for /api/net
 CAND_APPLY = {
@@ -39,14 +43,14 @@ CAND_APPLY = {
     "interneurons": ("interneurons", {"on": True}), "peptides": ("peptides", {"on": True}),
     "dendritic": ("cortex", {"dendritic": True}), "bounded_synapses": ("cortex", {"bounded_synapses": True}),
     "diff_neuromod": ("cortex", {"diff_neuromod": True}), "stochastic": ("cortex", {"stochastic": True}),
-    "pc": ("cortex", {"learn_rule": "pc"}),
+    "pc": ("cortex", {"learn_rule": "pc"}), "metabolic": ("cortex", {"metabolic": True}),
 }
 CAND_REVERT = {
     "glia": ("glia", {"on": False}), "stdp": ("stdp", {"on": False}), "stp": ("stp", {"on": False}),
     "interneurons": ("interneurons", {"on": False}), "peptides": ("peptides", {"on": False}),
     "dendritic": ("cortex", {"dendritic": False}), "bounded_synapses": ("cortex", {"bounded_synapses": False}),
     "diff_neuromod": ("cortex", {"diff_neuromod": False}), "stochastic": ("cortex", {"stochastic": False}),
-    "pc": ("cortex", {"learn_rule": "eprop"}),
+    "pc": ("cortex", {"learn_rule": "eprop"}), "metabolic": ("cortex", {"metabolic": False}),
 }
 KEEP_MARGIN = 0.02           # candidate must lower bpb by >0.02 to be kept (else revert — Occam)
 BPB_UNSAFE = 9.0             # above this, revert the pending change immediately (watchdog owns true rescue)

@@ -1049,3 +1049,44 @@ python runs/ablation_harness.py connectome  # connectome A/B      → runs/conne
 Every number in this section is one of those three JSON files; the harness fixes the seed set, corpus slice,
 step budget, and architecture at the top of the file. The NLMS head, the per-mechanism live wiring, and the
 connectome rewiring are all in that one script plus `brain/spiking_brain.py`.
+
+## 20.6 Does it hold with age? — the horizon sweep
+
+Everything in §20.2 is measured at one training age (600 steps). That is a real limitation: the mechanisms most
+likely to pay off *slowly* — homeostasis (runaway prevention), metabolic economy, Kolen-Pollack feedback
+alignment — are exactly the ones a short run cannot see reward. So the key configs were re-trained **6× longer
+(3 600 steps)** on the fixed, stable NLMS energy head, recording the held-out learning curve every 250 steps.
+The ranking does **not** hold with age — it *inverts*:
+
+| step | baseline | dale | full_stack | metabolic | homeostasis | everything |
+|---|---|---|---|---|---|---|
+| 250 | 4.523 | 4.538 | **4.492** | 4.515 | 4.592 | 4.541 |
+| 1500 | 4.358 | 4.296 | 4.295 | **4.288** | 4.699 | 4.529 |
+| 3500 | 4.176 | **3.993** | 4.172 | 4.094 | 5.207 | 4.643 |
+
+Long-horizon ranking (best held-out bpb): **dale 3.99 · metabolic 4.09 · full_stack 4.17 ≈ learned_fb 4.17 ≈
+baseline 4.18 · everything 4.64 (diverges) · homeostasis 5.21 (diverges) · dale+homeostasis 4.87 (diverges).**
+
+The findings:
+
+- **Early-optimal ≠ late-optimal.** At 250 steps the *combinations* (full_stack, everything) lead — many
+  mechanisms give a fast initial kick. By 3 500 steps they have plateaued and **dale, tied with baseline early,
+  has pulled decisively ahead** (3.99 vs 4.18): its advantage *compounds* with age rather than saturating.
+- **Genuine late-bloomers exist.** **Metabolic** — a clear *loser* at 600 steps (−0.115) — **crosses baseline
+  at ≈1 500 steps and finishes second (4.09)**: its efficiency/regularisation dividend is purely a long-horizon
+  effect. **Learned-fb**, which *diverged* at 600 steps, stabilises and tracks baseline with age (the KP feedback
+  matrix needs thousands of steps to align). So "hurts at 600 steps" is not a verdict; for some mechanisms it is
+  the opposite of the long-run truth.
+- **Homeostasis is a monotonic *de*-stabiliser here** (4.59 → 5.21, worsening every checkpoint) and it *poisons*
+  the best single mechanism (dale + homeostasis diverges). This overturned the naive expectation — and it caught
+  a live-config error: homeostasis had been placed in the orchestrator's always-on anchors for "stability"; the
+  sweep removed it. Runaway protection is the always-on over-excitation attention brake and the watchdog, not the
+  homeostatic threshold-adaptation toggle, which on this substrate amplifies rather than damps the drift.
+- **"Everything on" never recovers** — worst at every age and diverging by step 1 000. The §20.2.2 verdict is not
+  a short-horizon artefact; it is if anything *stronger* with age.
+
+The operating consequence for the living brain (which trains continuously, i.e. only ever in the long-horizon
+regime): the config is **dale on the NLMS energy head**, homeostasis *off*, with the online orchestrator free to
+add the proven late-bloomer (metabolic) and probe the rest — never the static everything-on, and explicitly not
+homeostasis-as-anchor. The measurement that looked finished at 600 steps had, in fact, the opposite answer for
+three of its mechanisms; only training to age revealed it.

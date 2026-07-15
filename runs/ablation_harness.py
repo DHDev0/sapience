@@ -204,6 +204,75 @@ def run_combo():
 
 
 RESULTS_CONN = "/home/dander/workspace/zk/sapience/runs/connectome_results.json"
+RESULTS_HORIZON = "/home/dander/workspace/zk/sapience/runs/horizon_results.json"
+
+
+def train_curve(toggles, seed, data, ev, steps, eval_every=250, energy_head=True):
+    """Train `steps` and record the held-out bpb learning CURVE. Uses the STABLE NLMS energy head as the fixed
+    foundation (so late divergence of a power head can't confound a long-horizon mechanism comparison)."""
+    torch.manual_seed(seed); b = make_brain(seed)
+    if energy_head:
+        b.set_faith(head_norm="energy", head_lr_scale=2.0, head_energy_eps=1e-2)
+    tg = apply_config(b, toggles)
+    rng = random.Random(seed); n = data.numel(); use_pc = "pc" in tg; curve = []
+    for step in range(steps):
+        idx = [rng.randint(0, n - SEQ - 2) for _ in range(BS)]
+        x = torch.stack([data[i:i + SEQ] for i in idx]); y = torch.stack([data[i + 1:i + SEQ + 1] for i in idx])
+        gate = 1.0
+        if "peptides" in tg: gate *= float(b.peptides.plasticity_bias())
+        if "glia" in tg:
+            gate *= float(b.glia.global_gain()); b._astro_on = True
+            b._astro_pgain = b.glia.pgain_per_layer([c.hid for c in b.cells]); b._astro_metab_mult = float(b.glia.metab_mult())
+        if "plateau" in tg: b._plateau = b._plateau_obj
+        b._eprop_step(x, y, gate=gate, pc=use_pc)
+        if "glia" in tg: b.glia.sense(getattr(b, "_spk_rate_vec", None))
+        if "peptides" in tg: b.peptides.wake_tick(progress=0.5, novelty=0.5, threat=0.1)
+        if (step + 1) % eval_every == 0:
+            curve.append(round(float(b.bits_per_byte(ev)), 4))
+    return curve
+
+
+HORIZON_CONFIGS = {
+    "baseline": set(),
+    "dale": {"dale"},
+    "dale+homeostasis": {"dale", "homeostasis"},
+    "full_stack": {"bounded_synapses", "dale", "dendritic", "diff_neuromod", "interneurons", "pc", "peptides", "stdp", "stochastic", "stp"},
+    "everything": set(SINGLES) - {"head_energy"},   # everything except the head toggle (energy IS the foundation here)
+    "homeostasis": {"homeostasis"},
+    "metabolic": {"metabolic"},
+    "learned_fb": {"learned_fb"},
+}
+
+
+def run_horizon(steps=3600, seeds=(0, 1)):
+    """Does the 600-step ranking HOLD with age? Train the key configs 6x longer on the STABLE energy head and
+    record learning curves — look for crossovers (does everything-on catch up? does homeostasis/metabolic/
+    learned_fb pay off late? does dale stay ahead?)."""
+    data_text, ev = load_corpus()
+    b0 = make_brain(0); data = torch.tensor(b0.to_bytes(data_text), device=DEV, dtype=torch.long); del b0
+    out = {"config": {"hidden": HIDDEN, "steps": steps, "eval_every": 250, "seeds": list(seeds),
+                      "head": "energy(NLMS) fixed foundation"}, "curves": {}}
+    print(f"HORIZON sweep: {steps} steps, energy head, configs={list(HORIZON_CONFIGS)}", flush=True)
+    for name, tg in HORIZON_CONFIGS.items():
+        allc = []
+        for s in seeds:
+            t0 = time.time(); c = train_curve(tg, s, data, ev, steps)
+            allc.append(c); print(f"  {name:18s} seed{s} min={min(c):.3f} end={c[-1]:.3f}  ({time.time()-t0:.0f}s)", flush=True)
+        L = min(len(c) for c in allc)
+        mean = [round(sum(c[i] for c in allc) / len(allc), 4) for i in range(L)]
+        out["curves"][name] = {"mean_curve": mean, "best": round(min(min(c) for c in allc), 4),
+                               "end": round(sum(c[-1] for c in allc) / len(allc), 4), "seed_curves": allc}
+        with open(RESULTS_HORIZON, "w") as f: json.dump(out, f, indent=2)
+    # crossover report: best-so-far ranking at each checkpoint
+    xs = list(range(250, steps + 1, 250))
+    print("\nstep   " + "  ".join(f"{n[:9]:>9s}" for n in HORIZON_CONFIGS), flush=True)
+    for i, st in enumerate(xs):
+        row = []
+        for n in HORIZON_CONFIGS:
+            mc = out["curves"][n]["mean_curve"]
+            row.append(f"{mc[i]:9.3f}" if i < len(mc) else "    -    ")
+        print(f"{st:5d}  " + "  ".join(row), flush=True)
+    print("HORIZON SWEEP DONE →", RESULTS_HORIZON, flush=True)
 
 
 def connectome_columns(hid, fanin, seed, lam_frac=0.05, longrange=0.12):
@@ -288,3 +357,5 @@ if __name__ == "__main__":
         run_combo()
     elif a.mode == "connectome":
         run_connectome()
+    elif a.mode == "horizon":
+        run_horizon()
