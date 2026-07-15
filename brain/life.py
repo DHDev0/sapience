@@ -332,6 +332,11 @@ class BrainLife:
                 self.brain._astro_metab_mult = glia.metab_mult()    # scales metabolic_lambda (lactate/ATP scarcity)
             elif hasattr(self.brain, "_astro_on"):                  # OFF → leave nothing stale (mirror _dyn_elig_beta reset)
                 self.brain._astro_on = False; self.brain._astro_pgain = None; self.brain._astro_metab_mult = 1.0
+            if hasattr(self.brain, "stp"):                          # §16↔§17: NE arousal raises effective STP release prob U
+                if self.brain.stp.on and endo is not None and endo.on:
+                    self.brain.stp._ne_gain = float(endo.ne_gain())
+                else:
+                    self.brain.stp._ne_gain = 1.0                   # default-neutral
             eprop = getattr(self.brain, "learn_rule", "bptt") == "eprop"
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr * gate
@@ -623,6 +628,7 @@ class BrainLife:
             if hasattr(self, "peptides"): p["peptides"] = self.peptides.state()      # §16 peptide-level metrics → /api/state
             if hasattr(self, "glia"): p["glia"] = self.glia.state()                  # §17 astrocyte field metrics
             if hasattr(self.brain, "stdp"): p["stdp"] = self.brain.stdp.state()      # §15.18 STDP timing metrics
+            if hasattr(self.brain, "stp"): p["stp"] = self.brain.stp.state()         # §17 STP efficacy metrics
             p["cerebellum"] = {"eta": self.cereb_eta, "sparsity": self.cerebellum.sparsity,
                                "g_golgi": self.cerebellum.g_golgi, "thr0": self.cerebellum.thr0,
                                "syn_density": getattr(self.cerebellum, "syn_density", 1.0)}
@@ -692,6 +698,8 @@ class BrainLife:
                 applied.update(self.glia.set_params(**p))            # §17 astrocyte field live-tune + toggle `on`
             elif target == "stdp" and hasattr(self.brain, "stdp"):
                 applied.update(self.brain.stdp.set_params(**p))      # §15.18 STDP live-tune + toggle `on` (no restart)
+            elif target == "stp" and hasattr(self.brain, "stp"):
+                applied.update(self.brain.stp.set_params(**p))       # §17 STP live-tune + toggle `on` (cortex mechanism)
             elif target == "cerebellum" and self.modules_on:
                 if "eta" in p: self.cereb_eta = float(p["eta"]); applied["eta"] = self.cereb_eta
                 if "sparsity" in p: self.cerebellum.sparsity = float(p["sparsity"]); applied["sparsity"] = self.cerebellum.sparsity
@@ -1743,6 +1751,8 @@ class BrainLife:
                                                "a": [t.detach().cpu() for t in self.glia.a]}
                 if hasattr(self.brain, "stdp"):              # §15.18 STDP: all tunable params
                     life["modules"]["stdp"] = {k: getattr(self.brain.stdp, k) for k in self.brain.stdp._KEYS}
+                if hasattr(self.brain, "stp"):               # §17 STP: 5 replicated scalar params (u,x transient, not saved)
+                    life["modules"]["stp"] = {k: getattr(self.brain.stp, k) for k in self.brain.stp._KEYS}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1816,6 +1826,8 @@ class BrainLife:
                     self.glia.load_field(gm.get("a"), [c.hid for c in self.brain.cells])
                 if hasattr(self.brain, "stdp") and m.get("stdp"):       # §15.18 restore STDP params
                     self.brain.stdp.set_params(**m["stdp"])
+                if hasattr(self.brain, "stp") and m.get("stp"):         # §17 restore STP params
+                    self.brain.stp.set_params(**m["stp"])
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)

@@ -172,12 +172,13 @@ class SparseLIFCell(nn.Module):
         s = spike(v - self.thr)
         return s, (v, s)
 
-    def run_seq(self, x, state):
+    def run_seq(self, x, state, stp=None, stp_layer=0):
         v, s = state
         pre = self._in_proj(x)                                  # (B,T,hid) vectorized input
         spikes, mems = [], []
         for t in range(x.shape[1]):
-            v = self.beta * v * (1.0 - s) + pre[:, t] + self._rec(s)
+            zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
+            v = self.beta * v * (1.0 - s) + pre[:, t] + self._rec(zt)
             s = spike(v - self.thr)
             spikes.append(s); mems.append(v)
         return torch.stack(spikes, 1), torch.stack(mems, 1), (v, s)
@@ -231,12 +232,13 @@ class SparseALIFCell(SparseLIFCell):
         s = spike(v - (self.thr0 + self.beta_adapt * a))
         return s, (v, s, a)
 
-    def run_seq(self, x, state):
+    def run_seq(self, x, state, stp=None, stp_layer=0):
         v, s, a = state
         pre = self._in_proj(x)
         spikes, mems = [], []
         for t in range(x.shape[1]):
-            v = self.beta * v * (1.0 - s) + pre[:, t] + self._rec(s)
+            zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
+            v = self.beta * v * (1.0 - s) + pre[:, t] + self._rec(zt)
             a = self.rho * a + s
             s = spike(v - (self.thr0 + self.beta_adapt * a))
             spikes.append(s); mems.append(v)
@@ -262,7 +264,7 @@ class LIFCell(nn.Module):
         s = spike(v - self.thr)
         return s, (v, s)
 
-    def run_seq(self, x, state):
+    def run_seq(self, x, state, stp=None, stp_layer=0):
         """Run the whole (B,T,in) sequence. The input projection Win(x) — the bulk of the
         FLOPs — is computed for ALL timesteps in ONE matmul; only the recurrence Wrec(s)
         stays in the Python loop (it must, it depends on the previous spike). Mathematically
@@ -271,7 +273,8 @@ class LIFCell(nn.Module):
         pre = self.Win(x)                              # (B,T,hid) — vectorized over time
         spikes, mems = [], []
         for t in range(x.shape[1]):
-            v = self.beta * v * (1.0 - s) + pre[:, t] + self.Wrec(s)
+            zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
+            v = self.beta * v * (1.0 - s) + pre[:, t] + self.Wrec(zt)
             s = spike(v - self.thr)
             spikes.append(s); mems.append(v)
         return torch.stack(spikes, 1), torch.stack(mems, 1), (v, s)
@@ -316,13 +319,14 @@ class ALIFCell(nn.Module):
         s = spike(v - thr)
         return s, (v, s, a)
 
-    def run_seq(self, x, state):
+    def run_seq(self, x, state, stp=None, stp_layer=0):
         """Sequence run with the input projection vectorized over time (see LIFCell.run_seq)."""
         v, s, a = state
         pre = self.Win(x)
         spikes, mems = [], []
         for t in range(x.shape[1]):
-            v = self.beta * v * (1.0 - s) + pre[:, t] + self.Wrec(s)
+            zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
+            v = self.beta * v * (1.0 - s) + pre[:, t] + self.Wrec(zt)
             a = self.rho * a + s
             s = spike(v - (self.thr0 + self.beta_adapt * a))
             spikes.append(s); mems.append(v)

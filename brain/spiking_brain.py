@@ -165,6 +165,8 @@ class SpikingBrain(nn.Module):
         # sparse connectome (syn_density of connections active) that childhood then densifies.
         self.syn_density = syn_density
         self._init_synapse_mask(syn_density)
+        from .synaptic_stp import SpikingSTP
+        self.stp = SpikingSTP(self.device)     # §17 short-term synaptic plasticity controller (DEFAULT OFF)
 
     @staticmethod
     def to_bytes(text):
@@ -190,9 +192,11 @@ class SpikingBrain(nn.Module):
             inp = self.E(x)                                # (B,T,emb)
             if states is None:
                 states = [c.init_state(B, self.device) for c in self.cells]
+                if getattr(self, "stp", None) is not None and self.stp.on:
+                    self.stp.reset(self.cells, B)     # §17: fresh context ⇒ (u,x) to rest (continuity across think/generate)
             top_mem = None
             for i, c in enumerate(self.cells):
-                spikes, mems, states[i] = c.run_seq(inp, states[i])
+                spikes, mems, states[i] = c.run_seq(inp, states[i], stp=getattr(self, "stp", None), stp_layer=i)
                 inp = spikes; top_mem = mems
             read = self._readout(top_mem, inp)             # (B,T,hid)
             logits = self.head(read)                       # (B,T,V) in one matmul
@@ -307,6 +311,8 @@ class SpikingBrain(nn.Module):
         (== the layer-outer forward), online, gated by the neuromodulator. No autograd, no BPTT."""
         B, T = x.shape
         cells = self.cells; dev = self.device
+        if getattr(self, "stp", None) is not None and self.stp.on:
+            self.stp.reset(cells, B)                            # §17: each e-prop window starts (u,x) at rest (like v/eps)
         inp = self.E(x)                                        # (B,T,emb)
         sp = lambda c: hasattr(c, "rec_val")                   # sparse cell?
         al = [hasattr(c, "rho") for c in cells]                # ALIF (adaptive threshold) cell?
@@ -399,12 +405,13 @@ class SpikingBrain(nn.Module):
             layer_in = inp[:, tt]; psi = []
             for l, c in enumerate(cells):
                 z_prev = z[l]
+                z_eff = z_prev * self.stp.transmit(l, z_prev) if (getattr(self, "stp", None) is not None and self.stp.on) else z_prev  # §17
                 if sp(c):
-                    rec = spmm(c.rec_val * c.rec_mask, c.rec_col, c.rec_row, z_prev, c.hid)
+                    rec = spmm(c.rec_val * c.rec_mask, c.rec_col, c.rec_row, z_eff, c.hid)
                     pre = (spmm(c.in_val * c.in_mask, c.in_col, c.in_row, layer_in, c.hid) + c.in_bias) \
                         if c.sparse_in else c.Win(layer_in)
                 else:
-                    rec = c.Wrec(z_prev); pre = c.Win(layer_in)
+                    rec = c.Wrec(z_eff); pre = c.Win(layer_in)
                 drive = pre + rec
                 if twocomp:                                    # PV fast divisive gain control + apical→soma feedback
                     drive = drive / (1.0 + pv_g * z_prev.mean(1, keepdim=True)) + g_ap * ap[l]
@@ -424,7 +431,7 @@ class SpikingBrain(nn.Module):
                 dyn_eb = getattr(self, "_dyn_elig_beta", None)  # §16 P2: attention→FREQUENCY sets the window
                 if dyn_eb is not None: eb = float(dyn_eb)       #   (gamma-short when focused, alpha-long when not)
                 if diffnm: eb = min(0.995, eb * ht_pat)        # 5-HT stretches the eligibility window (patience)
-                eps_rec[l] = eb * eps_rec[l] + z_prev          # ε^v forward eligibility (per pre-neuron)
+                eps_rec[l] = eb * eps_rec[l] + z_eff           # §17: eligibility carries the TRANSMITTED spike z⊙g (resource-aware)
                 eps_in[l] = eb * eps_in[l] + layer_in
                 if do_stdp and sp(c):                          # STDP rides the sparse cortex (edge-wise, O(nnz·B))
                     dr, lp_r, ld_r = sd.edge_delta(z[l], z[l], xr_p[l], xr_m[l], c.rec_row, c.rec_col)
@@ -802,6 +809,8 @@ class SpikingBrain(nn.Module):
             wm = float(getattr(self, "w_max", 1.0)); c0 = self.cells[0]
             w0 = (c0.rec_val if self._is_sparse(c0) else c0.Wrec.weight).detach().abs()
             out["synapse_sat_frac"] = float((w0 >= 0.999 * wm).float().mean())
+        if getattr(self, "stp", None) is not None and self.stp.on:
+            out["stp_efficacy"] = float(self.stp.mean_efficacy)   # §17 headline metric (≈1 rest, <1 depress, >1 facil)
         return out
 
     def _ensure_ei(self):
@@ -1098,7 +1107,8 @@ class SpikingBrain(nn.Module):
                         loss_ema=getattr(self, "loss_ema", None),
                         fb=(getattr(self, "_fb", None) if self.feedback_mode == "learned" else None),
                         ei=getattr(self, "_ei_sign", None),                # Dale E/I typing (learned state)
-                        thr_adapt=getattr(self, "_thr_adapt", None)), path)  # homeostatic thresholds
+                        thr_adapt=getattr(self, "_thr_adapt", None),
+                        stp=({k: getattr(self.stp, k) for k in self.stp._KEYS} if getattr(self, "stp", None) is not None else None)), path)  # §17 STP params (transient u,x NOT saved)
 
     def load(self, path):
         d = torch.load(path, map_location=self.device)
@@ -1149,6 +1159,8 @@ class SpikingBrain(nn.Module):
                 continue
             setattr(self, k, v)
         self.attention = d.get("attention", 1.0); self.loss_ema = d.get("loss_ema", None)
+        if d.get("stp") and getattr(self, "stp", None) is not None:
+            self.stp.set_params(**d["stp"])                    # §17 restore STP params (u,x rebuilt at rest)
         if d.get("fb") is not None:   self._fb = [t.to(self.device) for t in d["fb"]]        # aligned feedback
         if d.get("ei") is not None:   self._ei_sign = [t.to(self.device) for t in d["ei"]]   # Dale E/I typing
         if d.get("thr_adapt") is not None: self._thr_adapt = [t.to(self.device) for t in d["thr_adapt"]]
