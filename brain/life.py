@@ -29,6 +29,7 @@ from .memory import EpisodicMemory
 from .spiking_modules import SpikingCerebellum, SpikingBasalGanglia, SpikingHippocampus, SpikingNeuromod
 from .endocrine import SpikingEndocrine
 from .dynamics import SpikingDynamics
+from .neuropeptides import SpikingNeuropeptides
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -168,6 +169,7 @@ class BrainLife:
             self.nm = SpikingNeuromod((1,), self.dev)                                  # §5 (tone only)
             self.endocrine = SpikingEndocrine(self.dev)                                # §16 slow drive/stress layer (P1)
             self.dynamics = SpikingDynamics(self.dev)                                  # §16 dynamic states + rhythm (P2)
+            self.peptides = SpikingNeuropeptides(self.dev)                             # §16 slow neuropeptide layer, companion to endocrine
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
                                           alpha_v=0.1, alpha_pi=0.3, seed=seed, syn_density=syn_density)  # §2
@@ -312,6 +314,9 @@ class BrainLife:
                 gate = gate * endo.plasticity_gain()                # cortisol one-sided gate (chronic-high impairs)
                 # NE (satiation→focus) is applied to the per-call tone copy below, NOT the canonical tone —
                 # so toggling endocrine OFF leaves no stale NE lingering until the next set_phase.
+            pep = getattr(self, "peptides", None)
+            if pep is not None and pep.on:                          # §16 slow neuropeptides bias the SAME three-factor gate
+                gate = gate * pep.plasticity_bias()                 # OXT broadens / CRH narrows (∈[0.5,1.5], width-invariant)
             dyn = getattr(self, "dynamics", None)
             if dyn is not None and dyn.on:                          # §16 P2 attention → processing frequency
                 self.brain._dyn_elig_beta = dyn.eligibility_beta(float(getattr(self.brain, "attention", 1.0)))
@@ -321,19 +326,34 @@ class BrainLife:
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr * gate
             tone = dict(self.nm.tone) if self.modules_on else None   # the 4 tones (diff_neuromod uses them per-pathway)
-            if tone is not None and endo is not None and endo.on:
-                tone["ne"] = endo.ne_gain()                          # §16 satiation→focus, per-call (canonical tone stays clean)
+            if tone is not None:
+                _endo_on = endo is not None and endo.on
+                _pep_on = pep is not None and pep.on
+                if _endo_on or _pep_on:                              # per-call NE only (canonical self.nm.tone stays clean)
+                    ne = endo.ne_gain() if _endo_on else tone.get("ne", 1.0)
+                    if _pep_on:
+                        ne = ne + pep.ne_bias()                      # §16 orexin/oxytocin arousal-exploration bias
+                    tone["ne"] = ne
             r = self.brain.learn_text(text, epochs=1, max_steps=steps, gate=gate, tone=tone)
             if gate != 1.0 and not eprop:
                 for g in self.brain.opt.param_groups: g["lr"] = self.brain.lr
             if isinstance(r, tuple):                    # (first_loss, last_loss): free progress
                 progress = max(0.0, r[0] - r[1])
-            if endo is not None and endo.on:            # §16 wake tick → homeostatic-RL reward (satiation)
+            if (endo is not None and endo.on) or (pep is not None and pep.on):
                 dg = getattr(self.brain, "_diag", {}) or {}
-                threat = max(0.0, 1.0 - float(getattr(self.brain, "attention", 1.0)))   # loss-shock = threat
-                self._r_home = endo.wake_tick(surprise=dg.get("surprise", 0.0), threat=threat, progress=progress,
-                                              novelty=getattr(self, "_novelty", 0.5),
-                                              da=self.nm.tone.get("da", 0.5) - 0.5)
+                threat_raw = max(0.0, 1.0 - float(getattr(self.brain, "attention", 1.0)))   # loss-shock = threat
+                # §16 CRH is UPSTREAM of the HPA axis: it gains the threat the SINGLE cortisol pool sees.
+                threat = threat_raw * pep.threat_gain() if (pep is not None and pep.on) else threat_raw
+                if endo is not None and endo.on:        # §16 wake tick → homeostatic-RL reward (satiation)
+                    self._r_home = endo.wake_tick(surprise=dg.get("surprise", 0.0), threat=threat, progress=progress,
+                                                  novelty=getattr(self, "_novelty", 0.5),
+                                                  da=self.nm.tone.get("da", 0.5) - 0.5)
+                    if pep is not None and pep.on:      # §16 oxytocin buffers the SAME cortisol POOL (prosocial relief)
+                        endo.C = max(0.0, endo.C - pep.cortisol_relief())
+                if pep is not None and pep.on:          # §16 advance the three peptide pools (raw threat drives CRH)
+                    pep.wake_tick(progress=progress, novelty=getattr(self, "_novelty", 0.5),
+                                  surprise=dg.get("surprise", 0.0), threat=threat_raw,
+                                  da=self.nm.tone.get("da", 0.5) - 0.5, social=self._social_cue())
             self.brain.observe_stream(text)             # the mind (hidden state) contexts on it
         self.learn_bps = self._ema(self.learn_bps, len(text) / max(time.time() - _t0, 1e-3))
         self.memory.write(text)                         # whole-life episodic memory
@@ -527,9 +547,17 @@ class BrainLife:
             if payload is not None:
                 src = f"tool:{name}" + (f" ({kind})" if kind != "text" else "")
                 self._teach_q.put((src, payload))
+        self._social_flag = 1.0                          # §16 affiliation cue → OXT (tool/teacher interaction)
         self.teacher_name = name
         self.log(f"tool[{name}]({kind})> {str(out)[:66]}")
         return res
+
+    def _social_cue(self):
+        """§16 ~1.0 on a tool/teacher/teach tick (affiliation cue for OXT), else 0.0. One-shot: consumes a
+        transient flag set in use_tool — a per-interaction cue, not a persistent state."""
+        f = float(getattr(self, "_social_flag", 0.0))
+        self._social_flag = 0.0                          # consume it — transient per-interaction cue
+        return f
 
     def _encode_tool_output(self, kind, out):
         """Fold a tool's output into the ONE byte stream. text → str (learned as language);
@@ -580,6 +608,7 @@ class BrainLife:
             p["neuromod"] = dict(self.nm.tone)
             if hasattr(self, "endocrine"): p["endocrine"] = self.endocrine.state()   # §16 drive/cortisol metrics
             if hasattr(self, "dynamics"): p["dynamics"] = self.dynamics.state()      # §16 P2 entropy/ignition metrics
+            if hasattr(self, "peptides"): p["peptides"] = self.peptides.state()      # §16 peptide-level metrics → /api/state
             p["cerebellum"] = {"eta": self.cereb_eta, "sparsity": self.cerebellum.sparsity,
                                "g_golgi": self.cerebellum.g_golgi, "thr0": self.cerebellum.thr0,
                                "syn_density": getattr(self.cerebellum, "syn_density", 1.0)}
@@ -643,6 +672,8 @@ class BrainLife:
                 applied.update(self.endocrine.set_params(**p))       # §16 drive/cortisol/mood live-tune + toggle `on`
             elif target == "dynamics" and self.modules_on and hasattr(self, "dynamics"):
                 applied.update(self.dynamics.set_params(**p))        # §16 P2 entropy/ignition/frequency live-tune
+            elif target == "peptides" and self.modules_on and hasattr(self, "peptides"):
+                applied.update(self.peptides.set_params(**p))        # §16 slow neuropeptide layer live-tune + toggle `on`
             elif target == "cerebellum" and self.modules_on:
                 if "eta" in p: self.cereb_eta = float(p["eta"]); applied["eta"] = self.cereb_eta
                 if "sparsity" in p: self.cerebellum.sparsity = float(p["sparsity"]); applied["sparsity"] = self.cerebellum.sparsity
@@ -884,7 +915,9 @@ class BrainLife:
             bd = self.bg.device                              # bg may live on its own device
             endo = getattr(self, "endocrine", None)          # §16 homeostatic-RL reward = met-need deficit-drop
             r_home = float(getattr(self, "_r_home", 0.0)) if (endo is not None and endo.on) else 0.0
-            reward = torch.tensor([float(progress) + r_home], device=bd)
+            pep = getattr(self, "peptides", None)            # §16 peptide valence bias (OXT approach / CRH avoid)
+            r_val = pep.valence_bias() if (pep is not None and pep.on) else 0.0
+            reward = torch.tensor([float(progress) + r_home + r_val], device=bd)
             self.bg.train_step(self._topic_feat[self._last_topic:self._last_topic + 1].to(bd),
                                torch.tensor([topic_idx], device=bd), reward)
             self._last_topic = topic_idx
@@ -977,6 +1010,8 @@ class BrainLife:
             self.nm.set_phase("rem" if self._sleep_phase_t % 5 == 0 else "nrem")   # ~1-in-5 ticks = REM
             endo = getattr(self, "endocrine", None)
             if endo is not None and endo.on: endo.sleep_tick()  # §16 sleep RELIEVES cortisol + allostatic load
+            pep = getattr(self, "peptides", None)
+            if pep is not None and pep.on: pep.sleep_tick()      # §16 orexin falls, oxytocin recovers, CRH clears
         # §4 novelty-gated replay (CLS): a life full of NOVEL experience replays harder;
         # a familiar one consolidates lightly (the hippocampal salience signal sets the load).
         # replay load = novelty-gated chunk count × per-chunk BPTT steps. Both are live-tunable
@@ -1680,6 +1715,9 @@ class BrainLife:
                                                        for k in ("D_energy", "D_novelty", "C", "M", "AL")}}
                 if hasattr(self, "dynamics"):                # §16 P2 dynamics: all tunable params
                     life["modules"]["dynamics"] = {k: getattr(self.dynamics, k) for k in self.dynamics._KEYS}
+                if hasattr(self, "peptides"):                # §16 neuropeptides: tunable params + the three pools
+                    life["modules"]["peptides"] = {**{k: getattr(self.peptides, k) for k in self.peptides._KEYS},
+                                                   **{k: getattr(self.peptides, k) for k in ("OXT", "ORX", "CRH")}}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1744,6 +1782,8 @@ class BrainLife:
                     for k, v in m["endocrine"].items(): setattr(self.endocrine, k, v)
                 if hasattr(self, "dynamics") and m.get("dynamics"):     # §16 P2 restore dynamics params
                     for k, v in m["dynamics"].items(): setattr(self.dynamics, k, v)
+                if hasattr(self, "peptides") and m.get("peptides"):     # §16 restore peptide params + pools
+                    for k, v in m["peptides"].items(): setattr(self.peptides, k, v)
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)

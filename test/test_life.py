@@ -73,7 +73,7 @@ def test_set_net_per_module():
     assert L.set_net("neuromod", {"da": 0.9})["applied"]["da"] == 0.9
     assert L.set_net("cerebellum", {"eta": 0.5})["applied"]["eta"] == 0.5
     assert L.set_net("endocrine", {"on": True, "C_star": 0.4})["applied"]["C_star"] == 0.4   # §16 P1
-    assert set(L._net_params().keys()) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum", "endocrine", "dynamics"}
+    assert set(L._net_params().keys()) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum", "endocrine", "dynamics", "peptides"}
 
 
 def test_freezes():
@@ -165,3 +165,15 @@ def test_neurogenesis_adds_dg_cells_in_adult_phase():
     L.neurogenesis = True; L._wake_up()
     assert L.hippo.M == m0 + L.neurogenesis_add                    # DG grew
     assert L.hippo.recall(xi) is not None                         # old memory survives grow() (identity-preserving)
+
+
+def test_neuropeptides_integrated_and_persist():
+    L = _life("pep")
+    assert hasattr(L, "peptides") and L.peptides.on is False        # instantiated, default OFF
+    assert L.set_net("peptides", {"on": True, "k_op": 0.4})["applied"]["on"] is True  # live-tunable, no restart
+    L._learn_text("the cat sat on the mat and the dog ran fast by the river. " * 20, steps=4)  # wired into learn loop
+    assert "peptides" in L._net_params() and "oxytocin" in L._net_params()["peptides"]  # metric surfaced
+    L.peptides.CRH = 0.55; L.peptides.OXT = 0.61
+    d = os.path.join(BASE, "pep"); L.save_life()
+    L2 = BrainLife(d, core="spiking", use_teacher=False, use_visual=False, emb=16, hidden=48, layers=1, device="cpu", resume=True)
+    assert L2.peptides.on is True and abs(L2.peptides.CRH - 0.55) < 1e-9 and abs(L2.peptides.OXT - 0.61) < 1e-9  # pools persist
