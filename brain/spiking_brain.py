@@ -85,7 +85,14 @@ class SpikingBrain(nn.Module):
         # higher (e.g. 10000) descends faster short-term but can run away over long training once
         # synaptogenesis inflates the representation magnitude (measured). Tune up cautiously ≤4000.
         self.eprop_lr_scale = 2000.0           # the BASE rate; the EFFECTIVE rate self-adapts via `attention`
-        self._fanin_pow = 1.0                  # divide the update by N_j^p (p=1 → width-invariant descent)
+        self._fanin_pow = 1.0                  # divide the RECURRENT/input update by N_j^p (p=1 → width-invariant descent)
+        # The readout HEAD reads the WHOLE hidden width (fan-in = hidden), so the same p=1 fan-in norm divides its
+        # update by ~hidden and STARVES it at scale: at hidden=128000 the head moves ~2.8e-8/step and stays frozen
+        # at its random init → the whole net can only reach the byte-frequency baseline (measured: head_w_std≈init,
+        # fb_align_cos≈0, understanding≈0). The head is a simple readout, not a width-invariant recurrent map, so it
+        # gets a gentler power — live-tunable; 0 = no fan-in norm (fastest, UNSTABLE). A/B (hidden=2000, 300 steps):
+        # pow 1.0 → bpb 4.02 head frozen; pow 0.7 → bpb 2.95 acc 0.49 (WIN); pow ≤0.5 → explodes. 0.7 is the sweet spot.
+        self.head_fanin_pow = 0.7
         # SELF-ADAPTING plasticity (§15.17): the learning rate is NOT a fixed dial to hand-tune — it is
         # gated by `attention`, which tracks the brain's OWN learning health (loss vs. its running
         # baseline). A loss spike above baseline (a shock / struggling) DROPS attention → the update
@@ -493,8 +500,9 @@ class SpikingBrain(nn.Module):
         self.attention = (1.0 - aw) * cur_at + aw * attn_t   # over-firing/loss signal pulls the rate down promptly, not over ~10 steps
         self.loss_ema = 0.98 * self.loss_ema + 0.02 * L             # slow learning-health baseline
         scale = float(gate) * lr * self.attention * ((0.5 + da) if diffnm else 1.0)   # ACh gates; ATTENTION self-adapts; DA reward-modulates
-        def _upd(w, g, fin):
-            w.add_((scale * (g / (denom * float(fin) ** p))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
+        def _upd(w, g, fin, pw=p):
+            w.add_((scale * (g / (denom * float(fin) ** pw))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
+        hpow = float(getattr(self, "head_fanin_pow", 0.5))     # gentler fan-in norm for the wide readout head
         for l, c in enumerate(cells):
             if sp(c):
                 _upd(c.rec_val, g_rec[l] * c.rec_mask, c.rec_fanin)   # silent synapses get no update
@@ -505,12 +513,13 @@ class SpikingBrain(nn.Module):
             else:
                 _upd(c.Wrec.weight, g_rec[l], c.Wrec.weight.shape[1])
                 _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
-        _upd(self.head.weight, gHead, self.head.weight.shape[1]); _upd(self.head.bias, gHead_b, 1)
+        _upd(self.head.weight, gHead, self.head.weight.shape[1], pw=hpow)   # head: gentler norm so it isn't starved at width
+        _upd(self.head.bias, gHead_b, 1)
         _upd(self.E.weight, gE, self.E.weight.shape[1])        # sensory byte-embedding update (no longer frozen)
         if learned_fb:                                         # Kolen-Pollack: mirror the head/error grad into
             fb_dec = float(getattr(self, "fb_decay", 1e-4))    # B, then weight-decay → B aligns with W, locally
-            for l in range(len(cells)):
-                _upd(self._fb[l], gHead if l == len(cells) - 1 else gFB[l], self._fb[l].shape[1])
+            for l in range(len(cells)):                         # B must move at the SAME rate as the head (hpow),
+                _upd(self._fb[l], gHead if l == len(cells) - 1 else gFB[l], self._fb[l].shape[1], pw=hpow)  # else it can't align
                 self._fb[l].mul_(1.0 - fb_dec)
         if bounded:                                            # Fusi bounded synapses: clamp to ±w_max
             wm = float(getattr(self, "w_max", 1.0))
@@ -537,6 +546,9 @@ class SpikingBrain(nn.Module):
             mem_mag=float(v[-1].abs().mean()),                               # representation magnitude (runaway indicator)
             grad_mag=float(gHead.abs().mean()),
             update_mag=float((scale * (_grt / (denom * float(_rf) ** p))).clamp(-dmax, dmax).abs().mean()),
+            # head_update_mag = per-step readout Δw. If ~0 while grad_mag>0, the head is STARVED (fan-in norm too
+            # strong at width) → it stays at random init and the net can't learn past the byte-frequency baseline.
+            head_update_mag=float((scale * (gHead / (denom * float(self.head.weight.shape[1]) ** hpow))).clamp(-dmax, dmax).abs().mean()),
             surprise=float(surprise),
             rec_w_mag=float(_ct.rec_val.abs().mean() if sp(_ct) else _ct.Wrec.weight.abs().mean()),
         )
@@ -757,10 +769,10 @@ class SpikingBrain(nn.Module):
 
     # The faithfulness stack (§15.16): each biological constraint is an INDEPENDENT toggle (extends the
     # learn_rule switch), so its capability cost can be measured on the fidelity↔capability curve.
-    _FAITH_KEYS = ("learn_rule", "eprop_lr_scale", "attn_sensitivity", "attn_rate_sens", "feedback_mode",
-                   "fb_decay", "dale", "dendritic", "burst_thr", "bounded_synapses", "w_max", "homeostasis",
-                   "target_rate", "homeo_lr", "btsp", "btsp_beta", "two_compartment", "g_ap", "beta_ap",
-                   "som_baseline", "pv_gain", "diff_neuromod", "stochastic", "spike_noise", "metabolic",
+    _FAITH_KEYS = ("learn_rule", "eprop_lr_scale", "head_fanin_pow", "attn_sensitivity", "attn_rate_sens",
+                   "feedback_mode", "fb_decay", "dale", "dendritic", "burst_thr", "bounded_synapses", "w_max",
+                   "homeostasis", "target_rate", "homeo_lr", "btsp", "btsp_beta", "two_compartment", "g_ap",
+                   "beta_ap", "som_baseline", "pv_gain", "diff_neuromod", "stochastic", "spike_noise", "metabolic",
                    "metabolic_lambda")
 
     @torch.no_grad()
@@ -784,7 +796,7 @@ class SpikingBrain(nn.Module):
                     v = max(0.1, v)
                 elif k == "w_max":
                     v = max(1e-3, v)
-                elif k in ("target_rate", "homeo_lr", "pv_gain", "g_ap", "fb_decay", "burst_thr",
+                elif k in ("target_rate", "homeo_lr", "pv_gain", "g_ap", "fb_decay", "burst_thr", "head_fanin_pow",
                            "som_baseline", "spike_noise", "metabolic_lambda", "attn_sensitivity", "attn_rate_sens"):
                     v = max(0.0, v)
                 elif k in ("btsp_beta", "beta_ap"):

@@ -46,6 +46,14 @@ CHART_KEYS = [                                   # (state field, label, lower_is
     ("cerebellum_mse", "cerebellum MSE ↓", True, ""), ("bg_spike_rate", "§2 BG spike rate", False, ""),
     ("hippo_spike_rate", "§4 hippo spike rate", False, ""), ("hippo_fidelity", "§4 recall fidelity ↑", False, ""),
     ("bg_policy_entropy", "§2 policy entropy", False, " b"), ("replay_total", "replays (cumulative)", False, ""),
+    # cortex learning-health leading indicators (nested under net.weights; flattened into history below). These
+    # diagnose WHY the net does/doesn't learn: head_w_std collapsing to init + head_update_mag≈0 = starved readout;
+    # fb_align_cos≈0 = feedback not aligning; mem_mag climbing = representation runaway; update_mag = recurrent Δw.
+    ("head_w_std", "readout head weight std ↑", False, ""), ("head_update_mag", "head Δw/step ↑", False, ""),
+    ("fb_align_cos", "feedback↔head align ↑", False, ""), ("mem_mag", "representation |v|", False, ""),
+    ("update_mag", "recurrent Δw/step", False, ""), ("grad_mag", "readout grad", False, ""),
+    ("attention", "attention (self-lr)", False, ""), ("eff_lr_scale", "effective lr", False, ""),
+    ("loss_ema", "loss EMA ↓", True, ""), ("next_byte_acc", "next-byte acc ↑", False, ""),
 ]
 
 
@@ -341,9 +349,11 @@ class Controller:
             if "state" in st:
                 self.status = "awake" if st.get("awake") else "sleeping"
                 x = st.get("lived_seconds", int(time.time()))
+                wt = (st.get("net") or {}).get("weights") or {}      # cortex leading-indicator diagnostics live here
                 for k, *_ in CHART_KEYS:
-                    if k in st and isinstance(st[k], (int, float)):
-                        self.history[k].append([x, round(float(st[k]), 4)])
+                    val = st[k] if k in st else wt.get(k)            # top-level field, else a nested weight diagnostic
+                    if isinstance(val, (int, float)):
+                        self.history[k].append([x, round(float(val), 4)])
 
     def _hp(self):
         """The ACTUAL running hyperparameters (read from the live brain, authoritative), so
