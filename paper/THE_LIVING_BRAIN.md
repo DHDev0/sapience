@@ -882,3 +882,122 @@ remembered life** — already a stranger and more capable thing than either comp
 architecture can actually reach. It is, fittingly, the same design principle as the rest of the system: not one
 homogeneous network, but distinct structures coupled by shared activation and a single seat of continuity (§15.1)
 — extended, now, to a structure that was trained in a different world.
+
+# §20 · The ablation matrix — which mechanisms actually earn their keep
+
+§17 closed the gap-map by *building and wiring* the missing fundamentals; §15.17 and §16 measured a few of them.
+But "everything is in it" is an inventory, not a result. The result is knowing **which** of the ~20 learning
+toggles actually lower the loss on a real task — and which are present-but-inert, or actively harmful. This
+section is that measurement: a single reproducible ablation matrix over the awake next-byte-prediction task.
+
+## 20.1 The prerequisite — an unstarved readout (NLMS)
+
+The measurement is only meaningful if the readout head learns; a frozen head pins every configuration at the
+byte-frequency floor and washes out all differences. The head reads the full hidden width, so the fan-in
+power-law normaliser `÷hidden^p` starves it at scale — frozen at hidden = 128 000, yet exploding at `p < 0.5`;
+the stable exponent *drifts with width*, so a pure power law is the wrong model for a readout. The fix
+(`head_norm="energy"`) is **Normalised LMS**: divide the head/feedback update by the realised top-layer membrane
+energy `‖v‖²` instead of a width power. Because `Δlogit_i = μ·err_i·‖v‖²/(‖v‖²+ε) → μ·err_i`, the `‖v‖²` cancels
+and the per-step logit move is invariant to **both** width `N` and firing sparsity `ρ` (`‖v‖²≈ρN⟨v²⟩` auto-
+discounts the ~96 % silent membranes). One `head_lr_scale` transfers from hidden = 256 to 256 000; measured
+Δz\_rms width-ratio is 1.05–1.15 across a 16–32× span (the power law's is not), and it descends below the byte
+floor (bpb 5.5→3.9 at μ = 2.0). It is e-prop-local, adds no per-weight state, needs no forward-pass change, and
+is byte-identical when off. This is the stable learning foundation the ablation runs on.
+
+## 20.2 Method
+
+A fixed harness (`runs/ablation_harness.py`): a **fresh** brain (hidden = 4096, 2 layers, sparse fan-in 32) per
+configuration; train `STEPS = 600` e-prop steps on deterministic wikitext-2 windows with the *same per-step life
+wiring the living brain uses* (peptide/glia gate modulation, glia sense + per-neuron metaplastic gain, plateau
+handle); measure **held-out** bits/byte on a disjoint validation chunk (`bits_per_byte`, a clean no-grad
+forward). The reported score is the **minimum held-out bpb over checkpoints** (learning *capacity*, robust to
+late divergence) with **final** bpb reported alongside as a stability read; three seeds → mean ± std. Each
+mechanism's Δ is measured against the correct reference: the plain baseline, except the two-compartment-gated
+mechanisms (interneurons, plateau) which are scored marginally against a two-compartment reference. Positive Δ
+= the mechanism lowered held-out bpb.
+
+### 20.2.1 Single-toggle results
+
+Baseline (faithful e-prop, random feedback, power head, nothing else): held-out **min-bpb 4.118 ± 0.042**,
+final 4.421. Each mechanism alone, three seeds, sorted by capacity gain (Δcap = how much it lowered the best
+held-out bpb; Δstab = its effect on the *final*-checkpoint bpb, a stability read):
+
+| mechanism | min-bpb | Δcap | Δstab | verdict |
+|---|---|---|---|---|
+| **dale** (E/I sign law) | 3.941 | **+0.176** | +0.151 | earns keep |
+| **interneurons** (PV/SOM/VIP)¹ | 4.203 | **+0.149** | +0.249 | earns keep |
+| **stochastic** (spike noise) | 4.064 | +0.054 | +0.299 | earns keep |
+| **stp** (short-term plasticity) | 4.069 | +0.049 | +0.297 | earns keep |
+| **pc** (predictive coding) | 4.081 | +0.037 | +0.157 | earns keep |
+| **diff_neuromod** | 4.083 | +0.035 | +0.130 | earns keep |
+| **bounded_synapses** | 4.095 | +0.023 | +0.147 | earns keep |
+| **peptides** (gate) | 4.104 | +0.014 | −0.234 | marginal (capacity up, stability down) |
+| **stdp** | 4.107 | +0.011 | +0.273 | earns keep |
+| **dendritic** (apical burst) | 4.109 | +0.009 | +0.313 | earns keep |
+| glia | 4.122 | −0.005 | +0.299 | neutral on bpb, helps stability |
+| plateau¹ | 4.389 | −0.038 | −0.221 | hurts here |
+| btsp | 4.205 | −0.088 | −0.300 | hurts here |
+| learned_fb (Kolen-Pollack) | 4.220 | −0.103 | −1.261 | destabilises at this lr |
+| metabolic | 4.232 | −0.115 | +0.189 | trades capacity for efficiency |
+| homeostasis | 4.237 | −0.119 | −0.061 | trades capacity for long-horizon safety |
+| laminar | 4.379 | −0.262 | +0.042 | thins connectivity — hurts at this scale |
+| head_energy (NLMS) | 4.452 | −0.334 | −0.030 | **scale-dependent** — see below |
+
+¹ scored against a two-compartment reference (4.352), which is a prerequisite for both; two-compartment *alone*
+costs −0.234 capacity, so its payoff is entirely *through* the interneuron pools it enables.
+
+Reading it honestly:
+
+- **Dale's law is the single biggest win.** Constraining each neuron to be purely excitatory or inhibitory —
+  fewer degrees of freedom, not more — lowers held-out bpb the most and improves stability. Structured E/I beats
+  unconstrained sign.
+- **The spiking interneuron pools (§17) are the second-biggest win**, and only after their sparse-regime
+  recalibration (they were silent — a flat metric — at the cortex's real ~4 % firing until PV/SOM were re-tuned
+  to that regime). A mechanism that was *present but inert* became a genuine earner once actually driven.
+- **Most of the §17 plasticity tier gives small, consistent, stability-*positive* gains** (stochastic, STP, STDP,
+  dendritic, predictive coding, differential neuromodulation, bounded synapses). None is a silver bullet; together
+  they are a real, compounding tail — which is exactly what the combination test (§20.2.2) probes.
+- **`head_energy` (NLMS) *hurts* at hidden = 4096 — and that is the correct result.** 4096 is *below* the
+  starvation regime where the power head is fine and faster; NLMS is a *scale* mechanism whose win only appears
+  where the power head freezes (128 000+). The ablation faithfully reports it as net-negative at this width, and
+  the width sweep (§20.1) reports it as decisive at scale. Reporting the honest scale-dependence is the point.
+- **`homeostasis`/`metabolic` cost capacity on a 600-step horizon** because their value — runaway prevention and
+  energy economy — is a *long-horizon* property this short task does not stress (see §16). `learned_fb`'s
+  Kolen-Pollack loop is actively *destabilising* at this learning rate (final bpb diverges to 5.68); it is a
+  candidate for a lower feedback learning rate, not for the default-on set.
+
+<!-- ABLATION_RESULTS -->
+
+## 20.3 Scope — what this matrix does and does not measure
+
+This measures mechanisms that shape the **awake next-byte weight update**: the faithfulness stack and the §17
+plasticity tier (STDP, STP, dendritic plateau, interneurons, glia, laminar, predictive coding) plus the
+peptide/glia gate. Four §17 mechanisms are **deliberately excluded** because their value is not a next-byte-bpb
+quantity: sharp-wave-ripple and theta-sequence consolidation act during *sleep*; embodiment and grid/place act on
+*world* and *navigation* tasks. Folding them into a bpb number would understate them by construction; they are
+measured on their own tasks in the living loop (endocrine's stress-protection A/B, §16, is the template).
+Reporting a mechanism as bpb-neutral here is therefore a statement about the language task only, not a verdict.
+
+## 20.4 The one biophysical import — connectome-as-initialisation
+
+§18.4 named connectome-as-initialisation as the single biophysical idea on this model's axis. Here is its A/B:
+seed the sparse recurrent graph from realistic connectivity *statistics* — a distance-dependent (exponential
+distance rule) small-world topology with log-normal synaptic weights (mean-|w| matched to the random baseline so
+only the *distribution* and *topology* differ) — versus the flat uniform-random fan-in, same seed and data, and
+compare the learning curve and best bits/byte.
+
+<!-- CONNECTOME_RESULTS -->
+
+## 20.5 Replication
+
+```bash
+conda activate llm
+cd sapience
+python runs/ablation_harness.py single      # per-toggle matrix   → runs/ablation_results.json
+python runs/ablation_harness.py combo       # full-stack + LOO    → runs/ablation_combo_results.json
+python runs/ablation_harness.py connectome  # connectome A/B      → runs/connectome_results.json
+```
+
+Every number in this section is one of those three JSON files; the harness fixes the seed set, corpus slice,
+step budget, and architecture at the top of the file. The NLMS head, the per-mechanism live wiring, and the
+connectome rewiring are all in that one script plus `brain/spiking_brain.py`.

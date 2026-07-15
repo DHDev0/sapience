@@ -1,0 +1,431 @@
+{
+  "config": {
+    "hidden": 4096,
+    "layers": 2,
+    "seq": 48,
+    "bs": 16,
+    "steps": 600,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "device": "cuda"
+  },
+  "runs": [
+    {
+      "name": "baseline",
+      "toggles": [],
+      "bpb_mean": 4.1178,
+      "bpb_std": 0.0417,
+      "bpb_seeds": [
+        4.0705,
+        4.1721,
+        4.1108
+      ],
+      "final_mean": 4.4214,
+      "final_seeds": [
+        4.0705,
+        4.3027,
+        4.891
+      ]
+    },
+    {
+      "name": "two_compartment",
+      "toggles": [
+        "two_compartment"
+      ],
+      "bpb_mean": 4.3517,
+      "bpb_std": 0.0571,
+      "bpb_seeds": [
+        4.2882,
+        4.3402,
+        4.4266
+      ],
+      "final_mean": 4.451,
+      "final_seeds": [
+        4.2882,
+        4.4183,
+        4.6465
+      ]
+    },
+    {
+      "name": "learned_fb",
+      "toggles": [
+        "learned_fb"
+      ],
+      "bpb_mean": 4.2203,
+      "bpb_std": 0.0278,
+      "bpb_seeds": [
+        4.2289,
+        4.1827,
+        4.2492
+      ],
+      "final_mean": 5.6822,
+      "final_seeds": [
+        7.1375,
+        5.2061,
+        4.703
+      ],
+      "delta_vs_ref": -0.1025,
+      "ref": "baseline"
+    },
+    {
+      "name": "bounded_synapses",
+      "toggles": [
+        "bounded_synapses"
+      ],
+      "bpb_mean": 4.0949,
+      "bpb_std": 0.0193,
+      "bpb_seeds": [
+        4.0689,
+        4.1151,
+        4.1006
+      ],
+      "final_mean": 4.2743,
+      "final_seeds": [
+        4.0689,
+        4.1151,
+        4.6388
+      ],
+      "delta_vs_ref": 0.0229,
+      "ref": "baseline"
+    },
+    {
+      "name": "homeostasis",
+      "toggles": [
+        "homeostasis"
+      ],
+      "bpb_mean": 4.2372,
+      "bpb_std": 0.0476,
+      "bpb_seeds": [
+        4.2619,
+        4.279,
+        4.1706
+      ],
+      "final_mean": 4.4822,
+      "final_seeds": [
+        4.9126,
+        4.2948,
+        4.2391
+      ],
+      "delta_vs_ref": -0.1194,
+      "ref": "baseline"
+    },
+    {
+      "name": "btsp",
+      "toggles": [
+        "btsp"
+      ],
+      "bpb_mean": 4.2054,
+      "bpb_std": 0.0869,
+      "bpb_seeds": [
+        4.2005,
+        4.3141,
+        4.1016
+      ],
+      "final_mean": 4.7218,
+      "final_seeds": [
+        5.1618,
+        4.4995,
+        4.5041
+      ],
+      "delta_vs_ref": -0.0876,
+      "ref": "baseline"
+    },
+    {
+      "name": "dale",
+      "toggles": [
+        "dale"
+      ],
+      "bpb_mean": 3.9414,
+      "bpb_std": 0.0403,
+      "bpb_seeds": [
+        3.8951,
+        3.9358,
+        3.9934
+      ],
+      "final_mean": 4.27,
+      "final_seeds": [
+        3.8951,
+        4.0368,
+        4.8781
+      ],
+      "delta_vs_ref": 0.1764,
+      "ref": "baseline"
+    },
+    {
+      "name": "dendritic",
+      "toggles": [
+        "dendritic"
+      ],
+      "bpb_mean": 4.1086,
+      "bpb_std": 0.0029,
+      "bpb_seeds": [
+        4.1112,
+        4.11,
+        4.1046
+      ],
+      "final_mean": 4.1086,
+      "final_seeds": [
+        4.1112,
+        4.11,
+        4.1046
+      ],
+      "delta_vs_ref": 0.0092,
+      "ref": "baseline"
+    },
+    {
+      "name": "diff_neuromod",
+      "toggles": [
+        "diff_neuromod"
+      ],
+      "bpb_mean": 4.0828,
+      "bpb_std": 0.0232,
+      "bpb_seeds": [
+        4.0885,
+        4.052,
+        4.1079
+      ],
+      "final_mean": 4.2918,
+      "final_seeds": [
+        4.0885,
+        4.052,
+        4.7348
+      ],
+      "delta_vs_ref": 0.035,
+      "ref": "baseline"
+    },
+    {
+      "name": "stochastic",
+      "toggles": [
+        "stochastic"
+      ],
+      "bpb_mean": 4.0638,
+      "bpb_std": 0.0248,
+      "bpb_seeds": [
+        4.0321,
+        4.0926,
+        4.0668
+      ],
+      "final_mean": 4.1221,
+      "final_seeds": [
+        4.0321,
+        4.0926,
+        4.2416
+      ],
+      "delta_vs_ref": 0.054,
+      "ref": "baseline"
+    },
+    {
+      "name": "metabolic",
+      "toggles": [
+        "metabolic"
+      ],
+      "bpb_mean": 4.2323,
+      "bpb_std": 0.0078,
+      "bpb_seeds": [
+        4.2412,
+        4.2336,
+        4.2222
+      ],
+      "final_mean": 4.2323,
+      "final_seeds": [
+        4.2412,
+        4.2336,
+        4.2222
+      ],
+      "delta_vs_ref": -0.1145,
+      "ref": "baseline"
+    },
+    {
+      "name": "head_energy",
+      "toggles": [
+        "head_energy"
+      ],
+      "bpb_mean": 4.4517,
+      "bpb_std": 0.0126,
+      "bpb_seeds": [
+        4.4685,
+        4.4487,
+        4.438
+      ],
+      "final_mean": 4.4517,
+      "final_seeds": [
+        4.4685,
+        4.4487,
+        4.438
+      ],
+      "delta_vs_ref": -0.3339,
+      "ref": "baseline"
+    },
+    {
+      "name": "stdp",
+      "toggles": [
+        "stdp"
+      ],
+      "bpb_mean": 4.1066,
+      "bpb_std": 0.0239,
+      "bpb_seeds": [
+        4.1402,
+        4.0932,
+        4.0863
+      ],
+      "final_mean": 4.1485,
+      "final_seeds": [
+        4.1402,
+        4.2189,
+        4.0863
+      ],
+      "delta_vs_ref": 0.0112,
+      "ref": "baseline"
+    },
+    {
+      "name": "stp",
+      "toggles": [
+        "stp"
+      ],
+      "bpb_mean": 4.0691,
+      "bpb_std": 0.0306,
+      "bpb_seeds": [
+        4.0719,
+        4.0302,
+        4.1051
+      ],
+      "final_mean": 4.1249,
+      "final_seeds": [
+        4.1405,
+        4.0302,
+        4.2039
+      ],
+      "delta_vs_ref": 0.0487,
+      "ref": "baseline"
+    },
+    {
+      "name": "interneurons",
+      "toggles": [
+        "interneurons"
+      ],
+      "bpb_mean": 4.2025,
+      "bpb_std": 0.0165,
+      "bpb_seeds": [
+        4.2229,
+        4.1824,
+        4.2021
+      ],
+      "final_mean": 4.2025,
+      "final_seeds": [
+        4.2229,
+        4.1824,
+        4.2021
+      ],
+      "delta_vs_ref": 0.1492,
+      "ref": "two_compartment"
+    },
+    {
+      "name": "plateau",
+      "toggles": [
+        "plateau"
+      ],
+      "bpb_mean": 4.3892,
+      "bpb_std": 0.0223,
+      "bpb_seeds": [
+        4.4146,
+        4.3603,
+        4.3928
+      ],
+      "final_mean": 4.6719,
+      "final_seeds": [
+        4.4829,
+        4.7937,
+        4.7391
+      ],
+      "delta_vs_ref": -0.0375,
+      "ref": "two_compartment"
+    },
+    {
+      "name": "glia",
+      "toggles": [
+        "glia"
+      ],
+      "bpb_mean": 4.1224,
+      "bpb_std": 0.013,
+      "bpb_seeds": [
+        4.1391,
+        4.1076,
+        4.1204
+      ],
+      "final_mean": 4.1224,
+      "final_seeds": [
+        4.1391,
+        4.1076,
+        4.1204
+      ],
+      "delta_vs_ref": -0.0046,
+      "ref": "baseline"
+    },
+    {
+      "name": "laminar",
+      "toggles": [
+        "laminar"
+      ],
+      "bpb_mean": 4.3794,
+      "bpb_std": 0.0084,
+      "bpb_seeds": [
+        4.3909,
+        4.3762,
+        4.371
+      ],
+      "final_mean": 4.3794,
+      "final_seeds": [
+        4.3909,
+        4.3762,
+        4.371
+      ],
+      "delta_vs_ref": -0.2616,
+      "ref": "baseline"
+    },
+    {
+      "name": "peptides",
+      "toggles": [
+        "peptides"
+      ],
+      "bpb_mean": 4.1037,
+      "bpb_std": 0.0492,
+      "bpb_seeds": [
+        4.1384,
+        4.1385,
+        4.0341
+      ],
+      "final_mean": 4.655,
+      "final_seeds": [
+        5.1546,
+        4.5962,
+        4.2143
+      ],
+      "delta_vs_ref": 0.0141,
+      "ref": "baseline"
+    },
+    {
+      "name": "pc",
+      "toggles": [
+        "pc"
+      ],
+      "bpb_mean": 4.0811,
+      "bpb_std": 0.0257,
+      "bpb_seeds": [
+        4.049,
+        4.0825,
+        4.112
+      ],
+      "final_mean": 4.2645,
+      "final_seeds": [
+        4.049,
+        4.0825,
+        4.6622
+      ],
+      "delta_vs_ref": 0.0367,
+      "ref": "baseline"
+    }
+  ]
+}
