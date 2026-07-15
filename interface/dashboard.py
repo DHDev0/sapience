@@ -48,6 +48,9 @@ CHART_KEYS = [                                   # (state field, label, lower_is
     ("bg_policy_entropy", "§2 policy entropy", False, " b"), ("replay_total", "replays (cumulative)", False, ""),
     ("ripple_rate", "SWR ripple rate", False, ""), ("gated_commit_fraction", "SWR gated-commit frac", False, ""),
     ("seq_recall_acc", "§17 sequence recall ↑", False, ""), ("n_trajectories", "§17 trajectories", False, ""),
+    ("world_return", "§17 world return ↑", False, ""), ("world_return_random", "§17 random baseline", False, ""),
+    ("advantage", "§17 advantage ↑", False, ""), ("world_success_rate", "§17 goal reached ↑", False, ""),
+    ("world_steps_to_goal", "§17 steps to goal ↓", True, ""), ("world_surprise", "§17 world surprise ↓", True, ""),
     # cortex learning-health leading indicators (nested under net.weights; flattened into history below). These
     # diagnose WHY the net does/doesn't learn: head_w_std collapsing to init + head_update_mag≈0 = starved readout;
     # fb_align_cos≈0 = feedback not aligning; mem_mag climbing = representation runaway; update_mag = recurrent Δw.
@@ -624,7 +627,7 @@ main{display:grid;grid-template-columns:340px 1fr;gap:10px;padding:10px}
   <div class=card style=margin-top:10px><h3>💾 resources — usage vs limit</h3><div id=resources></div></div>
   <div class=card style=margin-top:10px><h3>🎚 tune a module (live)</h3>
    <div style=display:flex;gap:4px>
-    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option><option>endocrine</option><option>dynamics</option><option>peptides</option><option>glia</option><option>stdp</option><option>stp</option><option>plateau</option><option>interneurons</option><option>laminar</option><option>ripple</option><option>theta</option></select>
+    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option><option>endocrine</option><option>dynamics</option><option>peptides</option><option>glia</option><option>stdp</option><option>stp</option><option>plateau</option><option>interneurons</option><option>laminar</option><option>ripple</option><option>theta</option><option>embodiment</option></select>
     <input id=nt_key placeholder="param (lr, beta, da…)" style=flex:1><input id=nt_val placeholder="value" style=width:70px>
     <button class=b-go onclick=setNet()>set</button>
    </div>
@@ -868,7 +871,7 @@ API_HELP = {
                      "sleep_mode (buffer|generative), gr_dreams, gr_dream_len, gr_temperature, gr_anchor_frac (§16 P0 replay), "
                      "neurogenesis, neurogenesis_add, neurogenesis_every (§16 adult-DG neurogenesis). "
                      "(initial neurons/layers/device/core need /api/start relaunch.)",
-    "POST /api/net": "tune a PART (or 'all') of the net live: {target: cortex|cerebellum|hippocampus|bg|neuromod|endocrine|dynamics|all, ...params} — "
+    "POST /api/net": "tune a PART (or 'all') of the net live: {target: cortex|cerebellum|hippocampus|bg|neuromod|endocrine|dynamics|peptides|glia|stdp|stp|plateau|interneurons|laminar|ripple|theta|embodiment|all, ...params} — "
                      "cortex {lr,read_alpha,seq,think_temp,prune_frac,grow_syn_frac}, cerebellum {eta,sparsity,g_golgi,thr0,grow_syn_frac,prune_frac}, "
                      "hippocampus {beta,sparsity,capacity,thr,g_inh,grow_syn_frac,prune_frac}, bg {alpha_v,alpha_pi,beta,thr,grow_syn_frac,prune_frac}, "
                      "neuromod {da,ach,ne,ht}, endocrine {on,alpha_D,tau_C,C_star,C_sigma,k_thr,k_pe,k_need,drive_met,novelty_met,lam_mood,al_thr} (§16 P1), "
@@ -881,7 +884,8 @@ API_HELP = {
                      "interneurons {on,n_pv,n_som,n_vip,beta_i,thr_pv,thr_som,thr_vip,...} (§17 PV/SOM/VIP spiking pools; needs two_compartment), "
                      "laminar {on,frac_L4,frac_L23,frac_L56,allow_fb,input_to_l23,apical_l4_gain,strict} (§17 canonical L4/L2-3/L5-6 microcircuit), "
                      "ripple {on,f_so,dt,p0,up_thr,refractory,press_gain,debt_gain,debt_scale,rem_suppress,seed} (§16 SWR-gated consolidation), "
-                     "theta {on,L,capacity,beta,g_inh,thr,fwd_frac,ripple_k,commit_on_boundary} (§17 hippocampal sequence memory). "
+                     "theta {on,L,capacity,beta,g_inh,thr,fwd_frac,ripple_k,commit_on_boundary} (§17 hippocampal sequence memory), "
+                     "embodiment {on,grid,max_steps,gamma,explore_temp,epistemic_w,step_cost,cadence} (§17 active-inference world loop). "
                      "Every region has its own live synapse grow rate (grow_syn_frac).",
     "POST /api/arch": "LIVE per-region OR global neuron/synapse surgery: {target: cortex|cerebellum|bg|hippocampus|all, op, amount?, density?}. "
                       "ops: grow_neurons, set_neurons (grow to a TARGET count), grow_synapses (amount<1 = fraction), "

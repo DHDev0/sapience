@@ -36,6 +36,7 @@ from .interneurons import SpikingInterneurons
 from .laminar import LaminarMicrocircuit
 from .ripple import SharpWaveRipple
 from .theta_seq import ThetaSequenceMemory
+from .embodiment import SpikingEmbodiment
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -182,6 +183,8 @@ class BrainLife:
                 self.brain.interneurons = SpikingInterneurons(self.dev, dtype=next(self.brain.parameters()).dtype)
             self.laminar = LaminarMicrocircuit(self.dev, dtype=self.brain.head.weight.dtype)  # §17 laminar microcircuit (default OFF)
             self.ripple = SharpWaveRipple(self.dev, seed=seed)                          # §16 SWR-gated consolidation (default OFF)
+            self.embodiment = SpikingEmbodiment(self.dev, dtype=self.dtype, seed=seed)  # §17 closed sensorimotor loop (active inference), DEFAULT OFF
+            self._last_world = 0.0                                                       # §17 embodied-step throttle stamp
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
             self.theta = ThetaSequenceMemory(self.hippo, self.dev)                      # §17 temporal-order memory (rides the hippo DG)
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
@@ -647,6 +650,7 @@ class BrainLife:
                 p["interneurons"] = self.brain.interneurons.state()                 # §17 PV/SOM/VIP pool rates
             if hasattr(self, "ripple"): p["ripple"] = self.ripple.state()           # §16 SWR ripple-rate/gated-commit metrics
             if hasattr(self, "theta"): p["theta"] = self.theta.state()              # §17 sequence-memory metrics
+            if hasattr(self, "embodiment"): p["embodiment"] = self.embodiment.state()  # §17 active-inference world metrics
             if hasattr(self, "laminar"):                                            # §17 per-lamina rate + config → /api/state
                 if self.laminar.on:
                     try:
@@ -734,6 +738,8 @@ class BrainLife:
                 applied.update(self.ripple.set_params(**p))          # §16 SWR-gated consolidation live-tune + toggle
             elif target == "theta" and self.modules_on and hasattr(self, "theta"):
                 applied.update(self.theta.set_params(**p))           # §17 sequence-memory live-tune + toggle `on`
+            elif target == "embodiment" and self.modules_on and hasattr(self, "embodiment"):
+                applied.update(self.embodiment.set_params(**p))      # §17 world loop live-tune + toggle `on`
             elif target == "laminar" and self.modules_on and hasattr(self, "laminar"):
                 was_on = self.laminar.on
                 applied.update(self.laminar.set_params(**p))         # §17 canonical microcircuit live-tune + toggle
@@ -889,6 +895,48 @@ class BrainLife:
             self._learn_text(vtext[:1400], steps=6)         # learn the page's language
             self.debt += 1.0
             vb.scroll(1000)
+
+    def _live_in_world(self, on_update=None):
+        """§17 · one step of the closed sensorimotor loop (active inference), run BESIDE thought, throttled by
+        embodiment.cadence. Closes obs → BG actor → ACTION → world → new obs + reward → learning, and
+        INTERCONNECTS: endocrine NE/sleep-pressure set the exploration temperature; the world reward drives the
+        SAME §5 dopamine tone the cortex three-factor e-prop gate reads; forward-model surprise feeds the endocrine
+        surprise channel; the cortex PERCEIVES the frame via _learn_text once per episode. DEFAULT OFF."""
+        e = self.embodiment
+        endo = getattr(self, "endocrine", None)
+        ne = endo.ne_gain() if (endo is not None and endo.on) else float(self.nm.tone.get("ne", 1.0))
+        sp = (endo.sleep_pressure() - 1.0) if (endo is not None and endo.on) else 0.0
+        r_home = float(getattr(self, "_r_home", 0.0)) if (endo is not None and endo.on) else 0.0
+        feat = e.observe()
+        a, pi, epi = e.act(feat, ne=ne, sleep_pressure=max(0.0, sp))
+        reward, next_feat, done = e.world.step(int(a))
+        if not self.freeze_learning:
+            surprise, rpe = e.learn(feat, a, reward, next_feat, r_home=r_home)
+        else:
+            surprise = e.surprise
+        # act → learn beyond the RL nets: world reward modulates the SAME §5 dopamine tone the cortex e-prop gate reads
+        self.nm.tone["da"] = 0.9 * self.nm.tone["da"] + 0.1 * (0.5 + max(-0.5, min(0.5, float(reward))))
+        if endo is not None and endo.on:
+            endo.wake_tick(surprise=float(surprise))         # §16 same surprise channel the cortex uses
+        self._world_ret = getattr(self, "_world_ret", 0.0) + float(reward)
+        self._world_steps = getattr(self, "_world_steps", 0) + 1
+        if done:
+            reached = (e.world.pos == e.world.goal)
+            e._finish_episode(self._world_ret, self._world_steps, reached)
+            try:                                             # cortex PERCEIVES its embodiment via the unified byte-code
+                self._learn_text(self._world_frame(int(a), float(reward), reached), steps=2)
+            except Exception:
+                pass
+            e.world.reset(); self._world_ret = 0.0; self._world_steps = 0
+            self.debt += 0.2                                 # living in the world tires the brain (sleep pressure)
+        self._last_world = time.time()
+
+    def _world_frame(self, a, reward, reached):
+        """Render an embodied episode-end into a short frame on the unified 'world' nerve so the cortex perceives
+        its own embodiment in the one stream (kept tiny to avoid injecting noise into the language stream)."""
+        pos = self.embodiment.world.pos
+        tag = senses.NERVE.get("world", b"").decode("latin-1") if hasattr(senses, "NERVE") else ""
+        return f"{tag}world a{a} r{reward:+.2f} p{pos[0]}{pos[1]} {'G' if reached else '.'}"
 
     def _consume_perceptions(self, on_update):
         # directed lessons (teach() / tool outputs) are learned FIRST (priority)
@@ -1084,6 +1132,9 @@ class BrainLife:
             self.nm.set_phase("rem" if self._sleep_phase_t % 5 == 0 else "nrem")   # ~1-in-5 ticks = REM
             endo = getattr(self, "endocrine", None)
             if endo is not None and endo.on: endo.sleep_tick()  # §16 sleep RELIEVES cortisol + allostatic load
+            emb = getattr(self, "embodiment", None)             # §17 Dyna: model-based consolidation of imagined transitions
+            if emb is not None and emb.on and not self.freeze_learning:
+                emb.dyna_replay(k=int(getattr(self, "sleep_chunks", 10)))
             pep = getattr(self, "peptides", None)
             if pep is not None and pep.on: pep.sleep_tick()      # §16 orexin falls, oxytocin recovers, CRH clears
             glia = getattr(self, "glia", None)
@@ -1228,6 +1279,9 @@ class BrainLife:
                 if time.time() - getattr(self, "_last_reson", 0) > 5.0:
                     self._resonate(on_update)                # resonate in parallel every ~5s
                     self._last_reson = time.time()
+                if getattr(self, "embodiment", None) is not None and self.embodiment.on \
+                        and time.time() - getattr(self, "_last_world", 0) > self.embodiment.cadence:
+                    self._live_in_world(on_update)           # §17 one embodied active-inference step (throttled by cadence)
                 self.cycle += 1
                 if self.should_sleep(): self._begin_sleep()
                 self._emit(on_update)
@@ -1755,6 +1809,9 @@ class BrainLife:
                   hippo_spike_rate=nd.get("hippo_spike_rate"), hippo_fidelity=nd.get("hippo_fidelity"),
                   bg_policy_entropy=nd.get("bg_policy_entropy"),
                   replay_total=getattr(self, "_replay_count", 0),
+                  **{k: (self.embodiment.state().get(k) if hasattr(self, "embodiment") else None)   # §17 world-loop chart metrics
+                     for k in ("world_return", "world_return_random", "advantage",
+                               "world_success_rate", "world_steps_to_goal", "world_surprise", "world_episodes")},
                   ripple_rate=self.ripple.state()["ripple_rate"] if hasattr(self, "ripple") else 0.0,                        # §16 SWR density
                   gated_commit_fraction=self.ripple.state()["gated_commit_fraction"] if hasattr(self, "ripple") else 1.0,   # §16 selective-commit
                   sleep_mode=getattr(self, "sleep_mode", "buffer"),          # §16 consolidation mode
@@ -1857,6 +1914,13 @@ class BrainLife:
                     life["modules"]["theta"] = {**{k: getattr(self.theta, k) for k in self.theta._KEYS},
                                                 "seq_vals": self.theta.seq_vals, "seq_texts": self.theta.seq_texts,
                                                 "traj": self.theta.traj}
+                if hasattr(self, "embodiment"):              # §17 embodiment: params + world-BG/forward-model + curve stats
+                    e = self.embodiment
+                    life["modules"]["embodiment"] = dict(
+                        params={k: getattr(e, k) for k in e._KEYS},
+                        wbg_M=e.bg.M, wbg_wv=e.bg.w_v, wbg_Wpi=e.bg.W_pi, fwd_W=e.fwd.W, fwd_M=e.fwd.M,
+                        return_ema=e.return_ema, return_random=e.return_random, success_rate=e.success_rate,
+                        steps_to_goal=e.steps_to_goal, surprise=e.surprise, episodes=e.episodes)
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1942,6 +2006,18 @@ class BrainLife:
                         self.laminar.rebuild(self.brain)                # masks derived from lamina+A → deterministic
                 if hasattr(self, "ripple") and m.get("ripple"):        # §16 SWR restore params (reseeds RNG on `seed`)
                     self.ripple.set_params(**{k: v for k, v in m["ripple"].items() if k in self.ripple._KEYS})
+                em = m.get("embodiment")                                # §17 restore world loop (params first, then shape-guarded tensors)
+                if hasattr(self, "embodiment") and em:
+                    e = self.embodiment
+                    for k, v in em.get("params", {}).items(): setattr(e, k, v)
+                    e._build_world(); e._build_nets()
+                    if em["wbg_M"].shape == e.bg.M.shape:
+                        e.bg.M = em["wbg_M"].to(self.dev); e.bg.w_v = em["wbg_wv"].to(self.dev); e.bg.W_pi = em["wbg_Wpi"].to(self.dev)
+                    if em["fwd_W"].shape == e.fwd.W.shape:
+                        e.fwd.W = em["fwd_W"].to(self.dev); e.fwd.M = em["fwd_M"].to(self.dev)
+                    e.return_ema = em.get("return_ema", 0.0); e.return_random = em.get("return_random", 0.0)
+                    e.success_rate = em.get("success_rate", 0.0); e.steps_to_goal = em.get("steps_to_goal", float(e.max_steps))
+                    e.surprise = em.get("surprise", 0.0); e.episodes = em.get("episodes", 0)
                 if hasattr(self, "theta") and m.get("theta"):          # §17 restore sequence memory (keys rebuilt in current DG)
                     td = m["theta"]
                     self.theta.set_params(**{k: td[k] for k in self.theta._KEYS if k in td})
