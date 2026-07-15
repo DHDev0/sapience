@@ -622,6 +622,7 @@ class BrainLife:
             if hasattr(self, "dynamics"): p["dynamics"] = self.dynamics.state()      # §16 P2 entropy/ignition metrics
             if hasattr(self, "peptides"): p["peptides"] = self.peptides.state()      # §16 peptide-level metrics → /api/state
             if hasattr(self, "glia"): p["glia"] = self.glia.state()                  # §17 astrocyte field metrics
+            if hasattr(self.brain, "stdp"): p["stdp"] = self.brain.stdp.state()      # §15.18 STDP timing metrics
             p["cerebellum"] = {"eta": self.cereb_eta, "sparsity": self.cerebellum.sparsity,
                                "g_golgi": self.cerebellum.g_golgi, "thr0": self.cerebellum.thr0,
                                "syn_density": getattr(self.cerebellum, "syn_density", 1.0)}
@@ -689,6 +690,8 @@ class BrainLife:
                 applied.update(self.peptides.set_params(**p))        # §16 slow neuropeptide layer live-tune + toggle `on`
             elif target == "glia" and self.modules_on and hasattr(self, "glia"):
                 applied.update(self.glia.set_params(**p))            # §17 astrocyte field live-tune + toggle `on`
+            elif target == "stdp" and hasattr(self.brain, "stdp"):
+                applied.update(self.brain.stdp.set_params(**p))      # §15.18 STDP live-tune + toggle `on` (no restart)
             elif target == "cerebellum" and self.modules_on:
                 if "eta" in p: self.cereb_eta = float(p["eta"]); applied["eta"] = self.cereb_eta
                 if "sparsity" in p: self.cerebellum.sparsity = float(p["sparsity"]); applied["sparsity"] = self.cerebellum.sparsity
@@ -1738,6 +1741,8 @@ class BrainLife:
                 if hasattr(self, "glia"):                    # §17 astrocyte field: tunable params + per-neuron field
                     life["modules"]["glia"] = {**{k: getattr(self.glia, k) for k in self.glia._KEYS},
                                                "a": [t.detach().cpu() for t in self.glia.a]}
+                if hasattr(self.brain, "stdp"):              # §15.18 STDP: all tunable params
+                    life["modules"]["stdp"] = {k: getattr(self.brain.stdp, k) for k in self.brain.stdp._KEYS}
             torch.save(life, self.ckpt + ".life")
         except Exception as e:
             self.log(f"checkpoint failed: {str(e)[:50]}")
@@ -1809,6 +1814,8 @@ class BrainLife:
                     for k in self.glia._KEYS:
                         if k in gm: setattr(self.glia, k, gm[k])
                     self.glia.load_field(gm.get("a"), [c.hid for c in self.brain.cells])
+                if hasattr(self.brain, "stdp") and m.get("stdp"):       # §15.18 restore STDP params
+                    self.brain.stdp.set_params(**m["stdp"])
             # resume AWAKE — restoring a mid-sleep state would drive sleep_remaining<0 on the
             # first tick and fabricate a spurious night + develop/grow (age++). Wake up fresh.
             # (wake tone already set above, before the set_net tuning restore.)

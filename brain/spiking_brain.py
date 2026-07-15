@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .spiking import LIFCell, ALIFCell, SparseLIFCell, SparseALIFCell
 from . import synapse
+from .stdp import SpikingSTDP
 
 
 class SpikingBrain(nn.Module):
@@ -100,6 +101,9 @@ class SpikingBrain(nn.Module):
         # attention rises to engage. This is the Yerkes–Dodson arousal→plasticity curve; it removes the
         # need to manually chase eprop_lr_scale and would have auto-damped the Dale/lr excursions.
         self.attention = 1.0
+        # §15.18 pair-based asymmetric STDP (timing-refined sibling of eps_rec/eps_in). DEFAULT OFF; single
+        # source of truth = self.stdp.on (routed by set_faith). Holds only float scalars + device/dtype refs.
+        self.stdp = SpikingSTDP(device=device, dtype=dtype)
         self.loss_ema = None
         self.attn_sensitivity = 0.8            # how sharply attention drops with above-baseline loss
         self.attn_rate_sens = 0.25             # how sharply attention drops when firing runs > 2× the homeostatic
@@ -379,6 +383,17 @@ class SpikingBrain(nn.Module):
             for i in range(0, B, ch):
                 out += (gp[i:i + ch][:, row] * ea[i:i + ch]).sum(0)
             return out
+        # §15.18 STDP: fast spike-time traces (timing-refined siblings of eps_rec/eps_in) + per-edge deltas.
+        # Reallocated every step from current c.hid / g_rec shapes → a mid-life grow() cannot desync it.
+        sd = getattr(self, "stdp", None); do_stdp = sd is not None and sd.on
+        if do_stdp:
+            lam_p, lam_m = sd.decay()
+            xr_p = [torch.zeros(B, c.hid, device=dev) for c in cells]      # per-layer PRE trace  (λ₊)
+            xr_m = [torch.zeros(B, c.hid, device=dev) for c in cells]      # per-layer POST trace (λ₋)
+            xi_p = [torch.zeros(B, c.in_dim, device=dev) for c in cells]   # input-matrix PRE trace (λ₊)
+            stdp_rec = [torch.zeros_like(g) for g in g_rec]                # shares g_rec shape/partition (FSDP)
+            stdp_in = [torch.zeros_like(g) for g in g_in]
+            ltp_acc = ltd_acc = 0.0
         tot_loss = 0.0
         for tt in range(T):
             layer_in = inp[:, tt]; psi = []
@@ -411,6 +426,15 @@ class SpikingBrain(nn.Module):
                 if diffnm: eb = min(0.995, eb * ht_pat)        # 5-HT stretches the eligibility window (patience)
                 eps_rec[l] = eb * eps_rec[l] + z_prev          # ε^v forward eligibility (per pre-neuron)
                 eps_in[l] = eb * eps_in[l] + layer_in
+                if do_stdp and sp(c):                          # STDP rides the sparse cortex (edge-wise, O(nnz·B))
+                    dr, lp_r, ld_r = sd.edge_delta(z[l], z[l], xr_p[l], xr_m[l], c.rec_row, c.rec_col)
+                    stdp_rec[l] += dr; ltp_acc += lp_r; ltd_acc += ld_r
+                    if c.sparse_in:                            # post=z[l] (hid), pre=layer_in (in_dim)
+                        di, lp_i, ld_i = sd.edge_delta(z[l], layer_in, xi_p[l], xr_m[l], c.in_row, c.in_col)
+                        stdp_in[l] += di; ltp_acc += lp_i; ltd_acc += ld_i
+                    xr_p[l] = lam_p * xr_p[l] + z[l]           # advance AFTER the delta (t-1 → t)
+                    xr_m[l] = lam_m * xr_m[l] + z[l]
+                    xi_p[l] = lam_p * xi_p[l] + layer_in
                 if al[l]:                                      # ε^a = ψ_j·ε^v_i + (ρ − β_a·ψ_j)·ε^a (per synapse)
                     ba, rho = c.beta_adapt, c.rho
                     if sp(c):
@@ -508,6 +532,16 @@ class SpikingBrain(nn.Module):
         def _upd(w, g, fin, pw=p):
             w.add_((scale * (g / (denom * float(fin) ** pw))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
         hpow = float(getattr(self, "head_fanin_pow", 0.5))     # gentler fan-in norm for the wide readout head
+        if do_stdp:                                            # §15.18 blend the timing term into the grad BEFORE _upd:
+            _lastsp = None                                     #   −Δw because _upd subtracts (so +Δw potentiates);
+            for l, c in enumerate(cells):                      #   masked so silent/pruned synapses stay silent
+                if not sp(c): continue
+                g_rec[l] = g_rec[l] - sd.mix * stdp_rec[l] * c.rec_mask
+                if c.sparse_in:
+                    g_in[l] = g_in[l] - sd.mix * stdp_in[l] * c.in_mask
+                _lastsp = l
+            sd._ltp = ltp_acc; sd._ltd = ltd_acc
+            sd._mag = float((sd.mix * stdp_rec[_lastsp]).abs().mean()) if _lastsp is not None else 0.0
         if astro_pg is not None:                               # §17 glia: slow per-POSTsynaptic-neuron metaplastic gain on
             for l, c in enumerate(cells):                      #   the APPLIED update (a 4th factor on Δw, NOT the eligibility)
                 pg = astro_pg[l].to(g_rec[l].dtype)
@@ -792,7 +826,7 @@ class SpikingBrain(nn.Module):
                    "feedback_mode", "fb_decay", "dale", "dendritic", "burst_thr", "bounded_synapses", "w_max",
                    "homeostasis", "target_rate", "homeo_lr", "btsp", "btsp_beta", "two_compartment", "g_ap",
                    "beta_ap", "som_baseline", "pv_gain", "diff_neuromod", "stochastic", "spike_noise", "metabolic",
-                   "metabolic_lambda")
+                   "metabolic_lambda", "stdp")
 
     @torch.no_grad()
     def set_faith(self, **kw):
@@ -807,6 +841,8 @@ class SpikingBrain(nn.Module):
                 if v not in ("eprop", "bptt"): continue
             elif k == "feedback_mode":
                 if v not in ("learned", "random"): continue
+            elif k == "stdp":                              # single source of truth = self.stdp.on
+                self.stdp.set_params(on=v); applied[k] = self.stdp.on; continue
             else:
                 cur = getattr(self, k, None)
                 if isinstance(cur, bool):    v = bool(v)
@@ -827,7 +863,7 @@ class SpikingBrain(nn.Module):
 
     def faith_config(self):
         """The current state of every faithfulness toggle/hyperparameter — the fidelity axis settings."""
-        return {k: getattr(self, k, None) for k in self._FAITH_KEYS}
+        return {k: (self.stdp.on if k == "stdp" else getattr(self, k, None)) for k in self._FAITH_KEYS}
 
     def _ensure_homeo(self):
         """Per-neuron intrinsic-threshold offset for firing-rate homeostasis (metaplasticity). Grows
@@ -1108,6 +1144,9 @@ class SpikingBrain(nn.Module):
         self.grow_syn_frac = d.get("grow_syn_frac", getattr(self, "grow_syn_frac", 0.15))
         self.prune_frac = d.get("prune_frac", getattr(self, "prune_frac", 0.05))
         for k, v in (d.get("faith") or {}).items():                      # restore every fidelity-axis setting
+            if k == "stdp":                                              # object-backed toggle: keep the SpikingSTDP,
+                if hasattr(self, "stdp"): self.stdp.set_params(on=v)     # route to its controller (don't overwrite it)
+                continue
             setattr(self, k, v)
         self.attention = d.get("attention", 1.0); self.loss_ema = d.get("loss_ema", None)
         if d.get("fb") is not None:   self._fb = [t.to(self.device) for t in d["fb"]]        # aligned feedback

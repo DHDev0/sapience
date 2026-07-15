@@ -73,7 +73,7 @@ def test_set_net_per_module():
     assert L.set_net("neuromod", {"da": 0.9})["applied"]["da"] == 0.9
     assert L.set_net("cerebellum", {"eta": 0.5})["applied"]["eta"] == 0.5
     assert L.set_net("endocrine", {"on": True, "C_star": 0.4})["applied"]["C_star"] == 0.4   # §16 P1
-    assert set(L._net_params().keys()) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum", "endocrine", "dynamics", "peptides", "glia"}
+    assert set(L._net_params().keys()) == {"cortex", "hippocampus", "bg", "neuromod", "cerebellum", "endocrine", "dynamics", "peptides", "glia", "stdp"}
 
 
 def test_freezes():
@@ -192,3 +192,17 @@ def test_glia_integrated_and_byte_identical_off():
     d = os.path.join(BASE, "glia"); L.save_life()
     L2 = BrainLife(d, core="spiking", use_teacher=False, use_visual=False, emb=16, hidden=48, layers=1, device="cpu", resume=True)
     assert L2.glia.on is True and len(L2.glia.a) == len(L.glia.a)  # field restored (growth-guarded)
+
+
+def test_stdp_integrated_faith_routed_and_persists():
+    L = _life("stdp")
+    assert hasattr(L.brain, "stdp") and L.brain.stdp.on is False       # instantiated, default OFF
+    # live-tunable both via set_net('stdp',...) AND via the cortex faith surface (stdp in _FAITH_KEYS)
+    assert L.set_net("stdp", {"on": True, "mix": 0.05})["applied"]["on"] is True
+    assert L.brain.faith_config()["stdp"] is True                      # routed through faith_config
+    L._learn_text("the cat sat on the mat and the dog ran fast by the river. " * 20, steps=4)
+    assert "stdp" in L._net_params() and "ltp_ltd_balance" in L._net_params()["stdp"]  # metric surfaced
+    L.save_life()
+    d = os.path.join(BASE, "stdp")
+    L2 = BrainLife(d, core="spiking", use_teacher=False, use_visual=False, emb=16, hidden=48, layers=1, device="cpu", resume=True)
+    assert L2.brain.stdp.on is True and abs(L2.brain.stdp.mix - 0.05) < 1e-9   # params persist
