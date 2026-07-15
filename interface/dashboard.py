@@ -51,6 +51,7 @@ CHART_KEYS = [                                   # (state field, label, lower_is
     ("world_return", "§17 world return ↑", False, ""), ("world_return_random", "§17 random baseline", False, ""),
     ("advantage", "§17 advantage ↑", False, ""), ("world_success_rate", "§17 goal reached ↑", False, ""),
     ("world_steps_to_goal", "§17 steps to goal ↓", True, ""), ("world_surprise", "§17 world surprise ↓", True, ""),
+    ("spatial_decode_acc", "§17 spatial decode ↑", False, ""), ("pi_drift", "§17 PI drift ↓", True, ""),
     # cortex learning-health leading indicators (nested under net.weights; flattened into history below). These
     # diagnose WHY the net does/doesn't learn: head_w_std collapsing to init + head_update_mag≈0 = starved readout;
     # fb_align_cos≈0 = feedback not aligning; mem_mag climbing = representation runaway; update_mag = recurrent Δw.
@@ -627,7 +628,7 @@ main{display:grid;grid-template-columns:340px 1fr;gap:10px;padding:10px}
   <div class=card style=margin-top:10px><h3>💾 resources — usage vs limit</h3><div id=resources></div></div>
   <div class=card style=margin-top:10px><h3>🎚 tune a module (live)</h3>
    <div style=display:flex;gap:4px>
-    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option><option>endocrine</option><option>dynamics</option><option>peptides</option><option>glia</option><option>stdp</option><option>stp</option><option>plateau</option><option>interneurons</option><option>laminar</option><option>ripple</option><option>theta</option><option>embodiment</option></select>
+    <select id=nt_target><option>cortex</option><option>hippocampus</option><option>bg</option><option>neuromod</option><option>cerebellum</option><option>endocrine</option><option>dynamics</option><option>peptides</option><option>glia</option><option>stdp</option><option>stp</option><option>plateau</option><option>interneurons</option><option>laminar</option><option>ripple</option><option>theta</option><option>embodiment</option><option>spatial</option></select>
     <input id=nt_key placeholder="param (lr, beta, da…)" style=flex:1><input id=nt_val placeholder="value" style=width:70px>
     <button class=b-go onclick=setNet()>set</button>
    </div>
@@ -885,7 +886,8 @@ API_HELP = {
                      "laminar {on,frac_L4,frac_L23,frac_L56,allow_fb,input_to_l23,apical_l4_gain,strict} (§17 canonical L4/L2-3/L5-6 microcircuit), "
                      "ripple {on,f_so,dt,p0,up_thr,refractory,press_gain,debt_gain,debt_scale,rem_suppress,seed} (§16 SWR-gated consolidation), "
                      "theta {on,L,capacity,beta,g_inh,thr,fwd_frac,ripple_k,commit_on_boundary} (§17 hippocampal sequence memory), "
-                     "embodiment {on,grid,max_steps,gamma,explore_temp,epistemic_w,step_cost,cadence} (§17 active-inference world loop). "
+                     "embodiment {on,grid,max_steps,gamma,explore_temp,epistemic_w,step_cost,cadence} (§17 active-inference world loop), "
+                     "spatial {on,vel_gain,loop_close,path_integration,n_modules,place_n,grid_scale0,...} (§17 grid/place + path integration). "
                      "Every region has its own live synapse grow rate (grow_syn_frac).",
     "POST /api/arch": "LIVE per-region OR global neuron/synapse surgery: {target: cortex|cerebellum|bg|hippocampus|all, op, amount?, density?}. "
                       "ops: grow_neurons, set_neurons (grow to a TARGET count), grow_synapses (amount<1 = fraction), "

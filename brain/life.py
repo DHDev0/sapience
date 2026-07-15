@@ -37,6 +37,7 @@ from .laminar import LaminarMicrocircuit
 from .ripple import SharpWaveRipple
 from .theta_seq import ThetaSequenceMemory
 from .embodiment import SpikingEmbodiment
+from .spatial import SpikingSpatial
 from .tools import ToolRegistry
 from . import senses, motor, partner
 from .ascii_art import image_to_ascii
@@ -185,6 +186,9 @@ class BrainLife:
             self.ripple = SharpWaveRipple(self.dev, seed=seed)                          # §16 SWR-gated consolidation (default OFF)
             self.embodiment = SpikingEmbodiment(self.dev, dtype=self.dtype, seed=seed)  # §17 closed sensorimotor loop (active inference), DEFAULT OFF
             self._last_world = 0.0                                                       # §17 embodied-step throttle stamp
+            self.spatial = SpikingSpatial(self.dev, seed=seed)                          # §17 grid/place spatial code + path integration
+            if self.spatial.on:                                                         # nav-BG φ = grid+place when spatial on (A/B)
+                self.embodiment.set_feat_dim(self.spatial.grid_dim + self.spatial.place_dim)
             self.hippo = SpikingHippocampus(256, self.dev, seed=seed, syn_density=syn_density)  # §4
             self.theta = ThetaSequenceMemory(self.hippo, self.dev)                      # §17 temporal-order memory (rides the hippo DG)
             self.bg = SpikingBasalGanglia(len(TOPICS), len(TOPICS), self.dev,
@@ -651,6 +655,7 @@ class BrainLife:
             if hasattr(self, "ripple"): p["ripple"] = self.ripple.state()           # §16 SWR ripple-rate/gated-commit metrics
             if hasattr(self, "theta"): p["theta"] = self.theta.state()              # §17 sequence-memory metrics
             if hasattr(self, "embodiment"): p["embodiment"] = self.embodiment.state()  # §17 active-inference world metrics
+            if hasattr(self, "spatial"): p["spatial"] = self.spatial.state()           # §17 grid/place decode/pi_drift/nav metrics
             if hasattr(self, "laminar"):                                            # §17 per-lamina rate + config → /api/state
                 if self.laminar.on:
                     try:
@@ -740,6 +745,11 @@ class BrainLife:
                 applied.update(self.theta.set_params(**p))           # §17 sequence-memory live-tune + toggle `on`
             elif target == "embodiment" and self.modules_on and hasattr(self, "embodiment"):
                 applied.update(self.embodiment.set_params(**p))      # §17 world loop live-tune + toggle `on`
+            elif target == "spatial" and self.modules_on and hasattr(self, "spatial"):
+                applied.update(self.spatial.set_params(**p))         # §17 grid/place live-tune + toggle `on`, no restart
+                if hasattr(self, "embodiment"):                      # nav-BG φ dim tracks spatial.on (A/B) + place_n rebuild
+                    fd = (self.spatial.grid_dim + self.spatial.place_dim) if self.spatial.on else None
+                    self.embodiment.set_feat_dim(fd); applied["nav_feat_dim"] = self.embodiment._feat_dim()
             elif target == "laminar" and self.modules_on and hasattr(self, "laminar"):
                 was_on = self.laminar.on
                 applied.update(self.laminar.set_params(**p))         # §17 canonical microcircuit live-tune + toggle
@@ -938,6 +948,39 @@ class BrainLife:
         tag = senses.NERVE.get("world", b"").decode("latin-1") if hasattr(senses, "NERVE") else ""
         return f"{tag}world a{a} r{reward:+.2f} p{pos[0]}{pos[1]} {'G' if reached else '.'}"
 
+    def _embody_tick(self):
+        """§17 · one embodied NAVIGATION step with grid/place coding: world pose → spatial observe (sensed vs
+        blind path integration + loop closure) → φ = grid+place code → nav-BG act → world.step → endocrine-
+        augmented reward → learn → inject the place code as proprioception into the cortex byte stream."""
+        emb = self.embodiment; sp = self.spatial; w = emb.world
+        K = 3                                                  # sense every K-th step; path-integrate between
+        pos = w.pos
+        place = sp.observe((float(pos[0]), float(pos[1])), action=getattr(self, "_last_a", None),
+                           sensed=(self.cycle % K != 0), hippo=self.hippo)
+        grid = sp.grid_code(sp.pos_hat[0], sp.pos_hat[1])
+        phi = torch.cat([grid, place]).unsqueeze(0).to(self.dev)
+        if emb.bg.M.shape[1] != phi.shape[1]:                  # shape-invariant guard (live place_n change)
+            emb.set_feat_dim(phi.shape[1])
+        tone = self.nm.tone if self.modules_on else {}
+        endo = getattr(self, "endocrine", None)
+        ne = float(tone.get("ne", 1.0)); press = endo.sleep_pressure() if (endo is not None and endo.on) else 0.0
+        a, pi, epi = emb.act(phi, ne=ne, sleep_pressure=press)
+        reward, next_feat, done = w.step(int(a))
+        r_home = endo.wake_tick(novelty=sp._place_novelty) if (endo is not None and endo.on) else 0.0
+        npos = w.pos
+        next_phi = torch.cat([sp.grid_code(float(npos[0]), float(npos[1])),
+                              sp.place_code(float(npos[0]), float(npos[1]))]).unsqueeze(0).to(self.dev)
+        emb.learn(phi, a, reward, next_phi, r_home=r_home)
+        try: self.brain.observe_stream(bytes(sp.encode_place_bytes(place)).decode("latin1"))  # proprioception (no core edit)
+        except Exception: pass
+        self._embody_ret = getattr(self, "_embody_ret", 0.0) + reward
+        self._embody_steps = getattr(self, "_embody_steps", 0) + 1
+        if done:
+            sp.record_episode(self._embody_ret, self._embody_steps)
+            emb._finish_episode(self._embody_ret, self._embody_steps, w.pos == w.goal)
+            w.reset(); self._embody_ret = 0.0; self._embody_steps = 0
+        self._last_a = int(a); self._last_embody = time.time()
+
     def _consume_perceptions(self, on_update):
         # directed lessons (teach() / tool outputs) are learned FIRST (priority)
         if not self._teach_q.empty():
@@ -1019,7 +1062,10 @@ class BrainLife:
             ne = self.nm.tone.get("ne", 1.0) if self.modules_on else 1.0
             self._ign_mask = dyn.ignition({"bg": abs(float(progress)),
                                            "hippo": float(getattr(self, "_novelty", 0.5)),
-                                           "cereb": float(getattr(self, "cereb_mse", 0.0))}, ne=ne, attention=att)
+                                           "cereb": float(getattr(self, "cereb_mse", 0.0)),
+                                           "spatial": float(max(self.spatial._pi_drift, self.spatial._place_novelty))
+                                                      if getattr(self, "spatial", None) is not None else 0.0},
+                                          ne=ne, attention=att)
             self._ign_cyc = self.cycle
         return self._ign_mask.get(name, True)
 
@@ -1276,12 +1322,17 @@ class BrainLife:
                     self._consume_perceptions(on_update)     # learn periodically...
                     self._last_consume = time.time()
                 self.think(on_update)                        # ...but THINK every iteration
+                if (self.modules_on and getattr(self, "spatial", None) is not None and self.spatial.on
+                        and self._ignited("spatial")
+                        and time.time() - getattr(self, "_last_embody", 0) > self.embodiment.cadence):
+                    self._embody_tick()                      # §17 embodied nav w/ grid+place (throttled + ignition-gated)
                 if time.time() - getattr(self, "_last_reson", 0) > 5.0:
                     self._resonate(on_update)                # resonate in parallel every ~5s
                     self._last_reson = time.time()
                 if getattr(self, "embodiment", None) is not None and self.embodiment.on \
+                        and not (getattr(self, "spatial", None) is not None and self.spatial.on) \
                         and time.time() - getattr(self, "_last_world", 0) > self.embodiment.cadence:
-                    self._live_in_world(on_update)           # §17 one embodied active-inference step (throttled by cadence)
+                    self._live_in_world(on_update)           # §17 embodied step (tabular; spatial.on supersedes with grid/place)
                 self.cycle += 1
                 if self.should_sleep(): self._begin_sleep()
                 self._emit(on_update)
@@ -1914,6 +1965,8 @@ class BrainLife:
                     life["modules"]["theta"] = {**{k: getattr(self.theta, k) for k in self.theta._KEYS},
                                                 "seq_vals": self.theta.seq_vals, "seq_texts": self.theta.seq_texts,
                                                 "traj": self.theta.traj}
+                if hasattr(self, "spatial"):                 # §17 grid/place: live params + W_gp readout + nav EMAs
+                    life["modules"]["spatial"] = self.spatial.state_dict()
                 if hasattr(self, "embodiment"):              # §17 embodiment: params + world-BG/forward-model + curve stats
                     e = self.embodiment
                     life["modules"]["embodiment"] = dict(
@@ -2006,6 +2059,10 @@ class BrainLife:
                         self.laminar.rebuild(self.brain)                # masks derived from lamina+A → deterministic
                 if hasattr(self, "ripple") and m.get("ripple"):        # §16 SWR restore params (reseeds RNG on `seed`)
                     self.ripple.set_params(**{k: v for k, v in m["ripple"].items() if k in self.ripple._KEYS})
+                if hasattr(self, "spatial") and m.get("spatial"):       # §17 grid/place shape-invariant restore
+                    self.spatial.load_state_dict(m["spatial"])
+                    if hasattr(self, "embodiment") and self.spatial.on:
+                        self.embodiment.set_feat_dim(self.spatial.grid_dim + self.spatial.place_dim)
                 em = m.get("embodiment")                                # §17 restore world loop (params first, then shape-guarded tensors)
                 if hasattr(self, "embodiment") and em:
                     e = self.embodiment

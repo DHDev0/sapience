@@ -110,6 +110,7 @@ class SpikingEmbodiment:
         self.step_cost = 0.01                        # per-step cost in the world
         self.cadence = 0.5                           # min seconds between embodied steps (throttle; never starves thought)
         self.fwd_eta = 0.3                           # forward-model delta-rule rate
+        self.feat_dim = None                         # §17 None → tabular one-hot G*G; set to grid+place dim by spatial coupling
         self.G = self.grid
         # the reused SpikingBasalGanglia/SpikingCerebellum build float32 LIF state internally (shared code); we
         # therefore run the sensorimotor COMPUTE in their weight dtype (self._cdt, set in _build_nets) and cast
@@ -131,13 +132,22 @@ class SpikingEmbodiment:
         self.world = GridWorld(self.G, seed=self._seed, step_cost=self.step_cost,
                                max_steps=int(self.max_steps), device=self.device, dtype=self.dtype)
 
+    def _feat_dim(self):
+        return int(self.feat_dim) if getattr(self, "feat_dim", None) else self.G * self.G
+
+    def set_feat_dim(self, fd):
+        """§17 set the nav state-feature width (grid+place dim when spatial.on, else None=tabular) + rebuild the
+        actor/critic + forward model. Shape-invariant coupling for the spatial A/B."""
+        self.feat_dim = int(fd) if fd else None
+        self._build_nets()
+        return self._feat_dim()
+
     def _build_nets(self):
+        fd = self._feat_dim()
         # the world ACTOR/CRITIC — a real SpikingBasalGanglia (SEPARATE from life.self.bg topic policy)
-        self.bg = SpikingBasalGanglia(self.G * self.G, 4, self.device,
-                                      alpha_v=0.1, alpha_pi=0.2, seed=self._seed)
+        self.bg = SpikingBasalGanglia(fd, 4, self.device, alpha_v=0.1, alpha_pi=0.2, seed=self._seed)
         # the active-inference FORWARD MODEL — a real SpikingCerebellum (SEPARATE from life.self.cerebellum)
-        self.fwd = SpikingCerebellum(self.G * self.G + 4, self.G * self.G, self.device,
-                                     n_granule=512, seed=self._seed)
+        self.fwd = SpikingCerebellum(fd + 4, fd, self.device, n_granule=512, seed=self._seed)
         self._cdt = self.bg.M.dtype                  # the sensorimotor compute dtype (sub-net weight dtype)
 
     # ---- the sensorimotor primitives ------------------------------------- #
@@ -247,6 +257,8 @@ class SpikingEmbodiment:
         consolidate the world-BG on the IMAGINED transitions — buffer-free, mirroring the cortex's generative
         replay. Interconnects sleep + the forward model. Returns the number of imagined transitions replayed."""
         n = 0; fd = self.fwd.M.dtype; bd = self.bg.M.dtype
+        if getattr(self, "feat_dim", None):            # §17 non-tabular (grid+place) φ: one-hot rollout undefined → skip
+            return n
         for _ in range(int(k)):
             idx = random.randrange(self.G * self.G)
             feat = torch.zeros(1, self.G * self.G, device=self.device, dtype=self._cdt); feat[0, idx] = 1.0
