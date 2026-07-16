@@ -474,6 +474,21 @@ class SpikingBrain(nn.Module):
             if not al[i]: continue
             if sp(c) and c.sparse_in: ea_in[i] = torch.zeros(B, c.in_val.numel(), device=dev)
             else: ea_in[i] = torch.zeros(B, c.hid, c.in_dim, device=dev)
+        # §MEM2 input-gated slow compartment: per-neuron state C (|c|≤1) + per-SYNAPSE eligibility ec (clone of the
+        # ALIF ea shapes/recursion). Allocated ONLY where gated_slow is on ⇒ default-off is byte-identical & free.
+        gs = [getattr(c, "gated_slow", False) for c in cells]
+        if any(gs):
+            C = [torch.zeros(B, c.hid, device=dev) if gs[i] else None for i, c in enumerate(cells)]
+            ec_rec = [torch.zeros(B, c.rec_val.numel(), device=dev) if (gs[i] and sp(c))
+                      else (torch.zeros(B, c.hid, c.hid, device=dev) if gs[i] else None)
+                      for i, c in enumerate(cells)]
+            ec_in = [None] * len(cells)
+            for i, c in enumerate(cells):
+                if not gs[i]: continue
+                if sp(c) and c.sparse_in: ec_in[i] = torch.zeros(B, c.in_val.numel(), device=dev)
+                else: ec_in[i] = torch.zeros(B, c.hid, c.in_dim, device=dev)
+        else:
+            C = ec_rec = ec_in = [None] * len(cells)
         g_rec = [torch.zeros_like(c.rec_val) if sp(c) else torch.zeros_like(c.Wrec.weight) for c in cells]
         g_in, g_in_b = [], []
         for c in cells:
@@ -608,6 +623,13 @@ class SpikingBrain(nn.Module):
                     _ir = getattr(c, "lam_in_row", None)
                     pre = c.Win(layer_in) if _ir is None else c.Win(layer_in) * _ir
                 drive = pre + rec
+                if gs[l]:                                      # §MEM2 gate on the RAW drive I=pre+rec (∂I/∂W=z_pre ⇒ local)
+                    _ig_l = torch.sigmoid(c.k_g * drive + c.b_g_vec)          # NMDA write conductance (0,1)
+                    _wc_l = torch.tanh(drive)                                 # bounded write (-1,1)
+                    _cprev_l = C[l]                                           # c_{t-1} (used by the eligibility)
+                    C[l] = (1.0 - _ig_l) * _cprev_l + _ig_l * _wc_l          # convex gated slow state ⇒ |c|≤1
+                    if getattr(c, "gs_read", "threshold") == "drive":
+                        drive = drive + c.gs_kappa * C[l]                    # UPGRADE: plateau current into the membrane
                 if twocomp:                                    # PV fast divisive gain control + apical→soma feedback
                     apd_fwd = (ap[l] + plat[l]) if plateau else ap[l]   # §17 sustained plateau feeds forward across ticks
                     _ag = getattr(c, "lam_apical_gain", None)           # §17 laminar: apical error → L2/3+L5 tufts, spare L4
@@ -627,6 +649,8 @@ class SpikingBrain(nn.Module):
                 else:
                     thr = c.thr
                 if homeo: thr = thr + self._thr_adapt[l]       # intrinsic homeostasis offset (metaplasticity)
+                if gs[l] and getattr(c, "gs_read", "threshold") != "drive":
+                    thr = thr + c.gs_kappa * C[l]              # §MEM2 soma read via threshold (EXACT; membrane v untouched)
                 vfire = v[l] + snoise * torch.randn_like(v[l]) if stoch else v[l]   # stochastic (noisy) firing
                 psi_l = self._psi(vfire - thr); z[l] = (vfire >= thr).float()
                 if homeo: spk_sum[l] = spk_sum[l] + z[l].sum(0)
@@ -664,6 +688,19 @@ class SpikingBrain(nn.Module):
                     else:
                         ea_rec[l] = psi_l.unsqueeze(2) * eps_rec[l].unsqueeze(1) + (rho - ba * psi_l).unsqueeze(2) * ea_rec[l]
                         ea_in[l] = psi_l.unsqueeze(2) * eps_in[l].unsqueeze(1) + (rho - ba * psi_l).unsqueeze(2) * ea_in[l]
+                if gs[l]:                                      # §MEM2 ec = g·ec + Φ·z_pre  (LOCAL: clone of ea, decay ρ→g, source ε^v→z)
+                    _ip = _ig_l * (1.0 - _ig_l)                                            # i'_j = i(1−i)
+                    _Phi = c.k_g * _ip * (_wc_l - _cprev_l) + _ig_l * (1.0 - _wc_l * _wc_l)  # Φ_j = ∂c_j/∂I_j (per-neuron, local)
+                    _gret = 1.0 - _ig_l                                                    # retention gate g_j
+                    if sp(c):
+                        ec_rec[l] = _Phi[:, c.rec_row] * z_eff[:, c.rec_col.long()] + _gret[:, c.rec_row] * ec_rec[l]
+                        if c.sparse_in:
+                            ec_in[l] = _Phi[:, c.in_row] * layer_in[:, c.in_col.long()] + _gret[:, c.in_row] * ec_in[l]
+                        else:
+                            ec_in[l] = _Phi.unsqueeze(2) * layer_in.unsqueeze(1) + _gret.unsqueeze(2) * ec_in[l]
+                    else:
+                        ec_rec[l] = _Phi.unsqueeze(2) * z_eff.unsqueeze(1) + _gret.unsqueeze(2) * ec_rec[l]
+                        ec_in[l] = _Phi.unsqueeze(2) * layer_in.unsqueeze(1) + _gret.unsqueeze(2) * ec_in[l]
                 psi.append(psi_l); layer_in = z[l]
             top_v = v[-1]; logits = self.head(top_v)           # membrane readout → logits
             p = torch.softmax(logits.float(), 1)
@@ -722,23 +759,30 @@ class SpikingBrain(nn.Module):
                     gE.index_add_(0, x[:, tt].long(), g @ c.Win.weight)   # layer-0 signal back to the used rows.
                     #   (this input-projection gradient is the ONE weight-transport path in the rule — a
                     #   deliberate, disclosed exception; all cortical credit still flows through _fb, not W^T.)
-                ba = c.beta_adapt if al[l] else 0.0            # e_ji = ψ_j(ε^v_i − β_a·ε^a_ji); grad = Σ g_j·(ε^v_i − β_a·ε^a_ji)
+                ba = c.beta_adapt if al[l] else 0.0            # e_ji = ψ_j(ε^v_i − β_a·ε^a_ji − κ·ε^c_ji); grad = Σ g_j·e_ji
+                # §MEM2 compartment sign: threshold-read (thr+=κc ⇒ ∂z/∂c=−κψ) → −κ; drive-read (v+=κc ⇒ +κψ) → +κ.
+                _ks = 0.0 if not gs[l] else (c.gs_kappa if getattr(c, "gs_read", "threshold") == "drive" else -c.gs_kappa)
                 if sp(c):
                     g_rec[l] += sddmm(g, eps_rec[l], c.rec_row, c.rec_col)     # membrane part, O(nnz)
                     if al[l]: g_rec[l] += -ba * edge_reduce(g, ea_rec[l], c.rec_row)   # adaptation part
+                    if gs[l]: g_rec[l] += _ks * edge_reduce(g, ec_rec[l], c.rec_row)   # §MEM2 compartment part, O(nnz)
                     if c.sparse_in:
                         g_in[l] += sddmm(g, eps_in[l], c.in_row, c.in_col)
                         if al[l]: g_in[l] += -ba * edge_reduce(g, ea_in[l], c.in_row)
+                        if gs[l]: g_in[l] += _ks * edge_reduce(g, ec_in[l], c.in_row)   # §MEM2
                         g_in_b[l] += g.sum(0)
                     else:
                         g_in[l] += g.t() @ eps_in[l].float()                          # dense in (emb small)
                         if al[l]: g_in[l] += -ba * (g.unsqueeze(2) * ea_in[l]).sum(0)
+                        if gs[l]: g_in[l] += _ks * (g.unsqueeze(2) * ec_in[l]).sum(0)   # §MEM2
                         g_in_b[l] += g.sum(0)
                 else:
                     g_rec[l] += g.t() @ eps_rec[l].float()
                     if al[l]: g_rec[l] += -ba * (g.unsqueeze(2) * ea_rec[l]).sum(0)    # (h,h) dense adaptation
+                    if gs[l]: g_rec[l] += _ks * (g.unsqueeze(2) * ec_rec[l]).sum(0)    # §MEM2 dense compartment
                     g_in[l] += g.t() @ eps_in[l].float()
                     if al[l]: g_in[l] += -ba * (g.unsqueeze(2) * ea_in[l]).sum(0)
+                    if gs[l]: g_in[l] += _ks * (g.unsqueeze(2) * ec_in[l]).sum(0)      # §MEM2
                     g_in_b[l] += g.sum(0)
         # FULLY LOCAL three-factor update: Δw_ji = -η·M · clamp(mean_t[L_j·e_ji]/N_j^p, ±Δmax). Each
         # synapse sees only its own pre-trace, post learning-signal and the neuromodulator M — no global
@@ -988,6 +1032,10 @@ class SpikingBrain(nn.Module):
             surprise=float(surprise),
             rec_w_mag=float(_ct.rec_val.abs().mean() if sp(_ct) else _ct.Wrec.weight.abs().mean()),
         )
+        if any(gs):                                            # §MEM2 stability guard: max|c| MUST stay ≤1 (convex bound); mean|c| = register occupancy
+            _cvals = [C[l] for l in range(len(cells)) if gs[l] and C[l] is not None]
+            self._diag["slow_cmax"] = float(max(t.abs().max() for t in _cvals)) if _cvals else 0.0
+            self._diag["slow_cmag"] = float(sum(t.abs().mean() for t in _cvals) / max(1, len(_cvals))) if _cvals else 0.0
         if mem_homeo:                                          # §HARM magnitude-channel engagement: mean thr offset (≤0 = discharging)
             self._diag["mem_thr"] = float(self._thr_adapt[-1].mean())
         if he_on:                                              # §NLMS truthful head diagnostics: head_w_std stays ≈1/√N
@@ -1286,6 +1334,22 @@ class SpikingBrain(nn.Module):
         if self.dale:        self._project_dale()          # make weights Dale-compliant immediately
         if self.homeostasis: self._ensure_homeo()
         return applied
+
+    @torch.no_grad()
+    def set_mem(self, gated_slow=None, gs_read=None, k_g=None, gs_kappa=None, cells="all"):
+        """§MEM2 live control of the input-gated slow compartment, broadcast to every cell (the het_tau/sub_reset
+        pattern). gated_slow toggles the working-memory register; gs_read∈{'threshold'(exact),'drive'}; k_g the
+        gate slope; gs_kappa the soma read gain (κ<0 = excitatory afterdepolarization, |κ|<thr). Toggling on is
+        safe live: c starts at 0 (no state-arity surprise — init_state/run_seq read gated_slow per call). Returns
+        the applied config."""
+        tgt = self.cells if cells == "all" else [self.cells[i] for i in cells]
+        for c in tgt:
+            if gated_slow is not None: c.gated_slow = bool(gated_slow)
+            if gs_read in ("threshold", "drive"): c.gs_read = gs_read
+            if k_g is not None: c.k_g = float(k_g)
+            if gs_kappa is not None: c.gs_kappa = float(gs_kappa)
+        return {"gated_slow": getattr(tgt[0], "gated_slow", False), "gs_read": getattr(tgt[0], "gs_read", "threshold"),
+                "k_g": getattr(tgt[0], "k_g", 1.0), "gs_kappa": getattr(tgt[0], "gs_kappa", -0.3)} if tgt else {}
 
     def faith_config(self):
         """The current state of every faithfulness toggle/hyperparameter — the fidelity axis settings."""

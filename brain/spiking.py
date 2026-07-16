@@ -99,6 +99,32 @@ def _seed_csr(rows, cols, fanin, seed):
     return crow, col, fanin
 
 
+def _slow_step(cell, I_raw, cs):
+    """§MEM2 one step of the input-gated NMDA/Ca2+ slow dendritic compartment (working-memory register).
+        c ← (1−i)·c + i·tanh(I),   i = σ(k_g·I + b_g)
+    A CONVEX update ⇒ |c|≤1 for ANY input (unconditionally bounded — the structural property het_tau/sub_reset
+    lacked: a bare slow leak integrates drive to a runaway, a convex gate can only interpolate). Long memory
+    (i→0, retention g=1−i→1) and boundedness come from the SAME gate. The gate reads the RAW afferent drive I
+    (∂I/∂W = z_pre), which is what keeps the e-prop eligibility LOCAL (diagonal per-neuron Jacobian, no BPTT).
+    Returns (c_new, κ·c); the read κ·c is added by the caller to the threshold (gs_read='threshold', exact) or
+    the drive (gs_read='drive'). κ<0 = excitatory afterdepolarization: held context lowers θ ⇒ promotes firing."""
+    i_g = torch.sigmoid(cell.k_g * I_raw + cell.b_g_vec)
+    cs = (1.0 - i_g) * cs + i_g * torch.tanh(I_raw)
+    return cs, cell.gs_kappa * cs
+
+
+def _grow_mem_buffers(cell, add):
+    """§MEM/§MEM2 extend the per-neuron heterogeneity buffers (beta_vec, b_g_vec) when neurons are added, so they
+    stay sized == hid — else save/load after growth size-mismatches. Values are unused unless het_tau/gated_slow
+    are on; new neurons get fresh draws from the same distributions (local generator ⇒ no global-RNG perturbation)."""
+    if hasattr(cell, "beta_vec"):
+        _gb = torch.Generator().manual_seed(int(cell.beta_vec.numel()) + 11)
+        cell.beta_vec = torch.cat([cell.beta_vec, (0.85 + 0.149 * torch.rand(add, generator=_gb)).to(cell.beta_vec.device)])
+    if hasattr(cell, "b_g_vec"):
+        _gg = torch.Generator().manual_seed(int(cell.b_g_vec.numel()) + 23)
+        cell.b_g_vec = torch.cat([cell.b_g_vec, (-2.0 - 3.0 * torch.rand(add, generator=_gg)).to(cell.b_g_vec.device)])
+
+
 class SparseLIFCell(nn.Module):
     """Leaky integrate-and-fire layer with a SPARSE recurrent connectome — the same dynamics as
     LIFCell (v ← β·v·(1−s) + Win x + Wrec s ; s = spike(v−θ)) but Wrec (and Win for deep layers
@@ -124,6 +150,19 @@ class SparseLIFCell(nn.Module):
         self.het_tau = False; self.sub_reset = False
         g_bt = torch.Generator().manual_seed(seed + 11)
         self.register_buffer("beta_vec", 0.85 + 0.149 * torch.rand(hid, generator=g_bt))   # per-neuron beta in [0.85,0.999)
+        # §MEM2 input-gated NMDA/Ca2+ slow dendritic compartment (working-memory register) — the GATED successor to
+        # het_tau/sub_reset. Those diverge (a slow leak integrates drive unboundedly); this is a CONVEX gated store
+        # c=(1−i)c+i·tanh(I) with |c|≤1 for any input, read into the soma via the threshold (thr+=κ·c) and learned by
+        # a LOCAL e-prop trace (a clone of the ALIF `ea` recursion; the gate reads the drive not the carried state ⇒
+        # exact). DEFAULT OFF ⇒ byte-identical (state arity/forward/threshold/eligibility/gradient all unchanged).
+        self.gated_slow = False
+        self.gs_read = "threshold"           # 'threshold': thr += κ·c (exact eligibility, cheapest); 'drive': v += κ·c
+        self.k_g = 1.0                        # NMDA Mg2+-unblock gate slope on the drive
+        self.gs_kappa = -0.3                  # soma read gain κ (<0 = excitatory afterdepolarization); keep |κ|<thr
+        _gbg = torch.Generator().manual_seed(seed + 23)
+        # heterogeneous rest write-prob i0=σ(b_g)∈~[0.006,0.12] ⇒ per-neuron hold τ=1/i0∈~[8,160] steps: a
+        # MULTI-TIMESCALE bank, not one caricature τ (a fresh local generator ⇒ no global-RNG perturbation).
+        self.register_buffer("b_g_vec", -2.0 - 3.0 * torch.rand(hid, generator=_gbg))       # b_g ∈ [-5,-2]
         self.sparse_in = bool(sparse_in)
         self.rec_fanin, self.in_fanin = rec_fanin, in_fanin
         # --- recurrent connectome (always sparse) ---
@@ -190,6 +229,8 @@ class SparseLIFCell(nn.Module):
 
     def init_state(self, B, device, dtype=torch.float32):
         z = torch.zeros(B, self.hid, device=device, dtype=dtype)
+        if getattr(self, "gated_slow", False):
+            return (z, z.clone(), z.clone())                   # §MEM2 v, s, c (slow compartment; opaque to _run)
         return (z, z.clone())
 
     def _mem(self, v, s, inp):
@@ -201,21 +242,38 @@ class SparseLIFCell(nn.Module):
         return bt * v * (1.0 - s) + inp
 
     def forward(self, x, state):
-        v, s = state
-        v = self._mem(v, s, self._in_proj(x.unsqueeze(1))[:, 0] + self._rec(s))
-        s = spike(v - self.thr)
-        return s, (v, s)
+        gs = getattr(self, "gated_slow", False)
+        if gs: v, s, cs = state
+        else:  v, s = state
+        I = self._in_proj(x.unsqueeze(1))[:, 0] + self._rec(s)
+        thr = self.thr
+        if gs:
+            cs, read = _slow_step(self, I, cs)                  # §MEM2 gated slow compartment
+            if self.gs_read == "drive": I = I + read
+            else:                       thr = self.thr + read
+        v = self._mem(v, s, I)
+        s = spike(v - thr)
+        return s, ((v, s, cs) if gs else (v, s))
 
     def run_seq(self, x, state, stp=None, stp_layer=0):
-        v, s = state
+        gs = getattr(self, "gated_slow", False)
+        if gs: v, s, cs = state
+        else:  v, s = state
         pre = self._in_proj(x)                                  # (B,T,hid) vectorized input
         spikes, mems = [], []
+        drv = gs and self.gs_read == "drive"
         for t in range(x.shape[1]):
             zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
-            v = self._mem(v, s, pre[:, t] + self._rec(zt))
-            s = spike(v - self.thr)
+            I = pre[:, t] + self._rec(zt)
+            thr = self.thr
+            if gs:
+                cs, read = _slow_step(self, I, cs)             # §MEM2 gated slow compartment (bounded |c|≤1)
+                if drv: I = I + read
+                else:   thr = self.thr + read
+            v = self._mem(v, s, I)
+            s = spike(v - thr)
             spikes.append(s); mems.append(v)
-        return torch.stack(spikes, 1), torch.stack(mems, 1), (v, s)
+        return torch.stack(spikes, 1), torch.stack(mems, 1), ((v, s, cs) if gs else (v, s))
 
     @torch.no_grad()
     def grow(self, add):
@@ -243,6 +301,7 @@ class SparseLIFCell(nn.Module):
             nWin = nn.Linear(self.in_dim, new).to(self.Win.weight.device, self.Win.weight.dtype)
             nWin.weight.zero_(); nWin.weight[:old] = self.Win.weight; nWin.bias.zero_(); nWin.bias[:old] = self.Win.bias
             self.Win = nWin
+        _grow_mem_buffers(self, add)           # §MEM/§MEM2 keep beta_vec/b_g_vec sized == hid
         self.hid = new
         return add
 
@@ -287,33 +346,56 @@ class LIFCell(nn.Module):
         self.Win = nn.Linear(in_dim, hid)
         self.Wrec = nn.Linear(hid, hid, bias=False)
         self.beta, self.thr, self.hid, self.in_dim = beta, thr, hid, in_dim
+        # §MEM2 input-gated slow compartment (see SparseLIFCell / _slow_step). DEFAULT OFF ⇒ byte-identical.
+        self.gated_slow = False; self.gs_read = "threshold"; self.k_g = 1.0; self.gs_kappa = -0.3
+        _gbg = torch.Generator().manual_seed(hid + 23)
+        self.register_buffer("b_g_vec", -2.0 - 3.0 * torch.rand(hid, generator=_gbg))       # b_g ∈ [-5,-2]
 
     def init_state(self, B, device, dtype=torch.float32):
         z = torch.zeros(B, self.hid, device=device, dtype=dtype)
+        if getattr(self, "gated_slow", False):
+            return (z, z.clone(), z.clone())                   # §MEM2 v, s, c
         return (z, z.clone())
 
     def forward(self, x, state):
-        v, s = state
-        v = self.beta * v * (1.0 - s) + self.Win(x) + self.Wrec(s)
-        s = spike(v - self.thr)
-        return s, (v, s)
+        gs = getattr(self, "gated_slow", False)
+        if gs: v, s, cs = state
+        else:  v, s = state
+        I = self.Win(x) + self.Wrec(s)
+        thr = self.thr
+        if gs:
+            cs, read = _slow_step(self, I, cs)                  # §MEM2 gated slow compartment
+            if self.gs_read == "drive": I = I + read
+            else:                       thr = self.thr + read
+        v = self.beta * v * (1.0 - s) + I
+        s = spike(v - thr)
+        return s, ((v, s, cs) if gs else (v, s))
 
     def run_seq(self, x, state, stp=None, stp_layer=0):
         """Run the whole (B,T,in) sequence. The input projection Win(x) — the bulk of the
         FLOPs — is computed for ALL timesteps in ONE matmul; only the recurrence Wrec(s)
         stays in the Python loop (it must, it depends on the previous spike). Mathematically
         identical to stepping forward() T times. Returns (spikes, membranes, final_state)."""
-        v, s = state
+        gs = getattr(self, "gated_slow", False)
+        if gs: v, s, cs = state
+        else:  v, s = state
         pre = self.Win(x)                              # (B,T,hid) — vectorized over time
         spikes, mems = [], []
+        drv = gs and self.gs_read == "drive"
         for t in range(x.shape[1]):
             zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
             _rw = getattr(self, "lam_rec_w", None)                                       # §17 laminar dense adjacency (test nets)
             _rec = (zt @ (self.Wrec.weight * _rw).t()) if _rw is not None else self.Wrec(zt)
-            v = self.beta * v * (1.0 - s) + pre[:, t] + _rec
-            s = spike(v - self.thr)
+            I = pre[:, t] + _rec
+            thr = self.thr
+            if gs:
+                cs, read = _slow_step(self, I, cs)             # §MEM2 gated slow compartment
+                if drv: I = I + read
+                else:   thr = self.thr + read
+            v = self.beta * v * (1.0 - s) + I
+            s = spike(v - thr)
             spikes.append(s); mems.append(v)
-        return torch.stack(spikes, 1), torch.stack(mems, 1), (v, s)
+        return torch.stack(spikes, 1), torch.stack(mems, 1), ((v, s, cs) if gs else (v, s))
 
     @torch.no_grad()
     def grow(self, add):
@@ -324,6 +406,7 @@ class LIFCell(nn.Module):
         nWin.weight.zero_(); nWin.weight[:old] = self.Win.weight; nWin.bias.zero_(); nWin.bias[:old] = self.Win.bias
         nWrec = nn.Linear(new, new, bias=False).to(dev, dt)
         nWrec.weight.zero_(); nWrec.weight[:old, :old] = self.Wrec.weight
+        _grow_mem_buffers(self, add)           # §MEM2 keep b_g_vec sized == hid
         self.Win, self.Wrec, self.hid = nWin, nWrec, new
         return add
 
