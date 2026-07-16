@@ -21,7 +21,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .spiking import LIFCell, ALIFCell, SparseLIFCell, SparseALIFCell
+from .spiking import LIFCell, ALIFCell, SparseLIFCell, SparseALIFCell, _adapt_intrinsic
 from . import synapse
 from .stdp import SpikingSTDP
 from .predictive_coding import PredictiveCoding
@@ -566,7 +566,8 @@ class SpikingBrain(nn.Module):
         mlam = float(getattr(self, "metabolic_lambda", 0.01))
         astro_pg = getattr(self, "_astro_pgain", None)         # §17 glia: per-post-neuron metaplastic gain (list[H_l] or None)
         astro_mm = float(getattr(self, "_astro_metab_mult", 1.0) or 1.0)   # glia metabolic-scarcity multiplier on mlam
-        astro_on = bool(getattr(self, "_astro_on", False))     # accumulate per-neuron rate for glia.sense() (off-cost-free)
+        intr = [getattr(c, "intrinsic_exc", False) for c in cells]   # §INTRINSIC per-cell excitability (no neuron dies)
+        astro_on = bool(getattr(self, "_astro_on", False)) or any(intr)   # intrinsic needs the per-neuron rate accumulator
         # §HARM RATE-RELATIVE metabolic gate (precomputed ONCE per step from the PRIOR step's rate, like glia.a and
         # _thr_adapt): a per-neuron factor relu(rate/target−1)∈[0,cap] so the metabolic penalty is one-sided — zero
         # at/below target (no DC bias for Adam to amplify into silence), proportional only above it. Ratio source:
@@ -678,6 +679,7 @@ class SpikingBrain(nn.Module):
                     drive = drive / denom + g_ap * apd_fwd
                 if diffnm: drive = drive * ne_gain             # NE sets somatic gain (surprise/attention)
                 if pc_prev is not None: drive = drive + infer_g * pc_prev[l]   # §PC top-down error relaxes activity
+                if intr[l]: drive = drive + c.intrinsic_bias   # §INTRINSIC baseline excitability keeps every neuron alive
                 _bt = c.beta_vec if getattr(c, "het_tau", False) else c.beta   # §MEM per-neuron long-memory taus
                 v[l] = (_bt * v[l] - c.thr * z_prev if getattr(c, "sub_reset", False)   # §MEM subtractive reset
                         else _bt * v[l] * (1.0 - z_prev)) + drive
@@ -1064,6 +1066,8 @@ class SpikingBrain(nn.Module):
         self._burst_frac = burst_frac
         if astro_on:                                           # §17 per-neuron rate r_l=(Σ_{b,t}z)/(B·T) for glia.sense()
             self._spk_rate_vec = [astro_zsum[l] / float(B * T) for l in range(len(cells))]
+            for l, c in enumerate(cells):                      # §INTRINSIC adapt each neuron's excitability toward the floor
+                if intr[l]: _adapt_intrinsic(c, self._spk_rate_vec[l])
             self._mem_mag_vec = [astro_vsum[l] / float(B * T) for l in range(len(cells))]   # per-neuron |v| for glia.sense_mem()
         if bool(getattr(self, "metab_rate_relative", False)) and getattr(self, "_astro_a", None) is None:
             # §HARM fallback per-neuron rate EMA for the rate-relative metabolic gate when glia is OFF (glia's a_l

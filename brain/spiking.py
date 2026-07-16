@@ -132,6 +132,19 @@ def _grow_mem_buffers(cell, add):
         cell.write_d = torch.cat([cell.write_d, torch.zeros(add, device=cell.write_d.device)])
     if hasattr(cell, "mem_rho_vec"):           # §MEM3 new neurons read the fast store at the scalar default
         cell.mem_rho_vec = torch.cat([cell.mem_rho_vec, torch.full((add,), float(cell.mem_read_gain), device=cell.mem_rho_vec.device)])
+    if hasattr(cell, "intrinsic_bias"):        # §INTRINSIC new neurons start at zero bias, target-rate EMA
+        cell.intrinsic_bias = torch.cat([cell.intrinsic_bias, torch.zeros(add, device=cell.intrinsic_bias.device)])
+        cell.intrinsic_rate = torch.cat([cell.intrinsic_rate, torch.full((add,), float(cell.intrinsic_target), device=cell.intrinsic_rate.device)])
+
+
+def _adapt_intrinsic(cell, rate_vec):
+    """§INTRINSIC per-neuron excitability update from the observed firing rate (one-sided, bounded). A neuron below
+    the baseline target gets a growing depolarising bias (revive); at/above target the bias decays toward 0. Called
+    once per learning step; keeps EVERY neuron alive so it never drops out of learning."""
+    r = rate_vec.detach().to(cell.intrinsic_rate.dtype)
+    cell.intrinsic_rate.mul_(0.9).add_(r, alpha=0.1)                          # per-neuron rate EMA
+    cell.intrinsic_bias.add_(cell.intrinsic_target - cell.intrinsic_rate, alpha=cell.intrinsic_lr)
+    cell.intrinsic_bias.clamp_(0.0, cell.intrinsic_max)                       # excitability only (≥0), bounded
 
 
 class SparseLIFCell(nn.Module):
@@ -189,6 +202,16 @@ class SparseLIFCell(nn.Module):
         self.mem_learn_read = False
         self.mem_rho_max = 2.0
         self.register_buffer("mem_rho_vec", torch.full((hid,), 0.5))   # per-neuron learned read gain
+        # §INTRINSIC excitability (intrinsic plasticity; Desai/Turrigiano) — REAL neurons don't die. A per-neuron
+        # adaptive DRIVE bias holds a LOW baseline firing rate so NO neuron ever goes permanently silent (its
+        # eligibility stays alive to learn), while input still modulates on top. Fixes the silencing spiral at its
+        # root — a dead neuron gets a growing depolarising bias until it fires, then the bias stabilises. DEFAULT OFF.
+        self.intrinsic_exc = False
+        self.intrinsic_target = 0.05         # baseline firing floor (low ⇒ input still dominates the timing)
+        self.intrinsic_lr = 0.1              # revive speed (v_ss≈bias/(1-β): bias~0.1 wakes a zero-input neuron)
+        self.intrinsic_max = 1.0             # bound on the excitability bias (can't force saturation)
+        self.register_buffer("intrinsic_bias", torch.zeros(hid))
+        self.register_buffer("intrinsic_rate", torch.full((hid,), 0.05))   # per-neuron firing-rate EMA
         self.sparse_in = bool(sparse_in)
         self.rec_fanin, self.in_fanin = rec_fanin, in_fanin
         # --- recurrent connectome (always sparse) ---
@@ -308,6 +331,7 @@ class SparseLIFCell(nn.Module):
                 css.append(cs)                                  # §MEM2b per-tick compartment for the learned head-read
                 if drv: I = I + read
                 else:   thr = self.thr + read
+            if getattr(self, "intrinsic_exc", False): I = I + self.intrinsic_bias   # §INTRINSIC baseline excitability
             v = self._mem(v, s, I)
             s = spike(v - thr)
             if fm:                                              # Hebbian EMA write: post(t)·pre(t-1) ⇒ F∈[0,1]
@@ -397,6 +421,10 @@ class LIFCell(nn.Module):
         self.register_buffer("kappa_vec", torch.full((hid,), float(self.gs_kappa)))         # ≡ scalar κ off
         self.register_buffer("write_a", torch.ones(hid))                                    # §MEM2c ≡ tanh(I) off
         self.register_buffer("write_d", torch.zeros(hid))
+        # §INTRINSIC excitability (see SparseLIFCell) — per-neuron adaptive drive bias so no neuron dies. DEFAULT OFF.
+        self.intrinsic_exc = False; self.intrinsic_target = 0.05; self.intrinsic_lr = 0.1; self.intrinsic_max = 1.0
+        self.register_buffer("intrinsic_bias", torch.zeros(hid))
+        self.register_buffer("intrinsic_rate", torch.full((hid,), 0.05))
 
     def init_state(self, B, device, dtype=torch.float32):
         z = torch.zeros(B, self.hid, device=device, dtype=dtype)
@@ -440,6 +468,7 @@ class LIFCell(nn.Module):
                 css.append(cs)                                  # §MEM2b per-tick compartment for the learned head-read
                 if drv: I = I + read
                 else:   thr = self.thr + read
+            if getattr(self, "intrinsic_exc", False): I = I + self.intrinsic_bias   # §INTRINSIC baseline excitability
             v = self.beta * v * (1.0 - s) + I
             s = spike(v - thr)
             spikes.append(s); mems.append(v)
