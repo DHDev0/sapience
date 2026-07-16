@@ -344,12 +344,17 @@ class BrainLife:
                 self.brain._dyn_elig_beta = None                    # off → the native eligibility timescale
             glia = getattr(self, "glia", None)                      # §17 astrocyte field: slow per-neuron metaplasticity
             if glia is not None and glia.on:
-                gate = gate * glia.global_gain()                    # region-wide slow gliotransmission brake (× endo gate)
+                _gg = glia.global_gain()                            # region-wide slow gliotransmission brake (× endo gate)
+                if getattr(self.brain, "excite_pressure", False):   # §HARM bus: release the region-wide brake when calm/silenced
+                    _pp = min(1.0, float(getattr(self.brain, "_excite_p", 0.0)))   # blend toward neutral (1.0) by prior-step P
+                    _gg = 1.0 - _pp * (1.0 - _gg)                   # P→0 ⇒ _gg→1 (no brake); P≥1 ⇒ full glia global gain
+                gate = gate * _gg
                 self.brain._astro_on = True                         # cortex accumulates the per-neuron rate for glia.sense()
                 self.brain._astro_pgain = glia.pgain_per_layer([c.hid for c in self.brain.cells])  # per-post metaplastic gain
                 self.brain._astro_metab_mult = glia.metab_mult()    # scales metabolic_lambda (lactate/ATP scarcity)
+                self.brain._astro_a = list(glia.a) if glia.a else None   # §HARM per-neuron activity ratio a_l (=rate/target) for the rate-relative metabolic gate
             elif hasattr(self.brain, "_astro_on"):                  # OFF → leave nothing stale (mirror _dyn_elig_beta reset)
-                self.brain._astro_on = False; self.brain._astro_pgain = None; self.brain._astro_metab_mult = 1.0
+                self.brain._astro_on = False; self.brain._astro_pgain = None; self.brain._astro_metab_mult = 1.0; self.brain._astro_a = None
             if hasattr(self.brain, "stp"):                          # §16↔§17: NE arousal raises effective STP release prob U
                 if self.brain.stp.on and endo is not None and endo.on:
                     self.brain.stp._ne_gain = float(endo.ne_gain())

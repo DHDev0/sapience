@@ -55,7 +55,7 @@ L4, L23, L56 = 0, 1, 2
 
 class LaminarMicrocircuit:
     _KEYS = ("on", "frac_L4", "frac_L23", "frac_L56", "allow_fb",
-             "input_to_l23", "apical_l4_gain", "strict")
+             "input_to_l23", "apical_l4_gain", "strict", "drive_comp")
 
     def __init__(self, device=None, dtype=None):
         self.device = device
@@ -69,6 +69,7 @@ class LaminarMicrocircuit:
         self.input_to_l23 = 0.0                 # >0 also routes external drive to L2/3 (else L4-only)
         self.apical_l4_gain = 0.05              # apical top-down gain onto granular L4 (spared)
         self.strict = True                      # enforce the two forbidden pairs (L2/3→L4, L4→L5/6)
+        self.drive_comp = False                 # §HARM rescale surviving recurrent edges to preserve forward drive (opt-in)
         # last-observed metrics (surfaced to state())
         self._rate_L4 = 0.0
         self._rate_L23 = 0.0
@@ -161,6 +162,15 @@ class LaminarMicrocircuit:
                 eff = (c.rec_mask & c.lam_rec_mask).to(torch.float32)
                 fin = torch.zeros(c.hid, dtype=torch.float32, device=dev).index_add_(0, c.rec_row.long(), eff)
                 c.lam_rec_fanin = fin.clamp_(min=1.0)          # per-neuron effective fan-in (width-invariant norm)
+                # §HARM DRIVE-COMPENSATION: masking removes lamina-illegal edges, cutting the FORWARD recurrent
+                # drive so the top membrane silences (mem_mag→0.1) and can't learn. Rescale each surviving edge by
+                # its post-neuron's rec_fanin/surviving_fanin so the TOTAL recurrent drive is preserved — laminar
+                # then changes WHICH edges carry signal (functional differentiation) without changing HOW MUCH.
+                if getattr(self, "drive_comp", True):
+                    _of = torch.zeros(c.hid, dtype=torch.float32, device=dev).index_add_(0, c.rec_row.long(), c.rec_mask.to(torch.float32)).clamp_(min=1.0)
+                    c.lam_rec_comp = (_of / c.lam_rec_fanin)   # (hid,) per-post-neuron drive-preserving scale ≥1
+                elif hasattr(c, "lam_rec_comp"):
+                    del c.lam_rec_comp
                 tot_edge += float(c.rec_mask.sum()); masked_out += float((c.rec_mask & ~c.lam_rec_mask).sum())
                 if getattr(c, "sparse_in", False):
                     post_in = lam[c.in_row.long()]

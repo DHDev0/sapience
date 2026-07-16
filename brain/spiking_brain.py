@@ -116,6 +116,13 @@ class SpikingBrain(nn.Module):
         # cannot — it just explodes, measured). gate·attention·DA still multiplies the step (mechanisms modulate).
         self.learn_opt = "legacy"             # "legacy"=÷fan_in+clamp+fixed-lr (byte-identical); "adam"=per-weight Adam
         self.adam_lr = 1e-3                    #   Adam step size on the local e-prop gradient
+        # §17 glia metaplasticity under Adam: a per-neuron pgain that SCALES THE RAW GRADIENT is a no-op under
+        # Adam — m and √u both carry the same per-row factor, so it cancels in the m̂/√û ratio (a chronically
+        # over-firing astrocyte domain then fails to throttle its own synapses). glia_pgain_post_adam moves the
+        # metaplastic gain from the pre-Adam gradient onto the POST-Adam STEP (a per-post-neuron learning-rate
+        # multiplier that Adam's RMS cannot normalise away). OFF ⇒ pgain stays a gradient scale (byte-identical;
+        # legacy path unchanged, where the ±clamp makes pre-grad vs post-step genuinely differ).
+        self.glia_pgain_post_adam = False
         self._adam_state = {}                  #   id(param) -> [m, u] fp32 first/second-moment EMAs (per-weight, local)
         self._adam_t = 0                       #   Adam bias-correction step counter
         self.head_norm = "power"              # "power"=÷hidden^head_fanin_pow (current, byte-identical); "energy"=NLMS ÷‖top_v‖²
@@ -218,6 +225,45 @@ class SpikingBrain(nn.Module):
         self.spike_noise = 0.1
         self.metabolic = False
         self.metabolic_lambda = 0.01
+        # §HARM rate-relative metabolic penalty: the constant `+mlam·z` term is a sign-coherent DC bias on the
+        # e-prop gradient that Adam (which normalises magnitude but preserves sign) converts into a full-strength
+        # downward step EVERY tick → silences the top membrane (mem_mag→0.1-0.2, no learning). Gate the penalty by
+        # per-neuron OVER-firing relu(rate/target−1) (like intrinsic homeostasis) so it is ZERO at/below target (no
+        # DC for Adam to amplify, stable fixed point at rate=target) and only genuine over-drive gets a
+        # proportional, SELF-RELEASING push. DEFAULT OFF ⇒ byte-identical to the constant term.
+        self.metab_rate_relative = False       # engage the rate-relative (one-sided) metabolic gate
+        self.metab_rate_cap = 4.0              # cap on relu(rate/target−1) so the over-target bias stays a minority of Adam's RMS
+        # ── §HARM EXCITATION-PRESSURE BUS P — the unifying coordinator ─────────────────────────────────────
+        # The per-mechanism retunes above (metab_rate_relative, glia_pgain_post_adam, mem_homeostasis) each
+        # defuse ONE Adam-amplified suppressor, but the everything-on collapse is COLLECTIVE: under Adam the
+        # WHOLE suppressive stack (metabolic price, glia brake, rate/mem homeostasis, PV divisive gain) can
+        # co-pin a SILENCED membrane at mem_mag≈0.1 — a near-absorbing state that no single control releases
+        # (removing any ONE does not recover; the measured `−metabolic→0.15 / −glia→0.11` facts). P is ONE
+        # absolute-anchored over-drive signal ∈[0,excite_p_cap] that gates EVERY suppressive control together:
+        # each engages ∝min(1,P) and RELEASES to 0 the instant the top representation is calm OR silenced
+        # (mem_mag ≤ mem_target AND rate ≤ target_rate ⇒ P=0). So a silenced net sees ZERO suppression and its
+        # membrane is free to climb back out; only a genuine runaway (mem_mag/rate ABOVE their FIXED anchors —
+        # never a self-following EMA that would calibrate the runaway away) drives P>0 and pushes the brakes
+        # on, self-releasing the moment it settles at the anchor (negative feedback, stable fixed point at the
+        # anchor). This is the coordination principle in one bus: absolute-anchored PRESSURE, engaged only when
+        # drive is genuinely too high, released when calm. DEFAULT OFF ⇒ every gated control keeps its current
+        # (nominal) strength ⇒ byte-identical; when ON, the gate can only REDUCE suppression below today's
+        # constant level (min(1,P)≤1), never strengthen it past nominal — so it can undo the silence, not add
+        # instability. ANCHOR NOTE: under Adam the healthy band is mem_mag≈1.4–2.0, so the Adam everything-on
+        # config sets mem_target≈2.0 (this re-anchors BOTH the bus AND the attention mem-brake to one setpoint);
+        # left at the legacy 1.0 the bus would wrongly engage inside the healthy band.
+        self.excite_pressure = False           # master toggle for the P coordinator (default off ⇒ byte-identical)
+        self.excite_p_cap = 3.0                # clamp on P (matches the attention over/over_mem ±3 range)
+        self.excite_p_gain = 1.0               # sensitivity: P = excite_p_gain · max(mem_over, rate_over)
+        self.homeo_leak = 0.0                  # §HARM P-gated anti-windup leak on _thr_adapt: leaks ∝(1−min(1,P)) so the
+        #   threshold integrator UNWINDS toward baseline when the net is calm/silenced (P→0) — the recovery path out of a
+        #   homeostasis wind-up silence — and HOLDS (no leak) under genuine over-rate pressure. 0 ⇒ byte-identical.
+        self.homeo_clamp = 0.0                 # §HARM hard anti-windup backstop: |_thr_adapt|≤homeo_clamp (0⇒off⇒byte-identical).
+        #   Under Adam the RATE integrator winds up ~1e3× faster (proper-strength plant) and can push thr into the surrogate
+        #   dead-zone (|v−thr|≫0 ⇒ ψ→0 ⇒ g=Lsig·ψ→0 ⇒ frozen, acc→0.008). A ±0.6 clamp (thr0=1.0) keeps effective thr∈[0.4,1.6],
+        #   inside the Adam healthy mem band, so ψ stays alive and the silence point is STRUCTURALLY unreachable — unlike the
+        #   leak (which only RELEASES when calm), the clamp bounds even a transient over-rate excursion. Unconditional backstop.
+        self._excite_p = 0.0                   # last step's pressure (cached for life.py glia gate + next step's in-loop controls)
         self._mind = None                      # persistent per-layer state = stream of thought
         self._last = None
         # §10: the NEURON count is fixed at birth; the SYNAPSE count is what develops. Seed a
@@ -479,6 +525,33 @@ class SpikingBrain(nn.Module):
         astro_pg = getattr(self, "_astro_pgain", None)         # §17 glia: per-post-neuron metaplastic gain (list[H_l] or None)
         astro_mm = float(getattr(self, "_astro_metab_mult", 1.0) or 1.0)   # glia metabolic-scarcity multiplier on mlam
         astro_on = bool(getattr(self, "_astro_on", False))     # accumulate per-neuron rate for glia.sense() (off-cost-free)
+        # §HARM RATE-RELATIVE metabolic gate (precomputed ONCE per step from the PRIOR step's rate, like glia.a and
+        # _thr_adapt): a per-neuron factor relu(rate/target−1)∈[0,cap] so the metabolic penalty is one-sided — zero
+        # at/below target (no DC bias for Adam to amplify into silence), proportional only above it. Ratio source:
+        # glia's per-neuron activity field a_l (=rate/target, surfaced as _astro_a) when glia is on; else a
+        # self-maintained per-neuron rate EMA /target. No rate estimate yet ⇒ factor 0 (safe release, no penalty).
+        metab_rel = None
+        if metab and bool(getattr(self, "metab_rate_relative", False)):
+            _mrcap = float(getattr(self, "metab_rate_cap", 4.0))
+            _mratio = getattr(self, "_astro_a", None)          # glia per-neuron activity ratio a_l (a=1 ⇔ at target)
+            if _mratio is None:
+                _mre = getattr(self, "_metab_rate_ema", None)  # fallback (glia off): our own per-neuron rate EMA / target
+                if _mre is not None:
+                    _mtr = max(float(getattr(self, "target_rate", 0.08)), 1e-3)
+                    _mratio = [r / _mtr for r in _mre]
+            metab_rel = []
+            for l, c in enumerate(cells):                      # per-neuron relu(ratio−1), width-guarded + capped
+                if _mratio is not None and l < len(_mratio) and _mratio[l].numel() >= c.hid:
+                    metab_rel.append((_mratio[l][:c.hid].to(dev).float() - 1.0).clamp(0.0, _mrcap))
+                else:
+                    metab_rel.append(torch.zeros(c.hid, device=dev))   # no/stale rate → release (no DC bias)
+        # §HARM excitation-pressure bus: the IN-LOOP suppressive controls (metabolic price @ the Lsig term, PV
+        # divisive gain @ the drive) run BEFORE this step's P is known, so they gate on the PRIOR step's pressure
+        # (causal; P is a slow controller). _p_prev∈[0,1] is the in-loop gate — OFF ⇒ 1.0 (nominal, byte-identical);
+        # ON ⇒ min(1, last P) so both controls release to 0 on a calm/silenced net and reach nominal only under
+        # ≥2×-anchor over-drive. Tail controls (glia pgain, homeostasis) use THIS step's fresh P computed below.
+        _p_on = bool(getattr(self, "excite_pressure", False))
+        _p_prev = min(1.0, float(getattr(self, "_excite_p", 0.0))) if _p_on else 1.0
         if astro_on:                                           # §17 per-neuron accumulators for glia.sense()/sense_mem()
             astro_zsum = [torch.zeros(c.hid, device=dev) for c in cells]   # firing (rate channel)
             astro_vsum = [torch.zeros(c.hid, device=dev) for c in cells]   # |v| (ABSOLUTE membrane-runaway channel)
@@ -539,8 +612,9 @@ class SpikingBrain(nn.Module):
                     apd_fwd = (ap[l] + plat[l]) if plateau else ap[l]   # §17 sustained plateau feeds forward across ticks
                     _ag = getattr(c, "lam_apical_gain", None)           # §17 laminar: apical error → L2/3+L5 tufts, spare L4
                     if _ag is not None: apd_fwd = apd_fwd * _ag
-                    denom = intern.pv(l, z_prev.mean(1, keepdim=True), pv_g) if use_intern \
-                        else (1.0 + pv_g * z_prev.mean(1, keepdim=True))   # §17 spiking PV pool OR mean-field divisive gain
+                    _pvg = pv_g * _p_prev                       # §HARM: release the PV divisive gain (a FORWARD suppressor)
+                    denom = intern.pv(l, z_prev.mean(1, keepdim=True), _pvg) if use_intern \
+                        else (1.0 + _pvg * z_prev.mean(1, keepdim=True))   # when calm/silenced (P→0) → denom→1 → full drive
                     drive = drive / denom + g_ap * apd_fwd
                 if diffnm: drive = drive * ne_gain             # NE sets somatic gain (surprise/attention)
                 if pc_prev is not None: drive = drive + infer_g * pc_prev[l]   # §PC top-down error relaxes activity
@@ -637,7 +711,9 @@ class SpikingBrain(nn.Module):
                     brst = (Lsig.abs() > thr).float() * z[l]   # two-compartment neuron — low-bandwidth, noisy
                     Lsig = Lsig * brst
                     if l == len(cells) - 1: burst_frac = float(brst.mean())
-                if metab: Lsig = Lsig + (mlam * astro_mm) * z[l]   # metabolic cost (mlam·Σz); §17 glia scales the energy price
+                if metab:                                      # metabolic cost (mlam·Σz); §17 glia scales the energy price
+                    _mz = z[l] if metab_rel is None else metab_rel[l] * z[l]   # §HARM rate-relative: OVER-target firing only
+                    Lsig = Lsig + (mlam * astro_mm * _p_prev) * _mz    # §HARM bus: release the DC price (incl. astro_mm) when calm/silenced
                 #   has dLoss/dz=+mlam → ADDS to the per-neuron error, pushing incoming weights DOWN (less firing)
                 g = (Lsig * psi[l]).float()                    # g_j = L_j · ψ_j
                 if l == 0 and getattr(c, "Win", None) is not None:   # the byte-embedding learns too: project the
@@ -698,6 +774,28 @@ class SpikingBrain(nn.Module):
         mem_mag = float(v[-1].abs().mean())    # top-layer representation magnitude (same as the _diag mem_mag below)
         mem_sens = float(getattr(self, "attn_mem_sens", 0.5))
         over_mem = min(3.0, max(0.0, mem_mag / max(float(getattr(self, "mem_target", 1.0)), 1e-3) - 1.0))
+        # ── §HARM EXCITATION-PRESSURE BUS P ── the single absolute-anchored coordinator (see __init__). over_mem is
+        # ALREADY relu(mem_mag/mem_target−1) (the membrane channel); add the rate channel relu(rate/target−1) and take
+        # the max, ×gain, capped. This is THIS step's fresh P — used by the tail controls (glia pgain, homeostasis,
+        # mem-leak) below and cached for life.py's glia gate + the NEXT step's in-loop controls. _pgate∈[0,1] is the
+        # tail gate: OFF ⇒ 1.0 (nominal, byte-identical); ON ⇒ min(1,P) so every tail suppressor releases at P=0.
+        if _p_on:
+            _p_rate = 0.0
+            if homeo and spk_sum is not None:
+                _p_rate = max(0.0, rate / max(float(getattr(self, "target_rate", 0.08)), 1e-3) - 1.0)
+            excite_p = min(float(getattr(self, "excite_p_cap", 3.0)),
+                           float(getattr(self, "excite_p_gain", 1.0)) * max(float(over_mem), _p_rate))
+        else:
+            excite_p = 0.0
+        self._excite_p = excite_p              # cache for life.py glia gate + next step's in-loop controls
+        _pgate = min(1.0, excite_p) if _p_on else 1.0
+        # §HARM: gate the glia per-neuron metaplastic brake by the bus — blend each pgain toward neutral (1.0) by
+        # _pgate so the brake RELEASES on a calm/silenced net (P→0 ⇒ pgain→1 ⇒ full plasticity) and reaches its full
+        # glia-set value only under pressure. OFF ⇒ _pgate=1 ⇒ pgain unchanged (byte-identical). Feeds BOTH the
+        # pre-Adam gradient-scale path and the post-Adam step-scale path (glia_pgain_post_adam) below via astro_pg_g.
+        astro_pg_g = astro_pg
+        if astro_pg is not None and _p_on:
+            astro_pg_g = [1.0 - _pgate * (1.0 - pg) for pg in astro_pg]
         attn_t = min(1.3, max(0.2, 1.0 - sens * surprise - rate_sens * over - mem_sens * over_mem))   # loss-shock OR over-firing OR membrane-runaway → less plasticity
         cur_at = float(getattr(self, "attention", 1.0))
         aw = 0.3 if attn_t < cur_at else 0.1        # ASYMMETRIC: brake FAST (safety-biased), release SLOW — so an
@@ -705,20 +803,26 @@ class SpikingBrain(nn.Module):
         self.loss_ema = 0.98 * self.loss_ema + 0.02 * L             # slow learning-health baseline
         scale = float(gate) * lr * self.attention * ((0.5 + da) if diffnm else 1.0)   # ACh gates; ATTENTION self-adapts; DA reward-modulates
         _adam = getattr(self, "learn_opt", "legacy") == "adam"                # per-weight optimizer on the LOCAL e-prop grad
+        # §17 glia metaplasticity survives Adam ONLY as a step scale: reroute pgain from the raw gradient (where
+        # Adam's per-weight RMS cancels a pure per-row scale → no-op) onto the applied Adam step. Requires Adam
+        # (legacy keeps the ±clamped gradient scale — NOT step-equivalent) and a live glia field (astro_pg).
+        _pg_post = bool(getattr(self, "glia_pgain_post_adam", False)) and _adam and (astro_pg is not None)
         if _adam:                                                            # (faithful: reads only each synapse's own g-history)
             self._adam_t = int(getattr(self, "_adam_t", 0)) + 1
             if not hasattr(self, "_adam_state"): self._adam_state = {}
             _b1, _b2, _aeps = 0.9, 0.999, 1e-8; _alr = float(getattr(self, "adam_lr", 1e-3))
             _amult = float(gate) * self.attention * ((0.5 + da) if diffnm else 1.0)   # gate·attn·DA (mechanisms modulate); NO base lr
             _abc1 = 1.0 - _b1 ** self._adam_t; _abc2 = 1.0 - _b2 ** self._adam_t      # bias correction
-        def _upd(w, g, fin, pw=p):
+        def _upd(w, g, fin, pw=p, smul=None):
             if _adam:                                                        # ADAM: per-weight m/û normalization, no ÷fanin, no clamp
                 k = id(w); st = self._adam_state.get(k)
                 if st is None or st[0].shape != w.shape:
                     st = [torch.zeros_like(w, dtype=torch.float32), torch.zeros_like(w, dtype=torch.float32)]; self._adam_state[k] = st
                 m, u = st; gf = g.float()
                 m.mul_(_b1).add_(gf, alpha=1.0 - _b1); u.mul_(_b2).addcmul_(gf, gf, value=1.0 - _b2)
-                w.add_(((_amult * _alr) * (m / _abc1) / ((u / _abc2).sqrt() + _aeps)).to(w.dtype), alpha=-1.0)
+                step = (_amult * _alr) * (m / _abc1) / ((u / _abc2).sqrt() + _aeps)
+                if smul is not None: step = step * smul   # §17 glia: per-post-neuron LR multiplier on the ADAM STEP (survives RMS)
+                w.add_(step.to(w.dtype), alpha=-1.0)
                 return
             d = (fin ** pw) if torch.is_tensor(fin) else float(fin) ** pw     # §17 per-neuron eff-fanin (tensor) or scalar
             w.add_((scale * (g / (denom * d))).clamp_(-dmax, dmax).to(w.dtype), alpha=-1.0)
@@ -737,9 +841,9 @@ class SpikingBrain(nn.Module):
             # mean over ACTIVE edges across ALL sparse layers (the old code sampled only the top layer, which is
             # the sparsest-firing one — near-silent at depth — so stdp_mag read a flat 0.0 while STDP was healthy).
             sd._mag = (_mag_sum / _mag_n) if _mag_n > 0 else 0.0
-        if astro_pg is not None:                               # §17 glia: slow per-POSTsynaptic-neuron metaplastic gain on
-            for l, c in enumerate(cells):                      #   the APPLIED update (a 4th factor on Δw, NOT the eligibility)
-                pg = astro_pg[l].to(g_rec[l].dtype)
+        if astro_pg is not None and not _pg_post:              # §17 glia: slow per-POSTsynaptic-neuron metaplastic gain on
+            for l, c in enumerate(cells):                      #   the APPLIED update (a 4th factor on Δw, NOT the eligibility).
+                pg = astro_pg_g[l].to(g_rec[l].dtype)          #   §HARM bus-gated; _pg_post ⇒ moved onto the Adam STEP (below)
                 if sp(c):
                     g_rec[l] = g_rec[l] * pg[c.rec_row]        # sparse: scale each edge by its POSTsynaptic neuron's gain
                     if c.sparse_in:
@@ -750,20 +854,29 @@ class SpikingBrain(nn.Module):
                     g_rec[l] = g_rec[l] * pg.unsqueeze(1)      # dense: rows = postsynaptic neurons
                     g_in[l] = g_in[l] * pg.unsqueeze(1); g_in_b[l] = g_in_b[l] * pg
         for l, c in enumerate(cells):
+            # §17 glia (post-Adam): the per-post-neuron gain rides the STEP, so slice it to each weight's rows —
+            # per-EDGE by postsynaptic neuron for sparse (pg[row]), per-ROW for dense (pg[:,None]), per-neuron for
+            # biases. None ⇒ no scale (default path / non-glia weights: head, E, feedback are never glia-throttled).
+            _pgl = astro_pg_g[l].to(g_rec[l].dtype) if _pg_post else None   # §HARM bus-gated per-post-neuron step scale
             if sp(c):
+                _sm_e = _pgl[c.rec_row] if _pgl is not None else None    # per recurrent EDGE, indexed by its post-neuron
                 _lrm = getattr(c, "lam_rec_mask", None)
                 if _lrm is not None:                                     # §17 laminar-thinned fan-in norm (width-invariant)
-                    _upd(c.rec_val, g_rec[l] * (c.rec_mask * _lrm), c.lam_rec_fanin[c.rec_row].to(g_rec[l].dtype))
+                    _upd(c.rec_val, g_rec[l] * (c.rec_mask * _lrm), c.lam_rec_fanin[c.rec_row].to(g_rec[l].dtype), smul=_sm_e)
                 else:
-                    _upd(c.rec_val, g_rec[l] * c.rec_mask, c.rec_fanin)   # silent synapses get no update
+                    _upd(c.rec_val, g_rec[l] * c.rec_mask, c.rec_fanin, smul=_sm_e)   # silent synapses get no update
                 if c.sparse_in:
-                    _upd(c.in_val, g_in[l] * c.eff_in_mask(), c.in_fanin); _upd(c.in_bias, g_in_b[l], 1)
+                    _upd(c.in_val, g_in[l] * c.eff_in_mask(), c.in_fanin, smul=(_pgl[c.in_row] if _pgl is not None else None))
+                    _upd(c.in_bias, g_in_b[l], 1, smul=_pgl)
                 else:
-                    _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
+                    _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1], smul=(_pgl.unsqueeze(1) if _pgl is not None else None))
+                    _upd(c.Win.bias, g_in_b[l], 1, smul=_pgl)
             else:
+                _sm_r = _pgl.unsqueeze(1) if _pgl is not None else None  # dense: rows = postsynaptic neurons
                 _lrw = getattr(c, "lam_rec_w", None)                     # §17 laminar dense adjacency (test nets)
-                _upd(c.Wrec.weight, g_rec[l] if _lrw is None else g_rec[l] * _lrw, c.Wrec.weight.shape[1])
-                _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1]); _upd(c.Win.bias, g_in_b[l], 1)
+                _upd(c.Wrec.weight, g_rec[l] if _lrw is None else g_rec[l] * _lrw, c.Wrec.weight.shape[1], smul=_sm_r)
+                _upd(c.Win.weight, g_in[l], c.Win.weight.shape[1], smul=_sm_r)
+                _upd(c.Win.bias, g_in_b[l], 1, smul=_pgl)
         mu = meanE = epsE = None
         if he_on and not _adam:                                # §NLMS energy-normalized readout (width+sparsity-invariant)
             last = len(cells) - 1
@@ -806,12 +919,16 @@ class SpikingBrain(nn.Module):
             _mdrift = float(getattr(self, "homeo_lr_drift", 0.0))
             _mtgt = max(float(getattr(self, "mem_homeo_target", 3.0)), 1e-3)
             _mlr = float(getattr(self, "mem_homeo_lr", 0.05))
+            _hleak = float(getattr(self, "homeo_leak", 0.0))                        # §HARM P-gated anti-windup leak
             for l in range(len(cells)):
                 rerr = spk_sum[l] / float(B * T) - float(self.target_rate)          # per-neuron rate error
                 elr = self.homeo_lr                                                 # RATE channel → threshold (existing)
                 if _mdrift > 0.0:                                                   # drift-adaptive gain: raise thr FASTER when the
                     elr = self.homeo_lr * (1.0 + _mdrift * float(rerr.abs().mean()) / max(float(self.target_rate), 1e-3))
                 self._thr_adapt[l] += elr * rerr                                    #   rate is far from target (catch a fast runaway)
+                if _p_on and _hleak > 0.0:                                          # §HARM: leak the integrator toward baseline
+                    self._thr_adapt[l] *= (1.0 - _hleak * (1.0 - _pgate))           #   ∝(1−P) — UNWIND the wind-up when calm/silenced
+                    #   (P→0 ⇒ full leak ⇒ threshold returns ⇒ neurons re-fire ⇒ recovery); HOLD (no leak) under over-rate pressure.
                 if mem_homeo:
                     # MAGNITUDE channel: the everything-on collapse is a REPRESENTATION-WIDE |v| runaway (the LAYER-
                     # MEAN mem_mag inflates) that the rate channel is blind to (|v| grows with rate on target); worse,
@@ -826,13 +943,27 @@ class SpikingBrain(nn.Module):
                     # |v|≈mem_homeo_target. relu ⇒ 0 while mean|v|≤target ⇒ byte-identical when quiescent; the default
                     # target 3.0 sits ABOVE the healthy high-|v| operating band so it fires only on a genuine runaway.
                     excess = max(0.0, float(v[l].abs().mean()) / _mtgt - 1.0)
-                    if excess > 0.0: self._thr_adapt[l] -= _mlr * excess
+                    if excess > 0.0: self._thr_adapt[l] -= _mlr * excess * _pgate   # §HARM: mem-leak engages ∝P, releases at P=0
+                _hclamp = float(getattr(self, "homeo_clamp", 0.0))                  # §HARM hard anti-windup backstop (both channels)
+                if _hclamp > 0.0: self._thr_adapt[l].clamp_(-_hclamp, _hclamp)      #   keeps thr out of the ψ dead-zone (unconditional)
         if getattr(self, "dale", False):
             self._project_dale()                               # re-impose E/I sign law after the update
         self._burst_frac = burst_frac
         if astro_on:                                           # §17 per-neuron rate r_l=(Σ_{b,t}z)/(B·T) for glia.sense()
             self._spk_rate_vec = [astro_zsum[l] / float(B * T) for l in range(len(cells))]
             self._mem_mag_vec = [astro_vsum[l] / float(B * T) for l in range(len(cells))]   # per-neuron |v| for glia.sense_mem()
+        if bool(getattr(self, "metab_rate_relative", False)) and getattr(self, "_astro_a", None) is None:
+            # §HARM fallback per-neuron rate EMA for the rate-relative metabolic gate when glia is OFF (glia's a_l
+            # is preferred and, when present, drives the gate directly). Source: this step's per-neuron rate from
+            # astro (if on) or homeostasis' spk_sum. Neither ⇒ no source ⇒ gate stays released (penalty = 0).
+            _rv = getattr(self, "_spk_rate_vec", None) if astro_on \
+                else ([spk_sum[l] / float(B * T) for l in range(len(cells))] if homeo else None)
+            if _rv is not None:
+                _re = getattr(self, "_metab_rate_ema", None)
+                if _re is None or len(_re) != len(_rv) or any(_re[l].numel() != _rv[l].numel() for l in range(len(_rv))):
+                    self._metab_rate_ema = [r.detach().clone() for r in _rv]   # (re)seed on first use / width change
+                else:
+                    for l in range(len(_rv)): _re[l].mul_(0.9).add_(_rv[l].detach(), alpha=0.1)
         if twocomp: self._apical_mag = float(ap[-1].abs().mean())   # apical-dendrite drive magnitude
         if use_intern: self._intern_rates = intern.state()          # §17 cache per-type spiking rates for weight_stats
         if plateau:                                                 # §17 write back plateau metrics (apical_mag on apd)
@@ -1110,8 +1241,9 @@ class SpikingBrain(nn.Module):
                    "homeostasis", "target_rate", "homeo_lr", "mem_homeostasis", "mem_homeo_target", "mem_homeo_lr", "homeo_lr_drift",
                    "btsp", "btsp_beta", "two_compartment", "g_ap",
                    "beta_ap", "som_baseline", "pv_gain", "diff_neuromod", "stochastic", "spike_noise", "metabolic",
-                   "metabolic_lambda", "stdp", "head_norm", "head_lr_scale", "head_energy_eps",
-                   "learn_opt", "adam_lr")
+                   "metabolic_lambda", "metab_rate_relative", "metab_rate_cap", "stdp", "head_norm", "head_lr_scale", "head_energy_eps",
+                   "learn_opt", "adam_lr", "glia_pgain_post_adam",
+                   "excite_pressure", "excite_p_cap", "excite_p_gain", "homeo_leak", "homeo_clamp")   # §HARM excitation-pressure bus
 
     @torch.no_grad()
     def set_faith(self, **kw):
@@ -1142,8 +1274,9 @@ class SpikingBrain(nn.Module):
                     v = max(1e-3, v)
                 elif k in ("target_rate", "homeo_lr", "pv_gain", "g_ap", "fb_decay", "burst_thr", "head_fanin_pow",
                            "som_baseline", "spike_noise", "metabolic_lambda", "attn_sensitivity", "attn_rate_sens",
-                           "attn_mem_sens", "mem_homeo_lr", "homeo_lr_drift",
-                           "head_lr_scale", "head_energy_eps", "adam_lr"):
+                           "attn_mem_sens", "mem_homeo_lr", "homeo_lr_drift", "metab_rate_cap",
+                           "head_lr_scale", "head_energy_eps", "adam_lr",
+                           "excite_p_cap", "excite_p_gain", "homeo_leak", "homeo_clamp"):   # §HARM bus knobs (≥0)
                     v = max(0.0, v)
                 elif k in ("btsp_beta", "beta_ap"):
                     v = min(0.9999, max(0.0, v))

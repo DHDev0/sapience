@@ -153,9 +153,15 @@ class SparseLIFCell(nn.Module):
                                    self.rec_row, s, self.hid)
 
     def eff_rec_mask(self):
-        """§17 rec_mask AND the laminar adjacency mask when laminar is on (else just rec_mask → identical)."""
+        """§17 rec_mask AND the laminar adjacency mask when laminar is on (else just rec_mask → identical).
+        §HARM: when laminar drive-comp is on, the survivors are rescaled (float mask) to preserve total drive."""
         lm = getattr(self, "lam_rec_mask", None)
-        return (self.rec_mask * lm) if lm is not None else self.rec_mask
+        if lm is None:
+            return self.rec_mask
+        comp = getattr(self, "lam_rec_comp", None)
+        if comp is not None:                                   # per-post-neuron drive-preserving scale (≥1)
+            return (self.rec_mask * lm).to(comp.dtype) * comp[self.rec_row.long()]
+        return self.rec_mask * lm
 
     def eff_in_mask(self):
         lm = getattr(self, "lam_in_mask", None)
