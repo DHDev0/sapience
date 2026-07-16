@@ -42,12 +42,17 @@ NEEDS_TWOCOMP = {"interneurons", "plateau"}
 
 
 def load_corpus():
-    from datasets import load_dataset                # same source the brain births on (Salesforce/wikitext-2)
-    tr = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
-    va = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="validation")
-    train = "\n".join(tr["text"])[:400000]
+    # §CONFOUND-FIX (critic wave w3044t7yd): wt2[:400000] was trained ~38x ⇒ MEMORIZED ⇒ every ablation/horizon
+    # verdict fit on it is a memorization artifact. wikitext-103-raw (524MB, repo id "wikitext" — NOT Salesforce)
+    # is cached offline; a big fresh slice makes 600-step ablations measure GENERALIZATION, not recall. Held-out
+    # eval is the DISJOINT wt103 validation split.
+    from datasets import load_dataset
+    try:    tr = load_dataset("wikitext", "wikitext-103-raw-v1", split="train"); va = load_dataset("wikitext", "wikitext-103-raw-v1", split="validation")
+    except Exception:                               # fallback if wt103 ever unavailable
+        tr = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train"); va = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="validation")
+    train = "\n".join(tr["text"][:100000])          # ~12MB fresh (≫ the 460KB a 600-step run sees ⇒ no memorization)
     evf = "\n".join(va["text"])
-    ev = evf[len(evf)//3: len(evf)//3 + 6000]      # a disjoint held-out chunk
+    ev = evf[len(evf)//3: len(evf)//3 + 6000]       # a disjoint held-out chunk
     return train, ev
 
 

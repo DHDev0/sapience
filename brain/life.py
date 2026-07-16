@@ -435,10 +435,11 @@ class BrainLife:
                 # LOUD + honest: without the teacher the brain is born on wikitext ONLY — the
                 # "born from a frozen VLM by distillation" story does NOT hold for this run.
                 self.log(f"⚠ BIRTH TEACHER (Qwen VLM) FAILED — born on wikitext ONLY, not by distillation: {str(e)[:70]}")
-        try:                                              # real world text (wikitext-2)
-            from datasets import load_dataset
-            ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
-            wt = "".join(t for t in ds["text"] if len(t) > 100)
+        try:                                              # real world text — wikitext-103-raw (524MB fresh; NOT the
+            from datasets import load_dataset             # 250KB wt2 slice, which the brain MEMORIZES → confounds learning)
+            try:    ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+            except Exception: ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
+            wt = "\n".join(t for t in ds["text"][:200000] if len(t) > 100)
             parts.append(wt[:kb * 1000])
         except Exception as e:
             self.log(f"wikitext unavailable at birth: {str(e)[:50]}")
