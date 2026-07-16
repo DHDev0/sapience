@@ -113,6 +113,17 @@ class SparseLIFCell(nn.Module):
                  sparse_in=False, syn_density=1.0, seed=0):
         super().__init__()
         self.beta, self.thr, self.hid, self.in_dim = beta, thr, hid, in_dim
+        # §MEM the LIF memory ceiling: a FIXED beta (tau~9.5) + a HARD multiplicative reset *(1-s) that ZEROES the
+        # whole membrane on every spike ⇒ linearly-decodable horizon ~3-8 bytes ⇒ order-2 byte-Markov ⇒ gibberish.
+        # Two MORE-biophysical, faithful, local-learning-compatible fixes (default off ⇒ byte-identical):
+        #  het_tau  — heterogeneous per-neuron time constants (Perez-Nieves 2021): a slow sub-population reaches
+        #             tau up to ~300 steps, giving the population a long memory register (diverse beta_vec).
+        #  sub_reset— SUBTRACTIVE reset v←beta*v − thr*s (the standard biophysical LIF reset) instead of the harsh
+        #             multiplicative *(1-s); it also MATCHES the additive eligibility trace (eb*eps+z), removing a
+        #             forward/eligibility mismatch. Stops each spike from erasing sub-threshold memory.
+        self.het_tau = False; self.sub_reset = False
+        g_bt = torch.Generator().manual_seed(seed + 11)
+        self.register_buffer("beta_vec", 0.85 + 0.149 * torch.rand(hid, generator=g_bt))   # per-neuron beta in [0.85,0.999)
         self.sparse_in = bool(sparse_in)
         self.rec_fanin, self.in_fanin = rec_fanin, in_fanin
         # --- recurrent connectome (always sparse) ---
@@ -181,9 +192,17 @@ class SparseLIFCell(nn.Module):
         z = torch.zeros(B, self.hid, device=device, dtype=dtype)
         return (z, z.clone())
 
+    def _mem(self, v, s, inp):
+        """§MEM one membrane step. het_tau ⇒ per-neuron beta_vec (long-memory sub-population); sub_reset ⇒
+        subtractive v←beta*v−thr*s (biophysical + eligibility-consistent) vs the harsh multiplicative *(1-s)."""
+        bt = self.beta_vec if getattr(self, "het_tau", False) else self.beta
+        if getattr(self, "sub_reset", False):
+            return bt * v - self.thr * s + inp
+        return bt * v * (1.0 - s) + inp
+
     def forward(self, x, state):
         v, s = state
-        v = self.beta * v * (1.0 - s) + self._in_proj(x.unsqueeze(1))[:, 0] + self._rec(s)
+        v = self._mem(v, s, self._in_proj(x.unsqueeze(1))[:, 0] + self._rec(s))
         s = spike(v - self.thr)
         return s, (v, s)
 
@@ -193,7 +212,7 @@ class SparseLIFCell(nn.Module):
         spikes, mems = [], []
         for t in range(x.shape[1]):
             zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
-            v = self.beta * v * (1.0 - s) + pre[:, t] + self._rec(zt)
+            v = self._mem(v, s, pre[:, t] + self._rec(zt))
             s = spike(v - self.thr)
             spikes.append(s); mems.append(v)
         return torch.stack(spikes, 1), torch.stack(mems, 1), (v, s)

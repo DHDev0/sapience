@@ -618,7 +618,9 @@ class SpikingBrain(nn.Module):
                     drive = drive / denom + g_ap * apd_fwd
                 if diffnm: drive = drive * ne_gain             # NE sets somatic gain (surprise/attention)
                 if pc_prev is not None: drive = drive + infer_g * pc_prev[l]   # §PC top-down error relaxes activity
-                v[l] = c.beta * v[l] * (1.0 - z_prev) + drive
+                _bt = c.beta_vec if getattr(c, "het_tau", False) else c.beta   # §MEM per-neuron long-memory taus
+                v[l] = (_bt * v[l] - c.thr * z_prev if getattr(c, "sub_reset", False)   # §MEM subtractive reset
+                        else _bt * v[l] * (1.0 - z_prev)) + drive
                 if al[l]:
                     a[l] = c.rho * a[l] + z_prev               # adaptation from the previous spike
                     thr = c.thr0 + c.beta_adapt * a[l]         # adaptive threshold
