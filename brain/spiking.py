@@ -110,7 +110,8 @@ def _slow_step(cell, I_raw, cs):
     the drive (gs_read='drive'). κ<0 = excitatory afterdepolarization: held context lowers θ ⇒ promotes firing."""
     i_g = torch.sigmoid(cell.k_g * I_raw + cell.b_g_vec)
     cs = (1.0 - i_g) * cs + i_g * torch.tanh(I_raw)
-    return cs, cell.gs_kappa * cs
+    kap = cell.kappa_vec if getattr(cell, "learn_read", False) else cell.gs_kappa   # §MEM2b learned per-neuron read gain
+    return cs, kap * cs
 
 
 def _grow_mem_buffers(cell, add):
@@ -123,6 +124,8 @@ def _grow_mem_buffers(cell, add):
     if hasattr(cell, "b_g_vec"):
         _gg = torch.Generator().manual_seed(int(cell.b_g_vec.numel()) + 23)
         cell.b_g_vec = torch.cat([cell.b_g_vec, (-2.0 - 3.0 * torch.rand(add, generator=_gg)).to(cell.b_g_vec.device)])
+    if hasattr(cell, "kappa_vec"):             # §MEM2b new neurons read at the scalar-κ default (identity-preserving)
+        cell.kappa_vec = torch.cat([cell.kappa_vec, torch.full((add,), float(cell.gs_kappa), device=cell.kappa_vec.device)])
 
 
 class SparseLIFCell(nn.Module):
@@ -159,10 +162,12 @@ class SparseLIFCell(nn.Module):
         self.gs_read = "threshold"           # 'threshold': thr += κ·c (exact eligibility, cheapest); 'drive': v += κ·c
         self.k_g = 1.0                        # NMDA Mg2+-unblock gate slope on the drive
         self.gs_kappa = -0.3                  # soma read gain κ (<0 = excitatory afterdepolarization); keep |κ|<thr
+        self.learn_read = False               # §MEM2b learned PER-NEURON read gain kappa_vec (else the scalar gs_kappa)
         _gbg = torch.Generator().manual_seed(seed + 23)
         # heterogeneous rest write-prob i0=σ(b_g)∈~[0.006,0.12] ⇒ per-neuron hold τ=1/i0∈~[8,160] steps: a
         # MULTI-TIMESCALE bank, not one caricature τ (a fresh local generator ⇒ no global-RNG perturbation).
         self.register_buffer("b_g_vec", -2.0 - 3.0 * torch.rand(hid, generator=_gbg))       # b_g ∈ [-5,-2]
+        self.register_buffer("kappa_vec", torch.full((hid,), float(self.gs_kappa)))         # ≡ scalar κ off ⇒ identical
         self.sparse_in = bool(sparse_in)
         self.rec_fanin, self.in_fanin = rec_fanin, in_fanin
         # --- recurrent connectome (always sparse) ---
@@ -261,18 +266,20 @@ class SparseLIFCell(nn.Module):
         else:  v, s = state
         pre = self._in_proj(x)                                  # (B,T,hid) vectorized input
         spikes, mems = [], []
-        drv = gs and self.gs_read == "drive"
+        drv = gs and self.gs_read == "drive"; css = [] if gs else None
         for t in range(x.shape[1]):
             zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
             I = pre[:, t] + self._rec(zt)
             thr = self.thr
             if gs:
                 cs, read = _slow_step(self, I, cs)             # §MEM2 gated slow compartment (bounded |c|≤1)
+                css.append(cs)                                  # §MEM2b per-tick compartment for the learned head-read
                 if drv: I = I + read
                 else:   thr = self.thr + read
             v = self._mem(v, s, I)
             s = spike(v - thr)
             spikes.append(s); mems.append(v)
+        self._css_seq = torch.stack(css, 1) if gs else None     # (B,T,hid) top-layer slow bank, read by _run
         return torch.stack(spikes, 1), torch.stack(mems, 1), ((v, s, cs) if gs else (v, s))
 
     @torch.no_grad()
@@ -348,8 +355,10 @@ class LIFCell(nn.Module):
         self.beta, self.thr, self.hid, self.in_dim = beta, thr, hid, in_dim
         # §MEM2 input-gated slow compartment (see SparseLIFCell / _slow_step). DEFAULT OFF ⇒ byte-identical.
         self.gated_slow = False; self.gs_read = "threshold"; self.k_g = 1.0; self.gs_kappa = -0.3
+        self.learn_read = False               # §MEM2b learned per-neuron read gain
         _gbg = torch.Generator().manual_seed(hid + 23)
         self.register_buffer("b_g_vec", -2.0 - 3.0 * torch.rand(hid, generator=_gbg))       # b_g ∈ [-5,-2]
+        self.register_buffer("kappa_vec", torch.full((hid,), float(self.gs_kappa)))         # ≡ scalar κ off
 
     def init_state(self, B, device, dtype=torch.float32):
         z = torch.zeros(B, self.hid, device=device, dtype=dtype)
@@ -381,7 +390,7 @@ class LIFCell(nn.Module):
         else:  v, s = state
         pre = self.Win(x)                              # (B,T,hid) — vectorized over time
         spikes, mems = [], []
-        drv = gs and self.gs_read == "drive"
+        drv = gs and self.gs_read == "drive"; css = [] if gs else None
         for t in range(x.shape[1]):
             zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
             _rw = getattr(self, "lam_rec_w", None)                                       # §17 laminar dense adjacency (test nets)
@@ -390,11 +399,13 @@ class LIFCell(nn.Module):
             thr = self.thr
             if gs:
                 cs, read = _slow_step(self, I, cs)             # §MEM2 gated slow compartment
+                css.append(cs)                                  # §MEM2b per-tick compartment for the learned head-read
                 if drv: I = I + read
                 else:   thr = self.thr + read
             v = self.beta * v * (1.0 - s) + I
             s = spike(v - thr)
             spikes.append(s); mems.append(v)
+        self._css_seq = torch.stack(css, 1) if gs else None     # (B,T,hid) top-layer slow bank, read by _run
         return torch.stack(spikes, 1), torch.stack(mems, 1), ((v, s, cs) if gs else (v, s))
 
     @torch.no_grad()

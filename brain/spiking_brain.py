@@ -65,6 +65,11 @@ class SpikingBrain(nn.Module):
             d = hidden
         self.cells = nn.ModuleList(cells)
         self.head = nn.Linear(hidden, self.V)
+        # §MEM2b learned population READ of the top gated slow compartment C: logits += C @ mem_read_w.t(). Gives the
+        # byte-predictor DIRECT linear access to the slow bank (τ∈[8,160]) vs only the fixed κ threshold nudge.
+        # zero-init (torch.zeros ⇒ NO global-RNG consumed ⇒ byte-identical off) + read_mem gate ⇒ default off is a no-op.
+        self.read_mem = False
+        self.mem_read_w = nn.Parameter(torch.zeros(self.V, hidden))
         self.to(device)
         # bf16 mixed precision (weights stay fp32, matmuls autocast to bf16) — on GPU AND CPU
         self.use_amp = (dtype == torch.bfloat16)
@@ -308,6 +313,9 @@ class SpikingBrain(nn.Module):
                 inp = spikes; top_mem = mems
             read = self._readout(top_mem, inp)             # (B,T,hid)
             logits = self.head(read)                       # (B,T,V) in one matmul
+            if getattr(self, "read_mem", False):           # §MEM2b add the learned read of the top slow compartment
+                css = getattr(self.cells[-1], "_css_seq", None)
+                if css is not None: logits = logits + F.linear(css, self.mem_read_w)
             return logits, states
 
     def _readout(self, mem, spk):
@@ -495,6 +503,12 @@ class SpikingBrain(nn.Module):
             if sp(c) and c.sparse_in: g_in.append(torch.zeros_like(c.in_val)); g_in_b.append(torch.zeros_like(c.in_bias))
             else: g_in.append(torch.zeros_like(c.Win.weight)); g_in_b.append(torch.zeros_like(c.Win.bias))
         gHead = torch.zeros_like(self.head.weight); gHead_b = torch.zeros_like(self.head.bias)
+        # §MEM2b learned-read gradients (both INSTANTANEOUS — read params are OUTSIDE the c-recurrence ⇒ no trace):
+        #   κ_j (per-neuron read gain): thr+=κ·C ⇒ ∂z/∂κ=−ψ·C ; drive+=κ·C ⇒ +ψ·C.  R (head-read): sibling of gHead.
+        _lr_read = [gs[i] and getattr(c, "learn_read", False) for i, c in enumerate(cells)]
+        g_kappa = [torch.zeros(c.hid, device=dev) if _lr_read[i] else None for i, c in enumerate(cells)]
+        read_mem = getattr(self, "read_mem", False)
+        gMemRead = torch.zeros_like(self.mem_read_w) if read_mem else None
         gE = torch.zeros_like(self.E.weight)                   # the sensory byte-embedding also learns (e-prop)
         he_on = getattr(self, "head_norm", "power") == "energy"   # §NLMS width/sparsity-invariant readout
         v_energy = [torch.zeros((), device=dev, dtype=torch.float32) for _ in cells] if he_on else None
@@ -703,12 +717,15 @@ class SpikingBrain(nn.Module):
                         ec_in[l] = _Phi.unsqueeze(2) * layer_in.unsqueeze(1) + _gret.unsqueeze(2) * ec_in[l]
                 psi.append(psi_l); layer_in = z[l]
             top_v = v[-1]; logits = self.head(top_v)           # membrane readout → logits
+            _rmem = read_mem and gs[-1] and C[-1] is not None  # §MEM2b learned read of the top slow compartment
+            if _rmem: logits = logits + F.linear(C[-1], self.mem_read_w)
             p = torch.softmax(logits.float(), 1)
             oh = torch.zeros_like(p); oh.scatter_(1, y[:, tt].long().unsqueeze(1), 1.0)
             err = p - oh                                        # CE gradient wrt logits
             tot_loss += float(-(oh * (p + 1e-9).log()).sum(1).mean())
             if pc: pc_err_out += float(err.abs().mean())        # §PC output prediction error (free-energy proxy)
             gHead += err.t() @ top_v.float(); gHead_b += err.sum(0)   # head grad is LOCAL in time
+            if _rmem: gMemRead += err.t() @ C[-1].float()       # §MEM2b R grad = err^T@C (sibling of gHead; NO dL/dC→cortex = no W^T)
             if he_on:                                          # §NLMS: realized membrane energy ‖v_l‖² per layer,
                 for l in range(len(cells)):                    #   fp32-accumulated (bf16 length-N sum-of-squares underflows)
                     v_energy[l] += (v[l].float() ** 2).sum()
@@ -755,6 +772,9 @@ class SpikingBrain(nn.Module):
                     Lsig = Lsig + (mlam * astro_mm * _p_prev) * _mz    # §HARM bus: release the DC price (incl. astro_mm) when calm/silenced
                 #   has dLoss/dz=+mlam → ADDS to the per-neuron error, pushing incoming weights DOWN (less firing)
                 g = (Lsig * psi[l]).float()                    # g_j = L_j · ψ_j
+                if g_kappa[l] is not None:                     # §MEM2b κ_j grad: EXACT per-neuron, no trace, no W^T
+                    _krs = 1.0 if getattr(c, "gs_read", "threshold") == "drive" else -1.0
+                    g_kappa[l] += _krs * (g * C[l]).sum(0)
                 if l == 0 and getattr(c, "Win", None) is not None:   # the byte-embedding learns too: project the
                     gE.index_add_(0, x[:, tt].long(), g @ c.Win.weight)   # layer-0 signal back to the used rows.
                     #   (this input-projection gradient is the ONE weight-transport path in the rule — a
@@ -940,6 +960,12 @@ class SpikingBrain(nn.Module):
         else:
             _upd(self.head.weight, gHead, self.head.weight.shape[1], pw=hpow)   # head: gentler norm so it isn't starved at width
             _upd(self.head.bias, gHead_b, 1)
+        if gMemRead is not None:                               # §MEM2b R: learned read of the slow bank (head power path)
+            _upd(self.mem_read_w, gMemRead, self.mem_read_w.shape[1], pw=hpow)
+        for l, c in enumerate(cells):                          # §MEM2b κ_j: per-neuron read-gain update + MANDATORY |κ|<thr bound
+            if g_kappa[l] is not None:
+                _upd(c.kappa_vec, g_kappa[l], 1)
+                c.kappa_vec.data.clamp_(-(float(getattr(c, "thr", 1.0)) - 1e-3), float(getattr(c, "thr", 1.0)) - 1e-3)
         _upd(self.E.weight, gE, self.E.weight.shape[1])        # sensory byte-embedding update (no longer frozen) — both paths
         if learned_fb:                                         # Kolen-Pollack: mirror the head/error grad into
             fb_dec = float(getattr(self, "fb_decay", 1e-4)); last = len(cells) - 1   # B, then weight-decay → B aligns with W
@@ -1336,20 +1362,23 @@ class SpikingBrain(nn.Module):
         return applied
 
     @torch.no_grad()
-    def set_mem(self, gated_slow=None, gs_read=None, k_g=None, gs_kappa=None, cells="all"):
-        """§MEM2 live control of the input-gated slow compartment, broadcast to every cell (the het_tau/sub_reset
-        pattern). gated_slow toggles the working-memory register; gs_read∈{'threshold'(exact),'drive'}; k_g the
-        gate slope; gs_kappa the soma read gain (κ<0 = excitatory afterdepolarization, |κ|<thr). Toggling on is
-        safe live: c starts at 0 (no state-arity surprise — init_state/run_seq read gated_slow per call). Returns
-        the applied config."""
+    def set_mem(self, gated_slow=None, gs_read=None, k_g=None, gs_kappa=None, learn_read=None, read_mem=None, cells="all"):
+        """§MEM2/§MEM2b live control of the input-gated slow compartment + its learned read, broadcast to every cell.
+        gated_slow toggles the working-memory register; gs_read∈{'threshold'(exact),'drive'}; k_g the gate slope;
+        gs_kappa the fixed soma read gain (κ<0 = excitatory afterdepolarization, |κ|<thr). §MEM2b: learn_read makes
+        the per-neuron read gain κ_j learnable; read_mem gives the head a DIRECT learned linear read of the top slow
+        compartment (logits += C@mem_read_w.t()). Toggling on is safe live (c starts at 0). Returns the applied config."""
         tgt = self.cells if cells == "all" else [self.cells[i] for i in cells]
         for c in tgt:
             if gated_slow is not None: c.gated_slow = bool(gated_slow)
             if gs_read in ("threshold", "drive"): c.gs_read = gs_read
             if k_g is not None: c.k_g = float(k_g)
             if gs_kappa is not None: c.gs_kappa = float(gs_kappa)
+            if learn_read is not None: c.learn_read = bool(learn_read)
+        if read_mem is not None: self.read_mem = bool(read_mem)
         return {"gated_slow": getattr(tgt[0], "gated_slow", False), "gs_read": getattr(tgt[0], "gs_read", "threshold"),
-                "k_g": getattr(tgt[0], "k_g", 1.0), "gs_kappa": getattr(tgt[0], "gs_kappa", -0.3)} if tgt else {}
+                "k_g": getattr(tgt[0], "k_g", 1.0), "gs_kappa": getattr(tgt[0], "gs_kappa", -0.3),
+                "learn_read": getattr(tgt[0], "learn_read", False), "read_mem": getattr(self, "read_mem", False)} if tgt else {}
 
     def faith_config(self):
         """The current state of every faithfulness toggle/hyperparameter — the fidelity axis settings."""
@@ -1570,7 +1599,10 @@ class SpikingBrain(nn.Module):
         nhead = nn.Linear(new, self.V).to(dev, dt)
         with torch.no_grad():
             nhead.weight.zero_(); nhead.weight[:, :old] = self.head.weight; nhead.bias.copy_(self.head.bias)
+            nmr = torch.zeros(self.V, new, device=dev, dtype=self.mem_read_w.dtype)   # §MEM2b widen the learned read (new cols 0 = id-preserving)
+            nmr[:, :old] = self.mem_read_w
         self.head = nhead
+        self.mem_read_w = nn.Parameter(nmr)
         self.hidden = new
         self._head_e_ema = 0.0                                  # §NLMS: recalibrate the ε energy-floor to the new width
         self._mind = None
@@ -1636,6 +1668,7 @@ class SpikingBrain(nn.Module):
         self.cells = nn.ModuleList(cells).to(self.device)
         self.hidden = sd["head.weight"].shape[1]     # head input = top-layer width
         self.head = nn.Linear(self.hidden, self.V).to(self.device)
+        self.mem_read_w = nn.Parameter(torch.zeros(self.V, self.hidden, device=self.device))   # §MEM2b rebuilt at saved width before load
         self.sparse_cfg = d.get("sparse_cfg", getattr(self, "sparse_cfg", None))
         self.opt = torch.optim.Adam(self.parameters(), lr=d.get("lr", self.lr))
         self.load_state_dict(sd)
