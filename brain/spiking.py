@@ -109,7 +109,8 @@ def _slow_step(cell, I_raw, cs):
     Returns (c_new, κ·c); the read κ·c is added by the caller to the threshold (gs_read='threshold', exact) or
     the drive (gs_read='drive'). κ<0 = excitatory afterdepolarization: held context lowers θ ⇒ promotes firing."""
     i_g = torch.sigmoid(cell.k_g * I_raw + cell.b_g_vec)
-    cs = (1.0 - i_g) * cs + i_g * torch.tanh(I_raw)
+    w = torch.tanh(cell.write_a * I_raw + cell.write_d) if getattr(cell, "learn_write", False) else torch.tanh(I_raw)  # §MEM2c
+    cs = (1.0 - i_g) * cs + i_g * w
     kap = cell.kappa_vec if getattr(cell, "learn_read", False) else cell.gs_kappa   # §MEM2b learned per-neuron read gain
     return cs, kap * cs
 
@@ -126,6 +127,11 @@ def _grow_mem_buffers(cell, add):
         cell.b_g_vec = torch.cat([cell.b_g_vec, (-2.0 - 3.0 * torch.rand(add, generator=_gg)).to(cell.b_g_vec.device)])
     if hasattr(cell, "kappa_vec"):             # §MEM2b new neurons read at the scalar-κ default (identity-preserving)
         cell.kappa_vec = torch.cat([cell.kappa_vec, torch.full((add,), float(cell.gs_kappa), device=cell.kappa_vec.device)])
+    if hasattr(cell, "write_a"):               # §MEM2c new neurons write at a=1,d=0 (≡ tanh(I), identity-preserving)
+        cell.write_a = torch.cat([cell.write_a, torch.ones(add, device=cell.write_a.device)])
+        cell.write_d = torch.cat([cell.write_d, torch.zeros(add, device=cell.write_d.device)])
+    if hasattr(cell, "mem_rho_vec"):           # §MEM3 new neurons read the fast store at the scalar default
+        cell.mem_rho_vec = torch.cat([cell.mem_rho_vec, torch.full((add,), float(cell.mem_read_gain), device=cell.mem_rho_vec.device)])
 
 
 class SparseLIFCell(nn.Module):
@@ -168,6 +174,21 @@ class SparseLIFCell(nn.Module):
         # MULTI-TIMESCALE bank, not one caricature τ (a fresh local generator ⇒ no global-RNG perturbation).
         self.register_buffer("b_g_vec", -2.0 - 3.0 * torch.rand(hid, generator=_gbg))       # b_g ∈ [-5,-2]
         self.register_buffer("kappa_vec", torch.full((hid,), float(self.gs_kappa)))         # ≡ scalar κ off ⇒ identical
+        # §MEM2c learned WRITE content w=tanh(a_j·I+d_j): a per-neuron LATCH (open-quote/bracket/capital flag) instead
+        # of a low-pass of the drive. a=1,d=0 ⇒ tanh(I) bit-identically (byte-continuous); |w|<1 ⇒ |c|≤1 for any a,d.
+        self.learn_write = False
+        self.register_buffer("write_a", torch.ones(hid))
+        self.register_buffer("write_d", torch.zeros(hid))
+        # §MEM3 FAST-HEBBIAN relational store: a per-edge fast weight F (a transient STATE, not a param) living OUTSIDE
+        # the membrane so it survives the hard reset. Fixed Hebbian EMA write (NO gradient); learned per-neuron read
+        # gain rho_j (instantaneous grad, sibling of κ_j). Content-addressable recall binds repeated tokens / matched
+        # delimiters within ~1/(1-decay). DEFAULT OFF ⇒ byte-identical (nothing allocated, mem_rho_vec never read).
+        self.fast_mem = False
+        self.mem_fast_decay = 0.92            # λ; working-memory horizon ~1/(1-λ) ~12 bytes (NOT long-term)
+        self.mem_read_gain = 0.5              # scalar ρ when mem_learn_read off
+        self.mem_learn_read = False
+        self.mem_rho_max = 2.0
+        self.register_buffer("mem_rho_vec", torch.full((hid,), 0.5))   # per-neuron learned read gain
         self.sparse_in = bool(sparse_in)
         self.rec_fanin, self.in_fanin = rec_fanin, in_fanin
         # --- recurrent connectome (always sparse) ---
@@ -234,6 +255,7 @@ class SparseLIFCell(nn.Module):
 
     def init_state(self, B, device, dtype=torch.float32):
         z = torch.zeros(B, self.hid, device=device, dtype=dtype)
+        if getattr(self, "fast_mem", False): self._ffast = None   # §MEM3 reset the fast store at a fresh sequence
         if getattr(self, "gated_slow", False):
             return (z, z.clone(), z.clone())                   # §MEM2 v, s, c (slow compartment; opaque to _run)
         return (z, z.clone())
@@ -267,9 +289,19 @@ class SparseLIFCell(nn.Module):
         pre = self._in_proj(x)                                  # (B,T,hid) vectorized input
         spikes, mems = [], []
         drv = gs and self.gs_read == "drive"; css = [] if gs else None
+        fm = getattr(self, "fast_mem", False)                   # §MEM3 fast-Hebbian relational store (eval parity)
+        if fm:
+            F = getattr(self, "_ffast", None)
+            if F is None or F.shape[0] != x.shape[0]:
+                F = torch.zeros(x.shape[0], self.rec_val.numel(), device=x.device)
+            _rho = self.mem_rho_vec if getattr(self, "mem_learn_read", False) else float(self.mem_read_gain)
+            _fanin = float(max(1.0, self.rec_fanin)); _col = self.rec_col.long()
         for t in range(x.shape[1]):
             zt = s if (stp is None or not stp.on) else s * stp.transmit(stp_layer, s)   # §17 STP presynaptic gain (g≡1 off)
             I = pre[:, t] + self._rec(zt)
+            if fm:                                              # content-addressable recall current from F_{t-1}
+                recall = torch.zeros(x.shape[0], self.hid, device=x.device).index_add_(1, self.rec_row, F * zt[:, _col]) / _fanin
+                I = I + _rho * recall
             thr = self.thr
             if gs:
                 cs, read = _slow_step(self, I, cs)             # §MEM2 gated slow compartment (bounded |c|≤1)
@@ -278,7 +310,10 @@ class SparseLIFCell(nn.Module):
                 else:   thr = self.thr + read
             v = self._mem(v, s, I)
             s = spike(v - thr)
+            if fm:                                              # Hebbian EMA write: post(t)·pre(t-1) ⇒ F∈[0,1]
+                F = self.mem_fast_decay * F + (1.0 - self.mem_fast_decay) * (s[:, self.rec_row] * zt[:, _col])
             spikes.append(s); mems.append(v)
+        if fm: self._ffast = F
         self._css_seq = torch.stack(css, 1) if gs else None     # (B,T,hid) top-layer slow bank, read by _run
         return torch.stack(spikes, 1), torch.stack(mems, 1), ((v, s, cs) if gs else (v, s))
 
@@ -356,9 +391,12 @@ class LIFCell(nn.Module):
         # §MEM2 input-gated slow compartment (see SparseLIFCell / _slow_step). DEFAULT OFF ⇒ byte-identical.
         self.gated_slow = False; self.gs_read = "threshold"; self.k_g = 1.0; self.gs_kappa = -0.3
         self.learn_read = False               # §MEM2b learned per-neuron read gain
+        self.learn_write = False              # §MEM2c learned per-neuron write content
         _gbg = torch.Generator().manual_seed(hid + 23)
         self.register_buffer("b_g_vec", -2.0 - 3.0 * torch.rand(hid, generator=_gbg))       # b_g ∈ [-5,-2]
         self.register_buffer("kappa_vec", torch.full((hid,), float(self.gs_kappa)))         # ≡ scalar κ off
+        self.register_buffer("write_a", torch.ones(hid))                                    # §MEM2c ≡ tanh(I) off
+        self.register_buffer("write_d", torch.zeros(hid))
 
     def init_state(self, B, device, dtype=torch.float32):
         z = torch.zeros(B, self.hid, device=device, dtype=dtype)
