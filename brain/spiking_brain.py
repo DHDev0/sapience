@@ -1593,6 +1593,33 @@ class SpikingBrain(nn.Module):
         return n
 
     @torch.no_grad()
+    @torch.no_grad()
+    def reinit_dead(self, thr=0.005):
+        """§TURNOVER structural synaptic turnover — how real neurons don't vanish: a neuron that has gone SILENT gets
+        its INCOMING weights REINITIALISED to fresh random values (targeted mask → a new chance to find useful input),
+        NOT a uniform depolarising bias (which destroys input-selectivity → input-blind firing). Measured to beat the
+        additive-bias and multiplicative-scaling keep-alives on the everon config (bpb 4.75 vs 8.0/9.1). Uses the
+        per-neuron firing rate from the last e-prop step; call periodically from the training/live loop. Returns count."""
+        srv = getattr(self, "_spk_rate_vec", None)
+        if srv is None: return 0
+        n_re = 0
+        for l, c in enumerate(self.cells):
+            dead = (srv[l] < thr); d = int(dead.sum())
+            if d == 0: continue
+            n_re += d
+            if hasattr(c, "rec_val"):                          # sparse cell: reinit incoming CSR edges to dead post-neurons
+                ed = dead[c.rec_row.long()]; m = int(ed.sum())
+                if m: c.rec_val.data[ed] = torch.randn(m, device=c.rec_val.device) / max(1.0, c.rec_fanin) ** 0.5
+                if getattr(c, "sparse_in", False):
+                    ie = dead[c.in_row.long()]; k = int(ie.sum())
+                    if k: c.in_val.data[ie] = torch.randn(k, device=c.in_val.device) / max(1.0, c.in_fanin) ** 0.5
+                elif hasattr(c, "Win"):
+                    c.Win.weight.data[dead] = torch.randn(d, c.in_dim, device=c.Win.weight.device) / max(1.0, c.in_dim) ** 0.5
+            else:                                              # dense cell
+                c.Wrec.weight.data[dead] = torch.randn(d, c.hid, device=c.Wrec.weight.device) / max(1.0, c.hid) ** 0.5
+                c.Win.weight.data[dead] = torch.randn(d, c.in_dim, device=c.Win.weight.device) / max(1.0, c.in_dim) ** 0.5
+        return n_re
+
     def grow_synapses(self, frac=0.15):
         """§10 synaptogenesis (childhood): activate `frac` of the currently-SILENT connections
         (dense + sparse) with fresh small weights — the neuron count is unchanged. Returns count."""
